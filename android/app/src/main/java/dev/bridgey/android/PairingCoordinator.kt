@@ -179,12 +179,15 @@ class PairingCoordinator(
         android.util.Log.i("Bridgey", "CONNECT attempting $host:$port peer=$peerName")
         mutableState.value = PairingState.Connecting(peerName)
         scope.launch {
-            runCatching { Socket(host, port) }
+            runCatching { connectWithTimeout(host, port) }
                 .onSuccess {
                     android.util.Log.i("Bridgey", "CONNECT established $host:$port")
                     handle(it, initiatedLocally = true, peerHint = peerName)
                 }
-                .onFailure { fail("Could not connect to $peerName") }
+                .onFailure {
+                    android.util.Log.w("Bridgey", "CONNECT failed $host:$port: ${it.javaClass.simpleName}: ${it.message}")
+                    fail("Could not connect to $peerName")
+                }
         }
     }
 
@@ -937,11 +940,25 @@ class PairingCoordinator(
         val result = runCatching {
             while (true) {
                 try {
-                    val line = current.input.readProtocolLine() ?: break
+                    val line = current.input.readProtocolLine()
+                    if (line == null) {
+                        android.util.Log.w("Bridgey", "CONNECTION read loop: stream ended (readProtocolLine returned null)")
+                        break
+                    }
                     current.lastReceivedAtMillis = SystemClock.elapsedRealtime()
                     receive(current, Message.decode(line))
                 } catch (_: SocketTimeoutException) {
                     if (session !== current) break
+                    // DIAGNOSTIC (temporary): logs every ~10s soTimeout tick so we can see whether
+                    // the read loop keeps running normally across a screen lock, or stops ticking
+                    // altogether (which would point at the thread/process being suspended rather
+                    // than the socket/network actually failing).
+                    val sinceLastReceivedMs = SystemClock.elapsedRealtime() - current.lastReceivedAtMillis
+                    android.util.Log.d(
+                        "Bridgey",
+                        "CONNECTION soTimeout tick: state=${mutableState.value} " +
+                            "heartbeatSupported=${current.heartbeatSupported} sinceLastReceivedMs=$sinceLastReceivedMs",
+                    )
                     if (mutableState.value is PairingState.Connected) {
                         if (heartbeatExpired(
                                 supported = current.heartbeatSupported,
@@ -949,7 +966,10 @@ class PairingCoordinator(
                                 nowMillis = SystemClock.elapsedRealtime(),
                             )
                         ) {
-                            android.util.Log.w("Bridgey", "TRANSPORT heartbeat timed out")
+                            android.util.Log.w(
+                                "Bridgey",
+                                "CONNECTION lost: heartbeat timed out (sinceLastReceivedMs=$sinceLastReceivedMs)",
+                            )
                             break
                         }
                         if (!current.send(Message(
@@ -957,10 +977,16 @@ class PairingCoordinator(
                                 sessionId = current.id,
                                 messageId = UUID.randomUUID().toString(),
                             ))
-                        ) break
+                        ) {
+                            android.util.Log.w("Bridgey", "CONNECTION lost: heartbeat.ping send failed")
+                            break
+                        }
                     }
                 }
             }
+        }
+        result.exceptionOrNull()?.let {
+            android.util.Log.w("Bridgey", "CONNECTION read loop ended with exception: ${it.javaClass.simpleName}: ${it.message}")
         }
         if (session === current && mutableState.value is PairingState.Connected) {
             session = null

@@ -1199,7 +1199,10 @@ final class PairingCoordinator: ObservableObject {
                     self.state = .failed("Local Network access is off. Enable Bridgey in System Settings → Privacy & Security → Local Network.")
                     self.diagnostics.record(category: "transport", event: "local_network_denied", outcome: "permission_required")
                 default:
-                    break
+                    // DIAGNOSTIC (temporary, logging only): otherwise-unlogged NWConnection state
+                    // transitions (.setup, .preparing, other .waiting cases), to see whether the
+                    // connection lingers in an intermediate state around a phone screen lock.
+                    NSLog("TRANSPORT connection state=%@", String(describing: newState))
                 }
             }
         }
@@ -1821,8 +1824,13 @@ final class PairingCoordinator: ObservableObject {
         heartbeatWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self, weak current] in
             guard let self, let current, self.session === current, case .connected = self.state else { return }
+            let sinceLastReceived = Date().timeIntervalSince(current.lastReceivedAt)
+            // DIAGNOSTIC (temporary): logs every ~10s heartbeat tick so we can see whether this
+            // timer keeps firing normally across a phone screen lock, and how stale the last
+            // received message was at each tick.
+            NSLog("CONNECTION heartbeat tick: heartbeatSupported=%@ sinceLastReceived=%.1fs", String(current.heartbeatSupported), sinceLastReceived)
             if heartbeatExpired(supported: current.heartbeatSupported, lastReceivedAt: current.lastReceivedAt) {
-                NSLog("TRANSPORT heartbeat timed out")
+                NSLog("CONNECTION lost: heartbeat timed out (sinceLastReceived=%.1fs)", sinceLastReceived)
                 current.close()
                 return
             }

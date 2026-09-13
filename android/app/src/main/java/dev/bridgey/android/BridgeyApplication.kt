@@ -39,6 +39,20 @@ class BridgeyApplication : Application() {
         }
     }
 
+    // DIAGNOSTIC (temporary, logging only, no behavior change): correlates screen lock/unlock
+    // timing against CONNECTION/TRANSPORT log lines from PairingCoordinator to find out why a
+    // screen lock on the phone causes the active connection to be lost.
+    private var screenReceiverRegistered = false
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> android.util.Log.i("Bridgey", "LIFECYCLE screen off")
+                Intent.ACTION_SCREEN_ON -> android.util.Log.i("Bridgey", "LIFECYCLE screen on")
+                Intent.ACTION_USER_PRESENT -> android.util.Log.i("Bridgey", "LIFECYCLE user present (unlocked)")
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         isPrimaryUser = getSystemService(UserManager::class.java).isSystemUser
@@ -93,6 +107,17 @@ class BridgeyApplication : Application() {
             lastBatteryIntent = registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
             batteryReceiverRegistered = true
         }
+        if (!screenReceiverRegistered) {
+            registerReceiver(
+                screenReceiver,
+                IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_OFF)
+                    addAction(Intent.ACTION_SCREEN_ON)
+                    addAction(Intent.ACTION_USER_PRESENT)
+                },
+            )
+            screenReceiverRegistered = true
+        }
         lastBatteryIntent?.let(::publishBattery)
     }
 
@@ -104,6 +129,10 @@ class BridgeyApplication : Application() {
         if (batteryReceiverRegistered) {
             runCatching { unregisterReceiver(batteryReceiver) }
             batteryReceiverRegistered = false
+        }
+        if (screenReceiverRegistered) {
+            runCatching { unregisterReceiver(screenReceiver) }
+            screenReceiverRegistered = false
         }
         discovery.stop()
         pairing.pause()

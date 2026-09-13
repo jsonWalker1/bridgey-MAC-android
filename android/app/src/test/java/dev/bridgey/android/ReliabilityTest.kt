@@ -1,10 +1,13 @@
 package dev.bridgey.android
 
 import java.io.ByteArrayInputStream
+import java.io.IOException
+import java.net.ServerSocket
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ReliabilityTest {
@@ -41,6 +44,22 @@ class ReliabilityTest {
     @Test fun reconnectBackoffIsBounded() {
         assertEquals(listOf(1_000L, 2_000L, 4_000L, 8_000L, 16_000L, 30_000L, 30_000L),
             (0..6).map(::reconnectDelayMillis))
+    }
+
+    @Test fun connectWithTimeoutSucceedsAgainstAListeningLoopbackServer() {
+        ServerSocket(0).use { server ->
+            connectWithTimeout("127.0.0.1", server.localPort, timeoutMillis = 2_000).use { client ->
+                assertTrue(client.isConnected)
+            }
+        }
+    }
+
+    @Test fun connectWithTimeoutClosesTheSocketAndThrowsWhenNothingIsListening() {
+        val unusedPort = ServerSocket(0).use { it.localPort }
+
+        assertThrows(IOException::class.java) {
+            connectWithTimeout("127.0.0.1", unusedPort, timeoutMillis = 2_000)
+        }
     }
 
     @Test fun heartbeatTimeoutRequiresNegotiatedSupport() {
