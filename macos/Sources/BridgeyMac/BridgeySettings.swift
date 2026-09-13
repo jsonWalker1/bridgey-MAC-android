@@ -35,6 +35,24 @@ func featureEnabledByLegacyPeer(_ feature: BridgeyFeature) -> Bool {
     ![.calls, .ping, .links, .media, .photoSync].contains(feature)
 }
 
+enum PhotoSyncDestination: String, CaseIterable, Identifiable {
+    case folderAndPhotos = "folder_and_photos"
+    case photosOnly = "photos_only"
+    case folderOnly = "folder_only"
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .folderAndPhotos: "Folder and Photos"
+        case .photosOnly: "Photos only"
+        case .folderOnly: "Folder only"
+        }
+    }
+
+    var savesToFolder: Bool { self != .photosOnly }
+    var savesToPhotosLibrary: Bool { self != .folderOnly }
+}
+
 func effectiveFeatureEnabled(globalEnabled: Bool, deviceEnabled: Bool?) -> Bool {
     globalEnabled && deviceEnabled != false
 }
@@ -64,6 +82,7 @@ final class BridgeySettings: ObservableObject {
     @Published private(set) var deviceFeatures: [String: [BridgeyFeature: Bool]]
     @Published private(set) var receiveFolderPath: String
     @Published private(set) var syncFolderPath: String
+    @Published private(set) var syncDestination: PhotoSyncDestination
     @Published private(set) var launchAtLogin = false
     @Published private(set) var loginItemMessage: String?
     @Published private(set) var hasCompletedOnboarding: Bool
@@ -97,6 +116,8 @@ final class BridgeySettings: ObservableObject {
         syncFolderPath = storedDefaults.string(forKey: "settings.syncFolderPath")
             ?? FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first!
                 .appendingPathComponent("Bridgey", isDirectory: true).path
+        syncDestination = storedDefaults.string(forKey: "settings.syncDestination")
+            .flatMap(PhotoSyncDestination.init(rawValue:)) ?? .folderAndPhotos
         refreshLoginItemStatus()
     }
 
@@ -190,6 +211,11 @@ final class BridgeySettings: ObservableObject {
             defaults.set(bookmark, forKey: "settings.syncFolderBookmark")
         }
         syncFolderPath = url.path
+    }
+
+    func setSyncDestination(_ value: PhotoSyncDestination) {
+        defaults.set(value.rawValue, forKey: "settings.syncDestination")
+        syncDestination = value
     }
 
     func syncDirectoryAccess() -> ReceiveDirectoryAccess {

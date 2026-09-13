@@ -413,6 +413,7 @@ private fun BridgeyApp(
                         BridgeyNotificationListenerService.callPermissionsChanged()
                     }
                 },
+                onSyncExistingLibraryChanged = settings::setSyncExistingLibraryEnabled,
                 onForget = pairing::forget,
                 onExportDiagnostics = onExportDiagnostics,
                 modifier = Modifier.padding(padding),
@@ -592,6 +593,7 @@ private fun SettingsScreen(
     onDeviceFeatureChanged: (String, BridgeyFeature, Boolean) -> Unit,
     onNotificationApplicationChanged: (String, Boolean) -> Unit,
     onDirectCallsChanged: (Boolean) -> Unit,
+    onSyncExistingLibraryChanged: (Boolean) -> Unit,
     onForget: (String) -> Unit,
     onExportDiagnostics: () -> Unit,
     modifier: Modifier = Modifier,
@@ -655,6 +657,42 @@ private fun SettingsScreen(
                         Switch(
                             checked = state.directCallsEnabled,
                             onCheckedChange = onDirectCallsChanged,
+                        )
+                    }
+                }
+            }
+        }
+
+        if (state.globalFeatures[BridgeyFeature.PHOTO_SYNC] != false) {
+            item {
+                Card(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Text("Sync existing photos & videos too", fontWeight = FontWeight.Medium)
+                            Text(
+                                "Off by default: only new photos and videos taken from now on are synced. Turn this on to also send your whole existing gallery once.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = state.syncExistingLibraryEnabled,
+                            onCheckedChange = onSyncExistingLibraryChanged,
+                        )
+                    }
+                }
+            }
+            item {
+                Card(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Background reliability", fontWeight = FontWeight.Medium)
+                        Text(
+                            "Some phones (including Samsung's \"Sleeping apps\" battery feature) can pause Bridgey in the background over long periods away from your Mac, which delays reconnecting and syncing. For reliable sync — especially after a whole day out — exclude Bridgey from battery optimization in Settings → Apps → Bridgey → Battery.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }

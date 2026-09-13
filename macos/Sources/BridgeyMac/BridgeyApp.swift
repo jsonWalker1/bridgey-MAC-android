@@ -39,6 +39,7 @@ struct BridgeyApp: App {
     }
 
     private var menuBarSymbol: String {
+        if pairing.fileTransferActive { return "arrow.up.arrow.down.circle.fill" }
         if case .connected = pairing.state { return "link.circle.fill" }
         return "link.circle"
     }
@@ -468,6 +469,14 @@ private struct SettingsView: View {
                 HStack {
                     LabeledContent("Synced photos & videos", value: settings.syncFolderPath)
                     Button("Choose…") { settings.chooseSyncFolder() }
+                }
+                Picker("Save synced photos to", selection: Binding(
+                    get: { settings.syncDestination },
+                    set: { settings.setSyncDestination($0) }
+                )) {
+                    ForEach(PhotoSyncDestination.allCases) { destination in
+                        Text(destination.title).tag(destination)
+                    }
                 }
             }
             Section("Features") {

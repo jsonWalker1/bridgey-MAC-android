@@ -202,7 +202,7 @@ final class PairingCoordinator: ObservableObject {
     private let notificationPresenter = NotificationPresenter()
     private var remoteNotificationCategories: [String: UNNotificationCategory] = [:]
     private var incomingFiles: [String: IncomingFileTransfer] = [:]
-    private var incomingSyncAssetKeys: [String: String] = [:]
+    private var incomingSyncAssets: [String: (assetKey: String, isVideo: Bool)] = [:]
     private var outgoingFiles: [String: OutgoingFileTransfer] = [:]
     private var outgoingFileSources: [String: URL] = [:]
     private var fileOperationID: UUID?
@@ -1080,8 +1080,12 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func beginFileTransferUI() {
+        // Update state only — do not force the transfer window to the front. Progress is
+        // reachable from the menu bar (icon reflects an active transfer; the panel's
+        // "N transfers" button opens the window on demand) instead of interrupting the user
+        // for every transfer, which is especially important for frequent, unattended Photo
+        // Sync sends.
         fileTransferActive = true
-        showFileTransferWindow()
     }
 
     private func startListener() {
@@ -1505,7 +1509,9 @@ final class PairingCoordinator: ObservableObject {
                 }
                 let transfer = try IncomingFileTransfer(offer: offer, directoryAccess: directoryAccess)
                 incomingFiles[offer.transferId] = transfer
-                if let assetKey = offer.assetKey { incomingSyncAssetKeys[offer.transferId] = assetKey }
+                if let assetKey = offer.assetKey {
+                    incomingSyncAssets[offer.transferId] = (assetKey, offer.mimeType.hasPrefix("video/"))
+                }
                 fileOperationID = UUID()
                 beginFileTransferUI()
                 fileTransferStatus = "Receiving \(transfer.displayName): \(transfer.progressStatus(force: true)!)"
@@ -1552,11 +1558,21 @@ final class PairingCoordinator: ObservableObject {
                     if cancelledTransferIDs.contains(completion.transferId) { return }
                     throw PairingError.invalidMessage
                 }
-                let syncAssetKey = incomingSyncAssetKeys.removeValue(forKey: completion.transferId)
+                let syncAsset = incomingSyncAssets.removeValue(forKey: completion.transferId)
                 do {
                     let destination = try transfer.finish(expectedHash: completion.sha256)
-                    if let syncAssetKey {
-                        settings.markAssetSynced(syncAssetKey, directory: destination.deletingLastPathComponent())
+                    if let syncAsset {
+                        settings.markAssetSynced(syncAsset.assetKey, directory: destination.deletingLastPathComponent())
+                        let destinationMode = settings.syncDestination
+                        if destinationMode.savesToPhotosLibrary {
+                            PhotosImport.importAsset(at: destination, isVideo: syncAsset.isVideo) { success in
+                                if !success {
+                                    NSLog("PLUGIN photo sync: %@ was not added to Photos", destination.lastPathComponent)
+                                } else if !destinationMode.savesToFolder {
+                                    try? FileManager.default.removeItem(at: destination)
+                                }
+                            }
+                        }
                     }
                     let folder = destination.deletingLastPathComponent().path
                     fileTransferStatus = "Saved \(transfer.displayName) to \(folder)"
@@ -1568,7 +1584,7 @@ final class PairingCoordinator: ObservableObject {
                         sessionId: current.id,
                         transferId: completion.transferId
                     ))
-                    if syncAssetKey == nil { NSWorkspace.shared.activateFileViewerSelecting([destination]) }
+                    if syncAsset == nil { NSWorkspace.shared.activateFileViewerSelecting([destination]) }
                     NSLog("PLUGIN file received name=%@", transfer.displayName)
                 } catch {
                     transfer.cancel()
@@ -1640,7 +1656,7 @@ final class PairingCoordinator: ObservableObject {
                 guard let transferID = message.transferId else { return }
                 markTransferCancelled(transferID)
                 incomingFiles.removeValue(forKey: transferID)?.cancel()
-                incomingSyncAssetKeys.removeValue(forKey: transferID)
+                incomingSyncAssets.removeValue(forKey: transferID)
                 outgoingFiles.removeValue(forKey: transferID)?.cancel()
                 markFileTransferFinished(id: transferID, status: "Transfer cancelled by Android")
                 fileOperationID = nil

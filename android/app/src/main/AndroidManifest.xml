@@ -11,6 +11,7 @@
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-feature android:name="android.hardware.telephony" android:required="false" />
 
     <application
@@ -70,6 +71,11 @@
             android:name=".BridgeyConnectionService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+        <receiver android:name=".BootCompletedReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
         <service android:name=".ClipboardTileService" android:exported="true"
             android:label="Bridgey clipboard" android:icon="@drawable/ic_bridgey_notification"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">

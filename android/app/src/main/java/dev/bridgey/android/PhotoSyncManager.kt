@@ -12,9 +12,11 @@ import android.os.Looper
 import android.provider.MediaStore
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Watches the device's photo/video library for new MediaStore rows and offers each one to a
@@ -59,7 +61,7 @@ internal class PhotoSyncManager(
         scanJob?.cancel()
         scanJob = scope.launch {
             delay(1_500)
-            runScan()
+            withContext(Dispatchers.IO) { runScan() }
         }
     }
 
@@ -74,6 +76,18 @@ internal class PhotoSyncManager(
     }
 
     private suspend fun runScan() {
+        if (!preferences.getBoolean(KEY_BASELINE_SEEDED, false)) {
+            if (settings.state.value.syncExistingLibraryEnabled) {
+                // The user opted into a one-time full-library dump: mark the baseline as already
+                // seeded so this branch never runs again, but fall through to the normal
+                // send loop below, which — since the ledger is still empty — treats every
+                // existing asset as pending and sends all of it.
+                preferences.edit().putBoolean(KEY_BASELINE_SEEDED, true).apply()
+            } else {
+                seedBaseline()
+                return
+            }
+        }
         if (pairing.state.value !is PairingState.Connected) return
         val ledgerKeys = preferences.getStringSet(KEY_SYNCED, emptySet()).orEmpty()
         val pending = unsyncedAssets(queryCandidates(), ledgerKeys)
@@ -82,6 +96,20 @@ internal class PhotoSyncManager(
             if (!settings.isEnabled(BridgeyFeature.PHOTO_SYNC, null)) break
             sendOne(asset)
         }
+    }
+
+    /**
+     * The first scan after Photo Sync is turned on establishes a baseline instead of sending
+     * anything: every asset that already exists in the gallery at that point is marked synced
+     * without being transferred, so enabling the feature only syncs photos/videos taken from
+     * then on rather than dumping the entire existing library.
+     */
+    private fun seedBaseline() {
+        val keys = queryCandidates().map { it.ledgerKey() }.toSet()
+        preferences.edit()
+            .putStringSet(KEY_SYNCED, keys)
+            .putBoolean(KEY_BASELINE_SEEDED, true)
+            .apply()
     }
 
     private suspend fun sendOne(asset: MediaAssetRef) {
@@ -123,5 +151,6 @@ internal class PhotoSyncManager(
 
     private companion object {
         const val KEY_SYNCED = "synced_keys"
+        const val KEY_BASELINE_SEEDED = "baseline_seeded"
     }
 }

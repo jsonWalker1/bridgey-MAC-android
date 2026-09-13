@@ -34,6 +34,7 @@ data class BridgeySettingsState(
     val notificationApplications: Map<String, String>,
     val disabledNotificationPackages: Set<String>,
     val directCallsEnabled: Boolean,
+    val syncExistingLibraryEnabled: Boolean,
 )
 
 internal fun effectiveFeatureEnabled(
@@ -110,6 +111,11 @@ class BridgeySettings(context: Context, defaultDeviceName: String) {
         mutableState.value = mutableState.value.copy(directCallsEnabled = enabled)
     }
 
+    fun setSyncExistingLibraryEnabled(enabled: Boolean) {
+        preferences.edit().putBoolean(KEY_SYNC_EXISTING_LIBRARY, enabled).apply()
+        mutableState.value = mutableState.value.copy(syncExistingLibraryEnabled = enabled)
+    }
+
     fun removeDevice(deviceId: String) {
         val editor = preferences.edit()
         BridgeyFeature.entries.forEach { editor.remove("device.$deviceId.${it.key}") }
@@ -141,6 +147,7 @@ class BridgeySettings(context: Context, defaultDeviceName: String) {
             notificationApplications = notificationApplications,
             disabledNotificationPackages = preferences.getStringSet(KEY_DISABLED_NOTIFICATION_PACKAGES, emptySet()).orEmpty(),
             directCallsEnabled = preferences.getBoolean(KEY_DIRECT_CALLS_ENABLED, false),
+            syncExistingLibraryEnabled = preferences.getBoolean(KEY_SYNC_EXISTING_LIBRARY, false),
         )
     }
 
@@ -149,5 +156,6 @@ class BridgeySettings(context: Context, defaultDeviceName: String) {
         private const val KEY_NOTIFICATION_APPLICATION_PREFIX = "notification.application."
         private const val KEY_DISABLED_NOTIFICATION_PACKAGES = "notification.disabled_packages"
         private const val KEY_DIRECT_CALLS_ENABLED = "calls.direct_enabled"
+        private const val KEY_SYNC_EXISTING_LIBRARY = "photo_sync.include_existing_library"
     }
 }

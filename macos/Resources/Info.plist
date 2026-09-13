@@ -22,6 +22,8 @@
     <string>Bridgey discovers and connects to your paired Android devices on your local network.</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>When you enable media controls, Bridgey controls your selected Music or Spotify player and shares now-playing information with your paired phone.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>When you enable photo &amp; video sync, Bridgey adds photos and videos synced from your paired phone to your Photos library.</string>
     <key>NSBonjourServices</key>
     <array>
         <string>_bridgey._tcp</string>
