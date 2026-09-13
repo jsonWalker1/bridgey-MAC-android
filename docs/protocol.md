@@ -238,6 +238,31 @@ whose local file policy is disabled can return `files.rejected` without
 decrypting or accepting the offer. It then resends `features.update` to repair
 stale UI state on the sender.
 
+#### Photo Sync (reuses `files.v1`)
+
+Photo Sync (Android → Mac only, MVP) reuses `files.v1` wire messages as-is —
+there are no new message kinds. The only protocol change is one optional field,
+`assetKey`, added to `files.offer`. Its presence is the sync signal:
+
+- `assetKey` absent: today's manual file share, gated by the `files` feature,
+  written to the general receive folder.
+- `assetKey` present: a Photo Sync asset, gated by the separate `photo_sync`
+  feature instead, written to a dedicated sync folder (default
+  `~/Pictures/Bridgey` on macOS), and checked against a dedup index before
+  being accepted.
+
+`assetKey` is the same base64 SHA-256 already computed and sent as `sha256` for
+transfer verification — content hash doubles as the stable cross-device asset
+identity, so no separate identity scheme was introduced. Android keeps a local
+SharedPreferences-backed ledger keyed by `(MediaStore id, dateModified, size)`
+so it never re-offers an asset it already sent successfully; macOS keeps a
+flat, newline-delimited `.bridgey-sync-index` file inside the sync folder as a
+backstop, rejecting (via the existing `files.rejected`) an offer whose
+`assetKey` it already has even if Android's ledger were ever lost (reinstall,
+data clear). Like general file transfers, Photo Sync has no resume: an
+interrupted asset is simply retried from byte zero on the next scan, since it
+was never marked synced.
+
 ### Notifications (`notifications.send.v1`, `notifications.dismiss.v1`)
 
 `notifications.post` carries package, application name, opaque notification ID,

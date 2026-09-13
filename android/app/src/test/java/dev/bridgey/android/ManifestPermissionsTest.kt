@@ -23,6 +23,9 @@ class ManifestPermissionsTest {
                 "android.permission.CALL_PHONE",
                 "android.permission.READ_PHONE_STATE",
                 "android.permission.ANSWER_PHONE_CALLS",
+                "android.permission.READ_MEDIA_IMAGES",
+                "android.permission.READ_MEDIA_VIDEO",
+                "android.permission.READ_EXTERNAL_STORAGE",
             ),
             declared,
         )

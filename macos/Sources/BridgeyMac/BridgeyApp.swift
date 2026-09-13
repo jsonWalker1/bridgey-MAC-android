@@ -465,6 +465,10 @@ private struct SettingsView: View {
                     LabeledContent("Received files", value: settings.receiveFolderPath)
                     Button("Choose…") { settings.chooseReceiveFolder() }
                 }
+                HStack {
+                    LabeledContent("Synced photos & videos", value: settings.syncFolderPath)
+                    Button("Choose…") { settings.chooseSyncFolder() }
+                }
             }
             Section("Features") {
                 Text("These switches control what this Mac shares with every paired device. Changes appear on a connected device immediately.")

@@ -26,6 +26,8 @@ class BridgeyApplication : Application() {
         private set
     lateinit var settings: BridgeySettings
         private set
+    internal lateinit var photoSync: PhotoSyncManager
+        private set
     var isBridgeyEnabled: Boolean = false
         private set
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -66,6 +68,7 @@ class BridgeyApplication : Application() {
         val deviceName = settings.state.value.deviceName
         pairing = PairingCoordinator(this, deviceId, deviceName, settings = settings)
         discovery = NsdDiscoveryService(this, LocalDiscoveryIdentity(deviceId, deviceName))
+        photoSync = PhotoSyncManager(this, pairing, settings, applicationScope)
         applicationScope.launch {
             combine(discovery.peers, pairing.trustedDeviceIds, pairing.state) { peers, trustedIds, state ->
                 Triple(peers, trustedIds, state)
@@ -82,11 +85,15 @@ class BridgeyApplication : Application() {
                     }
                 } else if (state is PairingState.Connected) {
                     lastBatteryIntent?.let(::publishBattery)
+                    photoSync.requestScan()
                 }
             }
         }
         applicationScope.launch {
-            settings.state.collect { lastBatteryIntent?.let(::publishBattery) }
+            settings.state.collect {
+                lastBatteryIntent?.let(::publishBattery)
+                photoSync.requestScan()
+            }
         }
         applicationScope.launch {
             pairing.remoteFeatures.collect { features ->
@@ -103,6 +110,7 @@ class BridgeyApplication : Application() {
         isBridgeyEnabled = true
         pairing.start()
         discovery.start()
+        photoSync.start()
         if (!batteryReceiverRegistered) {
             lastBatteryIntent = registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
             batteryReceiverRegistered = true
@@ -136,6 +144,7 @@ class BridgeyApplication : Application() {
         }
         discovery.stop()
         pairing.pause()
+        photoSync.stop()
     }
 
     fun updateDeviceName(value: String) {

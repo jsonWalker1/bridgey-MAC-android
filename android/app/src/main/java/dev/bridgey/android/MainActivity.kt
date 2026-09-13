@@ -88,6 +88,7 @@ private enum class PermissionPrompt {
     BridgeyNotifications,
     NotificationForwarding,
     DirectCalls,
+    PhotoSync,
 }
 
 private data class SharedContent(
@@ -101,6 +102,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var bridgeySettings: BridgeySettings
     private var notificationAccessEnabled by mutableStateOf(false)
     private var appNotificationsEnabled by mutableStateOf(false)
+    private var mediaPermissionGranted by mutableStateOf(false)
     private var sharedContent by mutableStateOf<SharedContent?>(null)
     private var showOnboarding by mutableStateOf(false)
     private val notificationPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -109,6 +111,13 @@ class MainActivity : ComponentActivity() {
     private val callPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         bridgeySettings.setDirectCallsEnabled(hasCallIntegrationPermissions())
         BridgeyNotificationListenerService.callPermissionsChanged()
+    }
+    private val mediaPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        refreshPermissionState()
+        if (mediaPermissionGranted) {
+            bridgeySettings.setGlobal(BridgeyFeature.PHOTO_SYNC, true)
+            (application as BridgeyApplication).photoSync.requestScan()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -145,6 +154,8 @@ class MainActivity : ComponentActivity() {
                         startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                     },
                     onRequestDirectCalls = ::requestDirectCalls,
+                    mediaPermissionGranted = mediaPermissionGranted,
+                    onRequestPhotoSync = ::requestPhotoSync,
                     onExportDiagnostics = ::exportDiagnostics,
                     sharedContent = sharedContent,
                     onSharedContentHandled = ::clearSharedContent,
@@ -200,12 +211,20 @@ class MainActivity : ComponentActivity() {
     private fun refreshPermissionState() {
         appNotificationsEnabled = getSystemService(NotificationManager::class.java).areNotificationsEnabled()
         notificationAccessEnabled = NotificationAccess.isEnabled(this)
+        mediaPermissionGranted = hasMediaIntegrationPermissions()
         if (
             ::bridgeySettings.isInitialized && bridgeySettings.state.value.directCallsEnabled &&
             !hasCallIntegrationPermissions()
         ) {
             bridgeySettings.setDirectCallsEnabled(false)
             BridgeyNotificationListenerService.callPermissionsChanged()
+        }
+        if (
+            ::bridgeySettings.isInitialized &&
+            bridgeySettings.state.value.globalFeatures[BridgeyFeature.PHOTO_SYNC] != false &&
+            !mediaPermissionGranted
+        ) {
+            bridgeySettings.setGlobal(BridgeyFeature.PHOTO_SYNC, false)
         }
     }
 
@@ -231,6 +250,18 @@ class MainActivity : ComponentActivity() {
             callPermissionLauncher.launch(CALL_INTEGRATION_PERMISSIONS)
         }
     }
+
+    private fun requestPhotoSync() {
+        if (hasMediaIntegrationPermissions()) {
+            bridgeySettings.setGlobal(BridgeyFeature.PHOTO_SYNC, true)
+            (application as BridgeyApplication).photoSync.requestScan()
+        } else {
+            mediaPermissionLauncher.launch(MEDIA_SYNC_PERMISSIONS)
+        }
+    }
+
+    private fun hasMediaIntegrationPermissions(): Boolean =
+        MEDIA_SYNC_PERMISSIONS.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
 
     private fun hasCallIntegrationPermissions(): Boolean =
         CALL_INTEGRATION_PERMISSIONS.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
@@ -303,6 +334,8 @@ private fun BridgeyApp(
     onOpenAppNotificationSettings: () -> Unit,
     onOpenNotificationAccessSettings: () -> Unit,
     onRequestDirectCalls: () -> Unit,
+    mediaPermissionGranted: Boolean,
+    onRequestPhotoSync: () -> Unit,
     onExportDiagnostics: () -> Unit,
     sharedContent: SharedContent?,
     onSharedContentHandled: () -> Unit,
@@ -351,11 +384,15 @@ private fun BridgeyApp(
                 remoteFeatures = remoteFeatures,
                 onDeviceNameChanged = onDeviceNameChanged,
                 onGlobalFeatureChanged = { feature, enabled ->
-                    settings.setGlobal(feature, enabled)
-                    if (feature == BridgeyFeature.FIND_DEVICE && !enabled) pairing.stopFinding()
-                    if (feature == BridgeyFeature.CALLS && !enabled) {
-                        settings.setDirectCallsEnabled(false)
-                        BridgeyNotificationListenerService.callPermissionsChanged()
+                    if (feature == BridgeyFeature.PHOTO_SYNC && enabled && !mediaPermissionGranted) {
+                        permissionPrompt = PermissionPrompt.PhotoSync
+                    } else {
+                        settings.setGlobal(feature, enabled)
+                        if (feature == BridgeyFeature.FIND_DEVICE && !enabled) pairing.stopFinding()
+                        if (feature == BridgeyFeature.CALLS && !enabled) {
+                            settings.setDirectCallsEnabled(false)
+                            BridgeyNotificationListenerService.callPermissionsChanged()
+                        }
                     }
                 },
                 onDeviceFeatureChanged = { deviceId, feature, enabled ->
@@ -450,6 +487,7 @@ private fun BridgeyApp(
     permissionPrompt?.let { prompt ->
         val isForwarding = prompt == PermissionPrompt.NotificationForwarding
         val isDirectCalls = prompt == PermissionPrompt.DirectCalls
+        val isPhotoSync = prompt == PermissionPrompt.PhotoSync
         AlertDialog(
             onDismissRequest = { permissionPrompt = null },
             title = {
@@ -457,6 +495,7 @@ private fun BridgeyApp(
                     when {
                         isForwarding -> "Forward Android notifications?"
                         isDirectCalls -> "Allow call status and controls?"
+                        isPhotoSync -> "Allow photo & video sync?"
                         else -> "Allow Bridgey notifications?"
                     },
                 )
@@ -466,6 +505,7 @@ private fun BridgeyApp(
                     when {
                         isForwarding -> "This optional access lets Bridgey read notification titles and text and send them only to your paired Mac over the encrypted local connection."
                         isDirectCalls -> "These optional Phone permissions let an authenticated paired Mac start calls, distinguish ringing from active calls, and answer, decline, or hang up. Bridgey does not read contacts or call history."
+                        isPhotoSync -> "This optional access lets Bridgey automatically send new photos and videos to your paired Mac over the encrypted local connection. Bridgey does not read any other files."
                         else -> "Bridgey uses notifications to keep the connection visible and show file transfers, received files, and Find Device. It does not use notifications for advertising."
                     },
                 )
@@ -476,6 +516,7 @@ private fun BridgeyApp(
                     when {
                         isForwarding -> onOpenNotificationAccessSettings()
                         isDirectCalls -> onRequestDirectCalls()
+                        isPhotoSync -> onRequestPhotoSync()
                         else -> onRequestAppNotifications()
                     }
                 }) { Text("Continue") }
@@ -708,6 +749,12 @@ private val CALL_INTEGRATION_PERMISSIONS = arrayOf(
     Manifest.permission.READ_PHONE_STATE,
     Manifest.permission.ANSWER_PHONE_CALLS,
 )
+
+private val MEDIA_SYNC_PERMISSIONS = if (Build.VERSION.SDK_INT >= 33) {
+    arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
+} else {
+    arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+}
 
 @Composable
 private fun FeatureToggle(title: String, enabled: Boolean, onChanged: (Boolean) -> Unit) {

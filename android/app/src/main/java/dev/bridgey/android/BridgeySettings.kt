@@ -15,10 +15,17 @@ enum class BridgeyFeature(val key: String, val title: String) {
     LINKS("links", "Web links"),
     MEDIA("media", "Mac media controls"),
     CALLS("calls", "Calls from Mac"),
+    PHOTO_SYNC("photo_sync", "Photo & video sync"),
 }
 
 internal fun featureEnabledByLegacyPeer(feature: BridgeyFeature): Boolean =
-    feature !in setOf(BridgeyFeature.CALLS, BridgeyFeature.PING, BridgeyFeature.LINKS, BridgeyFeature.MEDIA)
+    feature !in setOf(
+        BridgeyFeature.CALLS,
+        BridgeyFeature.PING,
+        BridgeyFeature.LINKS,
+        BridgeyFeature.MEDIA,
+        BridgeyFeature.PHOTO_SYNC,
+    )
 
 data class BridgeySettingsState(
     val deviceName: String,

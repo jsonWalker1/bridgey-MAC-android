@@ -650,20 +650,24 @@ class PairingCoordinator(
         mutablePhoneRinging.value = false
     }
 
-    fun sendFile(uri: Uri) {
-        if (!isFeatureAvailable(BridgeyFeature.FILES)) {
+    fun sendFile(uri: Uri, assetKey: String? = null, onResult: ((Boolean) -> Unit)? = null) {
+        val feature = if (assetKey != null) BridgeyFeature.PHOTO_SYNC else BridgeyFeature.FILES
+        if (!isFeatureAvailable(feature)) {
             mutableFileTransferStatus.value = "File transfer is turned off on one of your devices"
+            onResult?.invoke(false)
             return
         }
         val connectedSession = session
         if (connectedSession == null || mutableState.value !is PairingState.Connected) {
             mutableFileTransferStatus.value = "Not connected — file was not sent"
+            onResult?.invoke(false)
             return
         }
         val transferId = UUID.randomUUID().toString()
         outgoingFileSources[transferId] = uri
         diagnostics.record("transfer", "send_started")
         updateFileTransfer(transferId, "Selected file", "Preparing…", true)
+        var succeeded = false
         val job = scope.launch {
             val resolver = appContext.contentResolver
             val metadata = runCatching {
@@ -716,6 +720,7 @@ class PairingCoordinator(
                 .put("mimeType", metadata.second)
                 .put("size", metadata.third)
                 .put("sha256", hash)
+                .apply { if (assetKey != null) put("assetKey", assetKey) }
                 .toString().toByteArray()
             val offer = Crypto.encrypt(connectedSession.pairingKey!!, offerPayload)
             val accepted = CompletableDeferred<Boolean>()
@@ -792,6 +797,7 @@ class PairingCoordinator(
                 outgoingFileSources.remove(transferId)
                 updateFileTransfer(transferId, metadata.first, "${metadata.first} saved on Mac", false)
                 diagnostics.record("transfer", "send_completed")
+                succeeded = true
             } else {
                 pendingFileCompletions.remove(transferId)
                 if (transferId in cancelledTransferIds || outgoingFileJobs[transferId] == null) return@launch
@@ -799,7 +805,11 @@ class PairingCoordinator(
             }
         }
         outgoingFileJobs[transferId] = job
-        job.invokeOnCompletion { outgoingFileJobs.remove(transferId, job) }
+        job.invokeOnCompletion { outgoingFileJobs.remove(transferId, job); onResult?.invoke(succeeded) }
+    }
+
+    fun sendSyncAsset(uri: Uri, assetKey: String, onResult: (Boolean) -> Unit) {
+        sendFile(uri, assetKey = assetKey, onResult = onResult)
     }
 
     fun cancelFileTransfer(transferId: String) {

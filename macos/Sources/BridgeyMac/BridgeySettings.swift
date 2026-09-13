@@ -12,6 +12,7 @@ enum BridgeyFeature: String, CaseIterable, Identifiable {
     case links
     case media
     case calls
+    case photoSync = "photo_sync"
 
     var id: String { rawValue }
     var title: String {
@@ -25,12 +26,13 @@ enum BridgeyFeature: String, CaseIterable, Identifiable {
         case .links: "Web links"
         case .media: "Media controls"
         case .calls: "Calls from Mac"
+        case .photoSync: "Photo & video sync"
         }
     }
 }
 
 func featureEnabledByLegacyPeer(_ feature: BridgeyFeature) -> Bool {
-    ![.calls, .ping, .links, .media].contains(feature)
+    ![.calls, .ping, .links, .media, .photoSync].contains(feature)
 }
 
 func effectiveFeatureEnabled(globalEnabled: Bool, deviceEnabled: Bool?) -> Bool {
@@ -61,6 +63,7 @@ final class BridgeySettings: ObservableObject {
     @Published private(set) var globalFeatures: [BridgeyFeature: Bool]
     @Published private(set) var deviceFeatures: [String: [BridgeyFeature: Bool]]
     @Published private(set) var receiveFolderPath: String
+    @Published private(set) var syncFolderPath: String
     @Published private(set) var launchAtLogin = false
     @Published private(set) var loginItemMessage: String?
     @Published private(set) var hasCompletedOnboarding: Bool
@@ -75,7 +78,7 @@ final class BridgeySettings: ObservableObject {
         hasCompletedOnboarding = storedDefaults.bool(forKey: "settings.onboarding.completed")
         notificationHistoryEnabled = storedDefaults.bool(forKey: "settings.notificationHistory.enabled")
         globalFeatures = Dictionary(uniqueKeysWithValues: BridgeyFeature.allCases.map {
-            ($0, storedDefaults.object(forKey: "settings.global.\($0.rawValue)") as? Bool ?? ($0 != .media))
+            ($0, storedDefaults.object(forKey: "settings.global.\($0.rawValue)") as? Bool ?? ![.media, .photoSync].contains($0))
         })
         var perDevice: [String: [BridgeyFeature: Bool]] = [:]
         for (key, value) in storedDefaults.dictionaryRepresentation() where key.hasPrefix("settings.device.") {
@@ -90,6 +93,9 @@ final class BridgeySettings: ObservableObject {
         deviceFeatures = perDevice
         receiveFolderPath = storedDefaults.string(forKey: "settings.receiveFolderPath")
             ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+                .appendingPathComponent("Bridgey", isDirectory: true).path
+        syncFolderPath = storedDefaults.string(forKey: "settings.syncFolderPath")
+            ?? FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first!
                 .appendingPathComponent("Bridgey", isDirectory: true).path
         refreshLoginItemStatus()
     }
@@ -168,6 +174,69 @@ final class BridgeySettings: ObservableObject {
             }
         }
         return ReceiveDirectoryAccess(url: URL(fileURLWithPath: receiveFolderPath, isDirectory: true), scoped: false)
+    }
+
+    func chooseSyncFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose where Bridgey saves synced photos & videos"
+        panel.prompt = "Choose"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: syncFolderPath, isDirectory: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        defaults.set(url.path, forKey: "settings.syncFolderPath")
+        if let bookmark = try? url.bookmarkData(options: .withSecurityScope) {
+            defaults.set(bookmark, forKey: "settings.syncFolderBookmark")
+        }
+        syncFolderPath = url.path
+    }
+
+    func syncDirectoryAccess() -> ReceiveDirectoryAccess {
+        if let data = defaults.data(forKey: "settings.syncFolderBookmark") {
+            var stale = false
+            if let url = try? URL(
+                resolvingBookmarkData: data,
+                options: .withSecurityScope,
+                relativeTo: nil,
+                bookmarkDataIsStale: &stale
+            ) {
+                let scoped = url.startAccessingSecurityScopedResource()
+                if stale, let refreshed = try? url.bookmarkData(options: .withSecurityScope) {
+                    defaults.set(refreshed, forKey: "settings.syncFolderBookmark")
+                }
+                return ReceiveDirectoryAccess(url: url, scoped: scoped)
+            }
+        }
+        return ReceiveDirectoryAccess(url: URL(fileURLWithPath: syncFolderPath, isDirectory: true), scoped: false)
+    }
+
+    /// A flat, append-only list of already-synced asset keys living next to the synced files
+    /// themselves — the backstop dedup check so a Mac never re-saves an asset it already has,
+    /// even if Android's own local ledger were ever lost (reinstall, data clear).
+    private func syncIndexURL(directory: URL) -> URL {
+        directory.appendingPathComponent(".bridgey-sync-index")
+    }
+
+    func isAssetSynced(_ assetKey: String, directory: URL) -> Bool {
+        syncedAssetKeys(directory: directory).contains(assetKey)
+    }
+
+    func markAssetSynced(_ assetKey: String, directory: URL) {
+        let url = syncIndexURL(directory: directory)
+        guard let data = (assetKey + "\n").data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            handle.seekToEndOfFile()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    private func syncedAssetKeys(directory: URL) -> Set<String> {
+        guard let contents = try? String(contentsOf: syncIndexURL(directory: directory), encoding: .utf8) else { return [] }
+        return Set(contents.split(separator: "\n").map(String.init))
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {

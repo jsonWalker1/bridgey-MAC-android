@@ -92,6 +92,7 @@ private struct FileOfferPayload: Codable {
     let mimeType: String
     let size: Int64
     let sha256: String
+    var assetKey: String? = nil
 }
 
 private struct FileCompletePayload: Codable {
@@ -201,6 +202,7 @@ final class PairingCoordinator: ObservableObject {
     private let notificationPresenter = NotificationPresenter()
     private var remoteNotificationCategories: [String: UNNotificationCategory] = [:]
     private var incomingFiles: [String: IncomingFileTransfer] = [:]
+    private var incomingSyncAssetKeys: [String: String] = [:]
     private var outgoingFiles: [String: OutgoingFileTransfer] = [:]
     private var outgoingFileSources: [String: URL] = [:]
     private var fileOperationID: UUID?
@@ -1463,15 +1465,6 @@ final class PairingCoordinator: ObservableObject {
                     setTransientCallStatus("Android could not \(payload.action) the call")
                 }
             case "files.offer":
-                guard featureEnabled(.files, current: current) else {
-                    current.send(PairingMessage(
-                        kind: "files.rejected",
-                        sessionId: current.id,
-                        transferId: message.transferId
-                    ))
-                    sendFeatureState()
-                    return
-                }
                 guard case .connected = state,
                       message.sessionId == current.id,
                       let messageID = message.messageId,
@@ -1487,9 +1480,32 @@ final class PairingCoordinator: ObservableObject {
                       Data(base64Encoded: offer.sha256)?.count == 32 else {
                     throw PairingError.invalidMessage
                 }
+                // A files.offer carrying an assetKey is a Photo Sync send: gated by its own
+                // feature flag and routed to the dedicated sync folder instead of the general
+                // receive folder, with a dedup check against that folder's sync index.
+                let requiredFeature: BridgeyFeature = offer.assetKey != nil ? .photoSync : .files
+                guard featureEnabled(requiredFeature, current: current) else {
+                    current.send(PairingMessage(
+                        kind: "files.rejected",
+                        sessionId: current.id,
+                        transferId: offer.transferId
+                    ))
+                    sendFeatureState()
+                    return
+                }
                 guard incomingFiles[offer.transferId] == nil else { throw PairingError.invalidMessage }
-                let transfer = try IncomingFileTransfer(offer: offer, directoryAccess: settings.receiveDirectoryAccess())
+                let directoryAccess = offer.assetKey != nil ? settings.syncDirectoryAccess() : settings.receiveDirectoryAccess()
+                if let assetKey = offer.assetKey, settings.isAssetSynced(assetKey, directory: directoryAccess.url) {
+                    current.send(PairingMessage(
+                        kind: "files.rejected",
+                        sessionId: current.id,
+                        transferId: offer.transferId
+                    ))
+                    return
+                }
+                let transfer = try IncomingFileTransfer(offer: offer, directoryAccess: directoryAccess)
                 incomingFiles[offer.transferId] = transfer
+                if let assetKey = offer.assetKey { incomingSyncAssetKeys[offer.transferId] = assetKey }
                 fileOperationID = UUID()
                 beginFileTransferUI()
                 fileTransferStatus = "Receiving \(transfer.displayName): \(transfer.progressStatus(force: true)!)"
@@ -1536,8 +1552,12 @@ final class PairingCoordinator: ObservableObject {
                     if cancelledTransferIDs.contains(completion.transferId) { return }
                     throw PairingError.invalidMessage
                 }
+                let syncAssetKey = incomingSyncAssetKeys.removeValue(forKey: completion.transferId)
                 do {
                     let destination = try transfer.finish(expectedHash: completion.sha256)
+                    if let syncAssetKey {
+                        settings.markAssetSynced(syncAssetKey, directory: destination.deletingLastPathComponent())
+                    }
                     let folder = destination.deletingLastPathComponent().path
                     fileTransferStatus = "Saved \(transfer.displayName) to \(folder)"
                     updateFileTransfer(id: completion.transferId, name: transfer.displayName, status: fileTransferStatus!, active: false)
@@ -1548,7 +1568,7 @@ final class PairingCoordinator: ObservableObject {
                         sessionId: current.id,
                         transferId: completion.transferId
                     ))
-                    NSWorkspace.shared.activateFileViewerSelecting([destination])
+                    if syncAssetKey == nil { NSWorkspace.shared.activateFileViewerSelecting([destination]) }
                     NSLog("PLUGIN file received name=%@", transfer.displayName)
                 } catch {
                     transfer.cancel()
@@ -1620,6 +1640,7 @@ final class PairingCoordinator: ObservableObject {
                 guard let transferID = message.transferId else { return }
                 markTransferCancelled(transferID)
                 incomingFiles.removeValue(forKey: transferID)?.cancel()
+                incomingSyncAssetKeys.removeValue(forKey: transferID)
                 outgoingFiles.removeValue(forKey: transferID)?.cancel()
                 markFileTransferFinished(id: transferID, status: "Transfer cancelled by Android")
                 fileOperationID = nil
