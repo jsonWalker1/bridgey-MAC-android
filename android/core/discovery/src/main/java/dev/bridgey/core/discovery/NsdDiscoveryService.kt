@@ -1,10 +1,15 @@
 package dev.bridgey.core.discovery
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import java.net.InetAddress
 import java.util.UUID
@@ -20,10 +25,25 @@ class NsdDiscoveryService(
 ) : DiscoveryService {
     private val nsd = context.applicationContext.getSystemService(NsdManager::class.java)
     private val wifiManager = context.applicationContext.getSystemService(WifiManager::class.java)
+    private val connectivityManager = context.applicationContext.getSystemService(ConnectivityManager::class.java)
     private val found = ConcurrentHashMap<String, DiscoveredPeer>()
     private val mutablePeers = MutableStateFlow<List<DiscoveredPeer>>(emptyList())
     override val peers: StateFlow<List<DiscoveredPeer>> = mutablePeers.asStateFlow()
     private var running = false
+    private var lastRestartElapsedMs = 0L
+
+    // mDNS browsing has no notion of "the network changed" — after a real interface swap (Wi-Fi
+    // drop/reconnect, roam to a different network), NsdManager keeps browsing on its own internal
+    // backoff schedule instead of immediately re-querying, which can leave a phone that regains
+    // Wi-Fi in the background silently undiscoverable for many minutes until that schedule happens
+    // to line up. Restarting discovery on every "network available" event forces an immediate
+    // fresh query instead of waiting on that backoff.
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            Log.i(TAG, "DISCOVERY network available, restarting discovery")
+            restartNsd()
+        }
+    }
 
     // Without this, the Wi-Fi radio can silently drop incoming mDNS multicast packets to save
     // power (observed in practice: our own service registers fine, but the peer's advertisement
@@ -84,6 +104,46 @@ class NsdDiscoveryService(
             }
         }.onSuccess { multicastLock = it }
             .onFailure { Log.w(TAG, "DISCOVERY could not acquire multicast lock: ${it.message}") }
+        runCatching {
+            connectivityManager?.registerNetworkCallback(
+                NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                    .build(),
+                networkCallback,
+            )
+        }.onFailure { Log.w(TAG, "DISCOVERY could not register network callback: ${it.message}") }
+        beginNsd()
+    }
+
+    @Synchronized
+    override fun stop() {
+        if (!running) return
+        running = false
+        runCatching { connectivityManager?.unregisterNetworkCallback(networkCallback) }
+        runCatching { nsd.stopServiceDiscovery(discoveryListener) }
+        runCatching { nsd.unregisterService(registrationListener) }
+        runCatching { multicastLock?.release() }
+        multicastLock = null
+        found.clear()
+        emitPeers()
+    }
+
+    /** Re-issues registration + browse against whatever network is current. Safe to call while
+     * already running (unlike [start], which is a one-time no-op guard). */
+    @Synchronized
+    private fun restartNsd() {
+        if (!running) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastRestartElapsedMs < 3_000) return
+        lastRestartElapsedMs = now
+        runCatching { nsd.stopServiceDiscovery(discoveryListener) }
+        runCatching { nsd.unregisterService(registrationListener) }
+        found.clear()
+        emitPeers()
+        beginNsd()
+    }
+
+    private fun beginNsd() {
         val info = NsdServiceInfo().apply {
             serviceName = registeredServiceName
             serviceType = SERVICE_TYPE
@@ -95,18 +155,6 @@ class NsdDiscoveryService(
         }
         nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, registrationListener)
         nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
-    }
-
-    @Synchronized
-    override fun stop() {
-        if (!running) return
-        running = false
-        runCatching { nsd.stopServiceDiscovery(discoveryListener) }
-        runCatching { nsd.unregisterService(registrationListener) }
-        runCatching { multicastLock?.release() }
-        multicastLock = null
-        found.clear()
-        emitPeers()
     }
 
     @Synchronized
