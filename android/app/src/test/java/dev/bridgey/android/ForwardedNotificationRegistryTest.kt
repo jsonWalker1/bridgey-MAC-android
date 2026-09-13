@@ -1,7 +1,6 @@
 package dev.bridgey.android
 
 import android.app.Notification
-import android.telephony.TelephonyManager
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -51,90 +50,5 @@ class ForwardedNotificationRegistryTest {
         assertFalse(shouldIgnoreOngoingNotification(Notification.FLAG_ONGOING_EVENT, Notification.CATEGORY_CALL))
         assertTrue(shouldIgnoreOngoingNotification(Notification.FLAG_ONGOING_EVENT, Notification.CATEGORY_SERVICE))
         assertFalse(shouldIgnoreOngoingNotification(0, Notification.CATEGORY_SERVICE))
-    }
-
-    @Test fun readsBoundedCallTypeWithoutPhonePermissions() {
-        assertTrue(notificationCallType(1) == "incoming")
-        assertTrue(notificationCallType(2) == "ongoing")
-        assertTrue(notificationCallType(99) == "unknown")
-    }
-
-    @Test fun mapsPlatformPhoneStateWithoutReadingCallHistory() {
-        assertTrue(telephonyCallType(TelephonyManager.CALL_STATE_RINGING) == "incoming")
-        assertTrue(telephonyCallType(TelephonyManager.CALL_STATE_OFFHOOK) == "ongoing")
-        assertTrue(telephonyCallType(TelephonyManager.CALL_STATE_IDLE) == "idle")
-    }
-
-    @Test fun exposesRequiredCallStyleActionsWhenPhoneAppDoesNotPublishRegularActions() {
-        assertTrue(callStyleFallbackActions("incoming").map { it.title } == listOf("Decline", "Answer"))
-        assertTrue(callStyleFallbackActions("ongoing").map { it.title } == listOf("Hang Up"))
-        assertTrue(callStyleFallbackActions("screening").map { it.title } == listOf("Hang Up", "Answer"))
-        assertTrue(callStyleFallbackActions("unknown").isEmpty())
-    }
-
-    @Test fun requiredCallIntentsOverrideAnIncorrectReportedCallType() {
-        assertTrue(resolvedNotificationCallType("ongoing", hasAnswer = true, hasDecline = true, hasHangUp = false) == "incoming")
-        assertTrue(resolvedNotificationCallType("incoming", hasAnswer = false, hasDecline = false, hasHangUp = true) == "ongoing")
-        assertTrue(resolvedNotificationCallType("unknown", hasAnswer = true, hasDecline = false, hasHangUp = true) == "screening")
-        assertTrue(resolvedNotificationCallType("incoming", hasAnswer = false, hasDecline = false, hasHangUp = false) == "incoming")
-        assertTrue(resolvedNotificationCallType("ongoing", hasAnswer = true, hasDecline = true, hasHangUp = true) == "ongoing")
-    }
-
-    @Test fun samsungFullScreenCallIntentOverridesItsIncorrectOngoingType() {
-        assertTrue(
-            resolvedNotificationCallType(
-                reportedType = "ongoing",
-                hasAnswer = false,
-                hasDecline = false,
-                hasHangUp = true,
-                hasFullScreenIntent = true,
-            ) == "incoming",
-        )
-        assertTrue(
-            resolvedNotificationCallType(
-                reportedType = "ongoing",
-                hasAnswer = false,
-                hasDecline = false,
-                hasHangUp = true,
-                hasFullScreenIntent = false,
-            ) == "ongoing",
-        )
-    }
-
-    @Test fun telephonyStateOverridesAmbiguousSamsungNotificationSignals() {
-        assertTrue(
-            resolvedNotificationCallType(
-                reportedType = "ongoing",
-                hasAnswer = false,
-                hasDecline = false,
-                hasHangUp = true,
-                hasFullScreenIntent = true,
-                telephonyCallType = "incoming",
-            ) == "incoming",
-        )
-        assertTrue(
-            resolvedNotificationCallType(
-                reportedType = "ongoing",
-                hasAnswer = false,
-                hasDecline = false,
-                hasHangUp = true,
-                hasFullScreenIntent = true,
-                telephonyCallType = "ongoing",
-            ) == "ongoing",
-        )
-    }
-
-    @Test fun systemCallControlsMatchTheResolvedCallState() {
-        assertTrue(systemCallActionTitles("incoming", 36) == listOf("Decline", "Answer"))
-        assertTrue(systemCallActionTitles("ongoing", 36) == listOf("Hang Up"))
-        assertTrue(systemCallActionTitles("screening", 36) == listOf("Hang Up", "Answer"))
-        assertTrue(systemCallActionTitles("incoming", 26) == listOf("Answer"))
-        assertTrue(systemCallActionTitles("unknown", 36).isEmpty())
-    }
-
-    @Test fun ongoingCallPostsUseASettleDelayToSuppressTerminalSamsungUpdates() {
-        assertTrue(shouldDelayCallPost("ongoing"))
-        assertFalse(shouldDelayCallPost("incoming"))
-        assertFalse(shouldDelayCallPost(null))
     }
 }

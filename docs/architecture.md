@@ -120,6 +120,24 @@ with a 1 second base and 60 second cap, and resets after 30 seconds of stability
   and authenticated action tokens invoke the platform Answer, Decline, and
   Hang Up operations. Without it, Bridgey forwards only actions supplied by
   the phone application.
+- **Incoming calls, rejected approach (0.7):** a 0.7 prototype tried making a
+  non-UI companion `InCallService` (`IN_CALL_SERVICE_UI=false`) the primary
+  incoming-call signal, so Bridgey would get real Telecom `Call` state,
+  `DisconnectCause`, and caller info without reading call log or contacts.
+  Confirmed on a real Samsung device that Telecom refuses to bind a non-UI
+  `InCallService` unless the app holds `android.permission.CONTROL_INCALL_EXPERIENCE`
+  — a `signature|privileged` permission only pre-installed/OEM-signed apps can
+  hold (`dumpsys telecom`'s `InCallController` log showed
+  `Skipping binding to ...BridgeyInCallService, control: false, car-mode: false, ui: false`
+  for every other companion `InCallService` it did bind, e.g. Android Auto,
+  Samsung's own dialer, the Bluetooth telephony stack — all privileged). This
+  path was removed; a regular sideloaded/Play-distributed app cannot take it
+  without becoming the default dialer, which is out of scope (see README).
+  The `calls.v2` protocol (`calls.state`/`calls.action`, stable call ID,
+  explicit ringing/active/ended/missed) designed for that path is kept on both
+  ends as a documented, tested, but currently unused wire format — see
+  `docs/protocol.md` — in case a future call-state source (e.g. becoming the
+  default dialer, or an OEM allowlist) can populate it.
 - **Calls from Mac:** macOS sends only a strictly validated number over the
   authenticated encrypted session. Android defaults to a notification that
   opens the system dialer for user confirmation. Call status and controls are

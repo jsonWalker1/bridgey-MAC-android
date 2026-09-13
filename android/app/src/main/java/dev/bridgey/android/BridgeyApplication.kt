@@ -57,11 +57,14 @@ class BridgeyApplication : Application() {
                 Triple(peers, trustedIds, state)
             }.collect { (peers, trustedIds, state) ->
                 if (isBridgeyEnabled && state is PairingState.Idle) {
-                    peers.firstOrNull {
+                    val match = peers.firstOrNull {
                         val peerId = it.deviceIdHint
                         peerId != null && peerId in trustedIds && deviceId < peerId
-                    }?.let { peer ->
-                        peer.host?.let { pairing.pair(it, peer.port ?: 42_458, peer.deviceNameHint) }
+                    }
+                    val host = match?.host
+                    if (match != null && host != null) {
+                        android.util.Log.i("Bridgey", "RECONNECT auto-pair match peer=${match.deviceNameHint}")
+                        pairing.pair(host, match.port ?: 42_458, match.deviceNameHint)
                     }
                 } else if (state is PairingState.Connected) {
                     lastBatteryIntent?.let(::publishBattery)

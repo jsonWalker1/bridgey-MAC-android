@@ -1,7 +1,5 @@
 package dev.bridgey.android
 
-import android.Manifest
-import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -9,21 +7,15 @@ import android.app.RemoteInput
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
-import android.telecom.TelecomManager
-import android.telephony.TelephonyCallback
-import android.telephony.TelephonyManager
 import android.util.Base64
-import androidx.annotation.RequiresApi
 import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
 
@@ -35,10 +27,17 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val pendingCallPosts = mutableMapOf<String, Runnable>()
     private val forwardedNotificationIds = mutableSetOf<String>()
-    private var telephonyCallback: TelephonyCallback? = null
+    private val callsController = CallsController(
+        context = this,
+        isCallIntegrationEnabled = { (application as BridgeyApplication).settings.state.value.directCallsEnabled },
+    )
+    private val callStateListener = object : CallsController.CallActivityListener {
+        override fun onRingingOrActive() = refreshActiveCallNotifications()
+        override fun onIdle() = removeActiveForwardedCalls()
+    }
 
     override fun onDestroy() {
-        unregisterTelephonyCallback()
+        callsController.unregisterTelephonyCallback()
         pendingCallPosts.values.forEach(mainHandler::removeCallbacks)
         pendingCallPosts.clear()
         if (activeService?.get() === this) activeService = null
@@ -51,12 +50,12 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
         activeNotifications.orEmpty()
             .filterNot { it.packageName == packageName }
             .forEach { forwardedNotifications.record(notificationToken(it.key), it.key, it.packageName) }
-        updateTelephonyCallback()
+        callsController.updateTelephonyCallback(callStateListener)
         android.util.Log.i("Bridgey", "PLUGIN notification listener connected")
     }
 
     override fun onListenerDisconnected() {
-        unregisterTelephonyCallback()
+        callsController.unregisterTelephonyCallback()
         if (activeService?.get() === this) activeService = null
         super.onListenerDisconnected()
     }
@@ -87,7 +86,7 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
         if (!bridgey.settings.isNotificationApplicationEnabled(sbn.packageName)) return
         val applicationIcon = applicationIcon(sbn.packageName)
 
-        val telephonyCallType = if (isCall) currentTelephonyCallType() else null
+        val telephonyCallType = if (isCall) callsController.currentTelephonyCallType() else null
         if (telephonyCallType == "idle") {
             removeForwardedCall(sbn.key)
             return
@@ -98,7 +97,7 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
         val callType = if (isCall) resolvedNotificationCallType(notification, telephonyCallType) else null
         val actions = storeActions(
             notificationId,
-            notificationActionCandidates(notification, callType, canControlSystemCalls()),
+            notificationActionCandidates(notification, callType, callsController.canControlSystemCalls()),
         )
         val forward = Runnable {
             pendingCallPosts.remove(notificationId)
@@ -215,7 +214,7 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
         if (replyText != null && action.remoteInputs.isEmpty()) return false
         return runCatching {
             val succeeded = if (action.systemCallAction != null) {
-                performSystemCallAction(action.systemCallAction)
+                callsController.performSystemCallAction(action.systemCallAction)
             } else if (replyText != null && action.remoteInputs.isNotEmpty()) {
                 val results = Bundle().apply {
                     action.remoteInputs.forEach { putCharSequence(it.resultKey, replyText.take(MAX_REPLY_LENGTH)) }
@@ -238,54 +237,6 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
             android.util.Log.w("Bridgey", "PLUGIN notification action failed", it)
             false
         }
-    }
-
-    @SuppressLint("MissingPermission")
-    @Suppress("DEPRECATION")
-    private fun performSystemCallAction(action: SystemCallAction): Boolean {
-        if (!canControlSystemCalls()) return false
-        val telecom = getSystemService(TelecomManager::class.java)
-        return when (action) {
-            SystemCallAction.ANSWER -> {
-                telecom.acceptRingingCall()
-                true
-            }
-            SystemCallAction.END -> Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && telecom.endCall()
-        }
-    }
-
-    @Suppress("DEPRECATION")
-    private fun currentTelephonyCallType(): String? {
-        if (!isCallIntegrationEnabled()) return null
-        if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) return null
-        return telephonyCallType(getSystemService(TelephonyManager::class.java).callState)
-    }
-
-    private fun canControlSystemCalls(): Boolean =
-        isCallIntegrationEnabled() &&
-            checkSelfPermission(Manifest.permission.ANSWER_PHONE_CALLS) == PackageManager.PERMISSION_GRANTED
-
-    private fun isCallIntegrationEnabled(): Boolean =
-        (application as BridgeyApplication).settings.state.value.directCallsEnabled
-
-    private fun updateTelephonyCallback() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
-        unregisterTelephonyCallback()
-        if (!isCallIntegrationEnabled()) return
-        if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) return
-        val callback = BridgeyCallStateCallback()
-        runCatching {
-            getSystemService(TelephonyManager::class.java).registerTelephonyCallback(mainExecutor, callback)
-            telephonyCallback = callback
-        }.onFailure { android.util.Log.w("Bridgey", "PLUGIN call-state listener registration failed", it) }
-    }
-
-    private fun unregisterTelephonyCallback() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
-        telephonyCallback?.let { callback ->
-            runCatching { getSystemService(TelephonyManager::class.java).unregisterTelephonyCallback(callback) }
-        }
-        telephonyCallback = null
     }
 
     private fun refreshActiveCallNotifications() {
@@ -314,19 +265,6 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
         }
     }
 
-    @RequiresApi(Build.VERSION_CODES.S)
-    private inner class BridgeyCallStateCallback : TelephonyCallback(), TelephonyCallback.CallStateListener {
-        override fun onCallStateChanged(state: Int) {
-            android.util.Log.d("Bridgey", "PLUGIN telephony state=${telephonyCallType(state) ?: "idle"}")
-            when (state) {
-                TelephonyManager.CALL_STATE_RINGING,
-                TelephonyManager.CALL_STATE_OFFHOOK,
-                -> refreshActiveCallNotifications()
-                TelephonyManager.CALL_STATE_IDLE -> removeActiveForwardedCalls()
-            }
-        }
-    }
-
     companion object {
         @Volatile
         private var activeService: java.lang.ref.WeakReference<BridgeyNotificationListenerService>? = null
@@ -346,9 +284,29 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
         }
 
         fun callPermissionsChanged() {
-            activeService?.get()?.mainHandler?.post {
-                activeService?.get()?.updateTelephonyCallback()
+            activeService?.get()?.let { service ->
+                service.mainHandler.post {
+                    service.callsController.updateTelephonyCallback(service.callStateListener)
+                }
             }
+        }
+
+        /**
+         * Executes a Mac-requested answer/decline/hangup (the `calls.action` v2 message) via the
+         * same TelecomManager-backed control path already used for the notification-driven
+         * Answer/Decline/Hang Up actions. There is no per-call tracking here (that would need
+         * InCallService, which cannot bind for a non-privileged app — see CONTROL_INCALL_EXPERIENCE
+         * in docs/architecture.md), so this always acts on whatever call is currently ringing or
+         * active rather than a specific call ID.
+         */
+        fun performCallAction(action: String): Boolean {
+            val service = activeService?.get() ?: return false
+            val systemAction = when (action) {
+                "answer" -> SystemCallAction.ANSWER
+                "decline", "hangup" -> SystemCallAction.END
+                else -> return false
+            }
+            return service.callsController.performSystemCallAction(systemAction)
         }
 
         private const val MAX_FORWARDED_ACTIONS = 4
@@ -361,131 +319,6 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
         private val ICON_SIZES = listOf(64, 48, 32)
     }
 }
-
-private data class NotificationActionCandidate(
-    val title: String,
-    val pendingIntent: PendingIntent? = null,
-    val remoteInputs: List<RemoteInput> = emptyList(),
-    val systemCallAction: SystemCallAction? = null,
-)
-
-private enum class SystemCallAction { ANSWER, END }
-
-private fun notificationActionCandidates(
-    notification: Notification,
-    callType: String?,
-    canControlSystemCalls: Boolean,
-): List<NotificationActionCandidate> {
-    if (callType != null && canControlSystemCalls) {
-        return systemCallActionCandidates(callType, Build.VERSION.SDK_INT)
-    }
-    val candidates = notification.actions.orEmpty().mapNotNull { action ->
-        val pendingIntent = action.actionIntent ?: return@mapNotNull null
-        NotificationActionCandidate(
-            title = action.title?.toString().orEmpty(),
-            pendingIntent = pendingIntent,
-            remoteInputs = action.remoteInputs.orEmpty().toList(),
-        )
-    }.toMutableList()
-    if (callType == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return candidates
-
-    callStyleFallbackActions(callType).forEach { action ->
-        val pendingIntent = notification.extras.pendingIntent(action.extraKey) ?: return@forEach
-        if (candidates.none { it.pendingIntent == pendingIntent }) {
-            candidates += NotificationActionCandidate(action.title, pendingIntent)
-        }
-    }
-    return candidates
-}
-
-private fun resolvedNotificationCallType(notification: Notification, telephonyCallType: String?): String {
-    val reportedType = notificationCallType(notification.extras.getInt("android.callType", 0))
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return reportedType
-    val hasAnswer = notification.extras.pendingIntent(Notification.EXTRA_ANSWER_INTENT) != null
-    val hasDecline = notification.extras.pendingIntent(Notification.EXTRA_DECLINE_INTENT) != null
-    val hasHangUp = notification.extras.pendingIntent(Notification.EXTRA_HANG_UP_INTENT) != null
-    val hasFullScreenIntent = notification.fullScreenIntent != null
-    val resolvedType = resolvedNotificationCallType(
-        reportedType = reportedType,
-        hasAnswer = hasAnswer,
-        hasDecline = hasDecline,
-        hasHangUp = hasHangUp,
-        hasFullScreenIntent = hasFullScreenIntent,
-        telephonyCallType = telephonyCallType,
-    )
-    android.util.Log.d(
-        "Bridgey",
-        "PLUGIN call state reported=$reportedType resolved=$resolvedType " +
-            "phoneState=${telephonyCallType ?: "unavailable"} fullScreen=$hasFullScreenIntent " +
-            "answer=$hasAnswer decline=$hasDecline hangUp=$hasHangUp",
-    )
-    return resolvedType
-}
-
-internal fun resolvedNotificationCallType(
-    reportedType: String,
-    hasAnswer: Boolean,
-    hasDecline: Boolean,
-    hasHangUp: Boolean,
-    hasFullScreenIntent: Boolean = false,
-    telephonyCallType: String? = null,
-): String = when {
-    telephonyCallType == "incoming" -> "incoming"
-    telephonyCallType == "ongoing" -> "ongoing"
-    // Samsung's dialer reports CALL_TYPE_ONGOING while the phone is still ringing.
-    // Its full-screen intent is the stable, language-independent incoming-call signal.
-    hasFullScreenIntent -> "incoming"
-    hasAnswer && hasDecline && !hasHangUp -> "incoming"
-    hasAnswer && hasHangUp && !hasDecline -> "screening"
-    hasHangUp && !hasAnswer && !hasDecline -> "ongoing"
-    else -> reportedType
-}
-
-internal fun systemCallActionTitles(callType: String, sdkInt: Int): List<String> = when (callType) {
-    "incoming" -> buildList {
-        if (sdkInt >= Build.VERSION_CODES.P) add("Decline")
-        add("Answer")
-    }
-    "ongoing" -> if (sdkInt >= Build.VERSION_CODES.P) listOf("Hang Up") else emptyList()
-    "screening" -> buildList {
-        if (sdkInt >= Build.VERSION_CODES.P) add("Hang Up")
-        add("Answer")
-    }
-    else -> emptyList()
-}
-
-private fun systemCallActionCandidates(callType: String, sdkInt: Int): List<NotificationActionCandidate> =
-    systemCallActionTitles(callType, sdkInt).map { title ->
-        NotificationActionCandidate(
-            title = title,
-            systemCallAction = if (title == "Answer") SystemCallAction.ANSWER else SystemCallAction.END,
-        )
-    }
-
-internal fun shouldDelayCallPost(callType: String?): Boolean = callType == "ongoing"
-
-internal data class CallStyleFallbackAction(val title: String, val extraKey: String)
-
-internal fun callStyleFallbackActions(callType: String): List<CallStyleFallbackAction> = when (callType) {
-    "incoming" -> listOf(
-        CallStyleFallbackAction("Decline", Notification.EXTRA_DECLINE_INTENT),
-        CallStyleFallbackAction("Answer", Notification.EXTRA_ANSWER_INTENT),
-    )
-    "ongoing" -> listOf(CallStyleFallbackAction("Hang Up", Notification.EXTRA_HANG_UP_INTENT))
-    "screening" -> listOf(
-        CallStyleFallbackAction("Hang Up", Notification.EXTRA_HANG_UP_INTENT),
-        CallStyleFallbackAction("Answer", Notification.EXTRA_ANSWER_INTENT),
-    )
-    else -> emptyList()
-}
-
-@Suppress("DEPRECATION")
-private fun Bundle.pendingIntent(key: String): PendingIntent? =
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        getParcelable(key, PendingIntent::class.java)
-    } else {
-        getParcelable(key) as? PendingIntent
-    }
 
 data class ForwardedNotificationAction(
     val token: String,
@@ -539,20 +372,6 @@ internal fun notificationActionToken(notificationId: String, index: Int): String
 
 internal fun shouldIgnoreOngoingNotification(flags: Int, category: String?): Boolean =
     flags and Notification.FLAG_ONGOING_EVENT != 0 && category != Notification.CATEGORY_CALL
-
-internal fun notificationCallType(value: Int): String = when (value) {
-    1 -> "incoming"
-    2 -> "ongoing"
-    3 -> "screening"
-    else -> "unknown"
-}
-
-internal fun telephonyCallType(value: Int): String? = when (value) {
-    TelephonyManager.CALL_STATE_RINGING -> "incoming"
-    TelephonyManager.CALL_STATE_OFFHOOK -> "ongoing"
-    TelephonyManager.CALL_STATE_IDLE -> "idle"
-    else -> null
-}
 
 object NotificationAccess {
     fun isEnabled(context: Context): Boolean {

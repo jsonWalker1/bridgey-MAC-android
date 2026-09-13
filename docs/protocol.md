@@ -320,6 +320,62 @@ number the platform identifies as an emergency number. It does not request
 contacts or call-log access. Local feature policy is checked again immediately
 before any side effect. Number content is not logged.
 
+### Incoming call state (`calls.v2`) — defined, not currently sent
+
+Designed in 0.7 alongside `calls.v1`; both use the same `calls` feature
+toggle, no new capability string. **Status:** both clients implement and unit
+test this format, but nothing in the shipped Android client currently sends
+`calls.state` — it exists as a documented, ready wire format for a future
+call-state source, not as an active second incoming-call path today. The
+production incoming-call signal remains the `notifications.post` `callType`
+annotation described under Notifications below.
+
+The reason: this was originally designed around a dedicated non-UI
+`InCallService`, which would have given Android a real Telecom `Call` object
+per call (state, `DisconnectCause`, caller info) independent of notification
+parsing. A real-device test showed Telecom will not bind a non-UI
+`InCallService` for an app that lacks the `signature|privileged` permission
+`android.permission.CONTROL_INCALL_EXPERIENCE`, which a normal
+sideloaded/Play-distributed app cannot hold. See `docs/architecture.md` for
+the confirming `dumpsys telecom` evidence. That approach was removed rather
+than kept as more dead code; only the message shapes below remain, in case a
+future call-state source (becoming the default dialer, an OEM allowlist,
+etc.) can populate them without a protocol change.
+
+`calls.state` (Android → Mac) would report one call's state:
+
+```json
+{
+  "version": 1,
+  "callId": "1b0d9e3e-6a63-4a4b-9d21-6e4d7e6a9b3f",
+  "state": "ringing",
+  "callerName": "",
+  "callerNumber": "+15550100"
+}
+```
+
+`callId` is a lowercase UUID meant to stay stable for one call's entire
+lifetime; it is not a system call ID. `state` is one of `ringing`, `active`,
+`ended`, or `missed`. `callerName`/`callerNumber` are bounded (128 and 64
+UTF-8 bytes) and either may be empty.
+
+`calls.action` (Mac → Android) requests `answer`, `decline`, or `hangup` for a
+`callId` from the most recent `calls.state`:
+
+```json
+{ "version": 1, "callId": "1b0d9e3e-6a63-4a4b-9d21-6e4d7e6a9b3f", "action": "answer" }
+```
+
+Android does implement the receiving side of `calls.action`: it validates the
+message, then executes the action via the same `TelecomManager`-backed control
+already used for the notification-driven Answer/Decline/Hang Up actions
+(`acceptRingingCall()` for `answer`, `endCall()` for `decline`/`hangup`).
+Without a tracked `Call` object (no `InCallService`), this acts on whatever
+call is currently ringing or active rather than looking up the specific
+`callId` — the field is validated but not used for lookup. Android replies
+with `calls.action.ack` echoing `callId` and `action` plus `accepted`; Mac
+ignores an ack that does not match the call it currently displays.
+
 ## Compatibility
 
 Adding optional fields or message types is backward compatible. Changing field

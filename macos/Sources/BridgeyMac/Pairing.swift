@@ -21,20 +21,7 @@ struct RemoteBatteryStatus: Equatable {
     let isCharging: Bool
 }
 
-struct RemoteCallAction: Identifiable, Equatable {
-    let id: String
-    let title: String
-}
-
-struct RemoteCallStatus: Equatable {
-    let notificationID: String
-    let deviceID: String
-    let applicationName: String
-    let caller: String
-    let detail: String
-    let type: String
-    let actions: [RemoteCallAction]
-}
+// RemoteCallAction / RemoteCallStatus / CallRequestPayload live in Calls.swift.
 
 struct FileTransferRow: Identifiable, Equatable {
     let id: String
@@ -71,7 +58,7 @@ private struct BatteryPayload: Codable {
     let isCharging: Bool
 }
 
-private struct RemoteNotificationPayload: Codable {
+struct RemoteNotificationPayload: Codable {
     let packageName: String
     let applicationName: String
     let notificationId: String
@@ -83,7 +70,7 @@ private struct RemoteNotificationPayload: Codable {
     let callType: String?
 }
 
-private struct RemoteNotificationActionPayload: Codable {
+struct RemoteNotificationActionPayload: Codable {
     let actionToken: String
     let title: String
     let allowsReply: Bool
@@ -118,10 +105,6 @@ private struct FindDevicePayload: Codable {
 
 private struct PingPayload: Codable {
     let version: Int
-}
-
-private struct CallRequestPayload: Codable {
-    let number: String
 }
 
 private struct FeatureStatePayload: Codable {
@@ -177,7 +160,7 @@ final class PairingCoordinator: ObservableObject {
     @Published private(set) var androidRinging = false
     @Published private(set) var remoteFeatures = defaultRemoteFeatureState()
     @Published private(set) var notificationHistory: [NotificationHistoryItem] = []
-    @Published private(set) var remoteCall: RemoteCallStatus?
+    @Published var remoteCall: RemoteCallStatus?
     @Published private(set) var callStatus: String?
     @Published private(set) var pingStatus: String?
     let quickActions = QuickActions()
@@ -203,6 +186,7 @@ final class PairingCoordinator: ObservableObject {
     private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var heartbeatWorkItem: DispatchWorkItem?
     private var lastTrustedEndpoint: (host: String, port: Int, name: String)?
+    private var lastKnownPeers: [DiscoveredPeer] = []
     private var reconnectAttempt = 0
     private var callRequestID: String?
     private var callTimeoutWorkItem: DispatchWorkItem?
@@ -223,9 +207,10 @@ final class PairingCoordinator: ObservableObject {
     private var filePreparationCancellation: FileCancellationToken?
     private var fileTransferWindow: FileTransferWindowController?
     private var fileDropWindow: FileDropWindowController?
-    private lazy var callOverlayWindow = CallOverlayWindowController(pairing: self)
-    private var hiddenCallOverlayIdentity: String?
-    private var audibleCallIdentity: String?
+    // Accessed from the call-domain extension in Calls.swift, hence not `private`.
+    lazy var callOverlayWindow = CallOverlayWindowController(pairing: self)
+    var hiddenCallOverlayIdentity: String?
+    var audibleCallIdentity: String?
     private var cancelledTransferIDs = Set<String>()
     private var findDeviceSound: NSSound?
     private var lastSentBattery: LocalBatteryStatus?
@@ -365,11 +350,14 @@ final class PairingCoordinator: ObservableObject {
 
     func observe(_ discovery: BonjourDiscovery) {
         discoveryCancellable = discovery.$peers.sink { [weak self] peers in
+            self?.lastKnownPeers = peers
             self?.connectTrustedPeerIfNeeded(peers)
         }
     }
 
     func pair(host: String, port: Int, peerName: String) {
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
         diagnostics.record(category: "pairing", event: "connection_started")
         guard let endpointPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
             state = .failed("Invalid peer port")
@@ -377,7 +365,7 @@ final class PairingCoordinator: ObservableObject {
         }
         state = .connecting(peerName)
         lastTrustedEndpoint = (host, port, peerName)
-        NSLog("PAIRING started peer=%@", peerName)
+        NSLog("CONNECT attempting %@:%d peer=%@", host, port, peerName)
         let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
         let current = Session(connection: connection, peerName: peerName)
         current.initiatedLocally = true
@@ -434,6 +422,9 @@ final class PairingCoordinator: ObservableObject {
     func cancel() {
         connectionTimeoutWorkItem?.cancel()
         heartbeatWorkItem?.cancel()
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        reconnectAttempt = 0
         let current = session
         session = nil
         current?.send(PairingMessage(kind: "pairing.cancel", sessionId: current?.id ?? ""))
@@ -456,6 +447,9 @@ final class PairingCoordinator: ObservableObject {
     func dismiss() {
         connectionTimeoutWorkItem?.cancel()
         heartbeatWorkItem?.cancel()
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        reconnectAttempt = 0
         let current = session
         session = nil
         current?.close()
@@ -553,7 +547,32 @@ final class PairingCoordinator: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
     }
 
-    private func clearCallStatus() {
+    /// Sends an answer/decline/hangup command for a call reported over the Telecom v2 channel.
+    /// Called from performRemoteCallAction in Calls.swift, hence not `private`.
+    func sendCallControl(callID: String, action: String, deviceID: String) {
+        guard case let .connected(connectedDeviceID, _) = state,
+              connectedDeviceID == deviceID,
+              let current = session,
+              current.remoteDeviceID == deviceID,
+              featureEnabled(.calls, current: current),
+              UUID(uuidString: callID) != nil,
+              isKnownCallAction(action),
+              let plaintext = try? JSONEncoder().encode(
+                CallActionPayload(version: 1, callId: callID, action: action)
+              ),
+              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
+        current.send(PairingMessage(
+            kind: "calls.action",
+            sessionId: current.id,
+            messageId: UUID().uuidString.lowercased(),
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext
+        ))
+        diagnostics.record(category: "calls", event: "action_sent", outcome: action)
+    }
+
+    // Called from the incoming-call state machine in Calls.swift, hence not `private`.
+    func clearCallStatus() {
         callTimeoutWorkItem?.cancel()
         callTimeoutWorkItem = nil
         callStatusClearWorkItem?.cancel()
@@ -584,7 +603,8 @@ final class PairingCoordinator: ObservableObject {
         pendingCallExpiryWorkItem = nil
     }
 
-    private func setTransientCallStatus(_ status: String) {
+    // Called from updateRemoteCallFromTelecom in Calls.swift, hence not `private`.
+    func setTransientCallStatus(_ status: String) {
         callStatusClearWorkItem?.cancel()
         callStatus = status
         let work = DispatchWorkItem { [weak self] in
@@ -1082,6 +1102,20 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func accept(_ connection: NWConnection) {
+        // A session that has already identified its peer (received pairing.offer/answer) is
+        // actively mid-handshake or connected; a brand new incoming connection racing against it
+        // must not tear it down, or two devices reconnecting near the same moment can flap
+        // forever without either ever completing. Before a peer is identified, the session is
+        // cheap enough (a fresh socket, no handshake progress) that letting a fresh contender
+        // replace it is fine.
+        let stateClaimsSession: Bool
+        if case .idle = state { stateClaimsSession = false } else if case .failed = state { stateClaimsSession = false } else { stateClaimsSession = true }
+        if let existing = session, !existing.remoteDeviceID.isEmpty, stateClaimsSession {
+            NSLog("CONNECT rejecting new connection: session with peer=%@ already in progress", String(existing.remoteDeviceID.prefix(8)))
+            connection.cancel()
+            return
+        }
+        NSLog("CONNECT accepting incoming connection")
         session?.close()
         let current = Session(connection: connection, peerName: "Android device")
         current.initiatedLocally = false
@@ -1114,23 +1148,27 @@ final class PairingCoordinator: ObservableObject {
                 self.outgoingFiles.removeAll()
                 self.fileTransferStatus = "File transfer interrupted"
             }
-            if case .connected = self.state {
-                self.session = nil
-                self.remoteBattery = nil
-                self.clearPingStatus()
-                self.quickActions.reset()
-                self.mediaController.reset()
-                self.lastSentBattery = nil
-                self.clearRemoteCall()
-                self.remoteFeatures = defaultRemoteFeatureState()
-                self.remoteFeatureStateReceived = false
-                self.state = .idle
-                NSLog("TRANSPORT disconnected")
-                self.diagnostics.record(category: "transport", event: "disconnected", outcome: "reconnecting")
-                self.scheduleReconnect()
-            } else {
-                self.state = .failed("Pairing connection lost")
-            }
+            // Unified: a transport failure during the handshake (.connecting/.verification) is
+            // treated exactly like one after .connected — full cleanup, back to .idle, and a
+            // reconnect attempt scheduled if this is a trusted peer. Previously only the
+            // .connected case did this; a drop mid-handshake (common right after a network blip,
+            // exactly when a reconnect attempt is most likely to also glitch) landed in `.failed`
+            // with no automatic recovery and no log line at all.
+            let wasConnected: Bool
+            if case .connected = self.state { wasConnected = true } else { wasConnected = false }
+            self.session = nil
+            self.remoteBattery = nil
+            self.clearPingStatus()
+            self.quickActions.reset()
+            self.mediaController.reset()
+            self.lastSentBattery = nil
+            self.clearRemoteCall()
+            self.remoteFeatures = defaultRemoteFeatureState()
+            self.remoteFeatureStateReceived = false
+            self.state = .idle
+            NSLog("CONNECTION lost: wasConnected=%@", String(wasConnected))
+            self.diagnostics.record(category: "transport", event: "disconnected", outcome: "reconnecting")
+            self.scheduleReconnect()
         }
         current.connection.stateUpdateHandler = { [weak self, weak current] newState in
             DispatchQueue.main.async {
@@ -1140,7 +1178,11 @@ final class PairingCoordinator: ObservableObject {
                     NSLog("TRANSPORT connected")
                     current.receive()
                     onReady()
-                case .failed, .cancelled:
+                case let .failed(error):
+                    NSLog("TRANSPORT connection failed error=%@", String(describing: error))
+                    current.onFailure?()
+                case .cancelled:
+                    NSLog("TRANSPORT connection cancelled")
                     current.onFailure?()
                 case let .waiting(error) where localNetworkPermissionDenied(error):
                     guard self.session === current else { return }
@@ -1382,6 +1424,41 @@ final class PairingCoordinator: ObservableObject {
                 case "calls.confirmation_required": setTransientCallStatus("Confirm the call from the Android notification")
                 default: setTransientCallStatus("Android rejected the call request")
                 }
+            case "calls.state":
+                guard featureEnabled(.calls, current: current) else { return }
+                guard case .connected = state,
+                      message.sessionId == current.id,
+                      let messageID = message.messageId,
+                      current.acceptMessageID(messageID),
+                      let nonce = message.nonce,
+                      let ciphertext = message.ciphertext,
+                      let plaintext = try? decrypt(nonce: nonce, ciphertext: ciphertext, key: current.pairingKey!),
+                      let payload = try? JSONDecoder().decode(CallStatePayload.self, from: plaintext),
+                      payload.version == 1,
+                      UUID(uuidString: payload.callId) != nil,
+                      isKnownRemoteCallState(payload.state),
+                      payload.callerName.utf8.count <= 128,
+                      payload.callerNumber.utf8.count <= 64 else {
+                    throw PairingError.invalidMessage
+                }
+                updateRemoteCallFromTelecom(payload, deviceID: current.remoteDeviceID)
+            case "calls.action.ack":
+                guard case .connected = state,
+                      message.sessionId == current.id,
+                      let messageID = message.messageId,
+                      current.acceptMessageID(messageID),
+                      let nonce = message.nonce,
+                      let ciphertext = message.ciphertext,
+                      let plaintext = try? decrypt(nonce: nonce, ciphertext: ciphertext, key: current.pairingKey!),
+                      let payload = try? JSONDecoder().decode(CallActionAckPayload.self, from: plaintext),
+                      payload.version == 1 else {
+                    throw PairingError.invalidMessage
+                }
+                // Only surface a failure for the call currently displayed; an ack for a call
+                // that already ended or was replaced is a normal race, not worth reporting.
+                if !payload.accepted, remoteCall?.notificationID == payload.callId {
+                    setTransientCallStatus("Android could not \(payload.action) the call")
+                }
             case "files.offer":
                 guard featureEnabled(.files, current: current) else {
                     current.send(PairingMessage(
@@ -1572,6 +1649,15 @@ final class PairingCoordinator: ObservableObject {
             diagnostics.record(category: "pairing", event: "connected")
             reconnectAttempt = 0
             reconnectWorkItem?.cancel()
+            // lastTrustedEndpoint previously was only ever set by pair() (an outbound dial), so a
+            // peer whose most recent connection came from *them* dialing *us* (accept(_:)), or any
+            // peer after this app restarts, had a permanently inert reconnect timer for that peer.
+            // Looking it up from the current discovery snapshot instead works regardless of which
+            // side initiated, and always reflects the peer's latest known host/port.
+            if let peer = lastKnownPeers.first(where: { $0.deviceIDHint == current.remoteDeviceID }),
+               let host = peer.host, let port = peer.port {
+                lastTrustedEndpoint = (host, port, current.peerName)
+            }
             sendFeatureState()
             publishLocalBattery(force: true)
             scheduleHeartbeat(for: current)
@@ -1689,16 +1775,27 @@ final class PairingCoordinator: ObservableObject {
             guard let id = $0.deviceIDHint else { return false }
             return trustedDeviceIDs.contains(id) && deviceID < id
         }), let host = peer.host, let port = peer.port else { return }
+        NSLog("RECONNECT discovery match peer=%@", peer.deviceNameHint)
         pair(host: host, port: port, peerName: peer.deviceNameHint)
     }
 
     private func scheduleReconnect() {
-        guard let endpoint = lastTrustedEndpoint else { return }
+        guard let endpoint = lastTrustedEndpoint else {
+            NSLog("RECONNECT skipped: no known trusted endpoint yet")
+            return
+        }
         reconnectWorkItem?.cancel()
-        let delay = reconnectDelay(attempt: reconnectAttempt)
+        // Jitter is added here (not inside reconnectDelay, which stays a pure, tested function)
+        // so two devices racing to reconnect at the same moment don't stay in lockstep and keep
+        // colliding on every subsequent retry.
+        let delay = reconnectDelay(attempt: reconnectAttempt) + TimeInterval.random(in: 0..<1)
         reconnectAttempt += 1
+        NSLog("RECONNECT scheduling attempt to %@:%d in %.1fs", endpoint.host, endpoint.port, delay)
+        diagnostics.record(category: "reconnect", event: "scheduled")
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.state == .idle else { return }
+            NSLog("RECONNECT attempting %@:%d", endpoint.host, endpoint.port)
+            self.diagnostics.record(category: "reconnect", event: "attempt")
             self.pair(host: endpoint.host, port: endpoint.port, peerName: endpoint.name)
         }
         reconnectWorkItem = work
@@ -1771,52 +1868,7 @@ final class PairingCoordinator: ObservableObject {
         }
     }
 
-    func performRemoteCallAction(_ action: RemoteCallAction) {
-        guard let call = remoteCall else { return }
-        performAndroidNotificationAction(
-            call.notificationID,
-            deviceID: call.deviceID,
-            actionToken: action.id,
-            replyText: nil
-        )
-    }
-
-    func hideCallOverlay() {
-        if let call = remoteCall {
-            hiddenCallOverlayIdentity = callOverlayIdentity(call.notificationID, deviceID: call.deviceID)
-        }
-        callOverlayWindow.hide()
-    }
-
-    private func updateRemoteCall(_ payload: RemoteNotificationPayload, deviceID: String) {
-        guard let callType = normalizedRemoteCallType(payload.callType) else { return }
-        let identity = callOverlayIdentity(payload.notificationId, deviceID: deviceID)
-        if let existing = remoteCall,
-           existing.notificationID != payload.notificationId || existing.deviceID != deviceID {
-            clearRemoteCall()
-        }
-        clearCallStatus()
-        let actions = (payload.actions ?? []).filter { !$0.allowsReply }.prefix(4).map {
-            RemoteCallAction(id: $0.actionToken, title: $0.title)
-        }
-        remoteCall = RemoteCallStatus(
-            notificationID: payload.notificationId,
-            deviceID: deviceID,
-            applicationName: payload.applicationName,
-            caller: payload.title,
-            detail: remoteCallDetail(payload.text, type: callType),
-            type: callType,
-            actions: actions
-        )
-        mediaController.callChanged(active: ["incoming", "ongoing"].contains(callType))
-        if hiddenCallOverlayIdentity != identity {
-            callOverlayWindow.show()
-        }
-        if callType == "incoming", audibleCallIdentity != identity {
-            NSSound.beep()
-            audibleCallIdentity = identity
-        }
-    }
+    // performRemoteCallAction / hideCallOverlay / updateRemoteCall are defined in Calls.swift.
 
     func clearNotificationHistory() {
         notificationHistoryStore.clear()
@@ -1914,7 +1966,8 @@ final class PairingCoordinator: ObservableObject {
         diagnostics.record(category: "notification", event: "dismiss_sent")
     }
 
-    private func performAndroidNotificationAction(
+    // Called from performRemoteCallAction in Calls.swift, hence not `private`.
+    func performAndroidNotificationAction(
         _ notificationID: String,
         deviceID: String,
         actionToken: String,
@@ -1976,25 +2029,7 @@ final class PairingCoordinator: ObservableObject {
         diagnostics.record(category: "notification", event: "removed_remotely")
     }
 
-    private func clearRemoteCall() {
-        mediaController.callChanged(active: false)
-        guard let call = remoteCall else { return }
-        remoteCall = nil
-        callOverlayWindow.hide()
-        hiddenCallOverlayIdentity = nil
-        audibleCallIdentity = nil
-        let identifier = remoteNotificationRequestIdentifier(
-            deviceID: call.deviceID,
-            notificationID: call.notificationID
-        )
-        let center = UNUserNotificationCenter.current()
-        center.removeDeliveredNotifications(withIdentifiers: [identifier])
-        center.removePendingNotificationRequests(withIdentifiers: [identifier])
-    }
-
-    private func callOverlayIdentity(_ notificationID: String, deviceID: String) -> String {
-        "\(deviceID)\u{0}\(notificationID)"
-    }
+    // clearRemoteCall / callOverlayIdentity are defined in Calls.swift.
 
     private func saveTrust(_ current: Session) {
         guard let identityKey = current.remoteIdentityKey else { return }

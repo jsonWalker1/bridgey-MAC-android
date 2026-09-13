@@ -145,6 +145,8 @@ class PairingCoordinator(
     private val diagnostics = BridgeyDiagnostics()
     private val remoteCallRequest = RemoteCallRequest(appContext)
     private var lastRemoteCallRequestAt = 0L
+    private var reconnectAttempt = 0
+    private var reconnectJob: Job? = null
 
     init {
         scope.launch {
@@ -171,12 +173,17 @@ class PairingCoordinator(
     }
 
     fun pair(host: String, port: Int, peerName: String) {
+        reconnectJob?.cancel()
+        reconnectJob = null
         diagnostics.record("pairing", "connection_started")
-        android.util.Log.i("Bridgey", "PAIRING started peer=$peerName")
+        android.util.Log.i("Bridgey", "CONNECT attempting $host:$port peer=$peerName")
         mutableState.value = PairingState.Connecting(peerName)
         scope.launch {
             runCatching { Socket(host, port) }
-                .onSuccess { handle(it, initiatedLocally = true, peerHint = peerName) }
+                .onSuccess {
+                    android.util.Log.i("Bridgey", "CONNECT established $host:$port")
+                    handle(it, initiatedLocally = true, peerHint = peerName)
+                }
                 .onFailure { fail("Could not connect to $peerName") }
         }
     }
@@ -189,6 +196,9 @@ class PairingCoordinator(
     }
 
     fun cancel() {
+        reconnectJob?.cancel()
+        reconnectJob = null
+        reconnectAttempt = 0
         val current = session
         session = null
         current?.send(Message(kind = "pairing.cancel", sessionId = current.id))
@@ -203,6 +213,9 @@ class PairingCoordinator(
     }
 
     fun dismiss() {
+        reconnectJob?.cancel()
+        reconnectJob = null
+        reconnectAttempt = 0
         val current = session
         session = null
         current?.close()
@@ -499,6 +512,43 @@ class PairingCoordinator(
 
     fun sendNotificationRemoved(notificationId: String) {
         sendNotificationReference("notifications.remove", notificationId)
+    }
+
+    /**
+     * Pushes a `calls.state` (v2) update. Nothing on Android currently calls this: the
+     * incoming-call signal in production is still the notification-based callType path in
+     * sendNotification, driven by BridgeyNotificationListenerService/CallsController. A prior
+     * attempt to source this from a dedicated InCallService was reverted because Telecom will
+     * not bind a non-UI InCallService for an app that lacks the privileged
+     * `CONTROL_INCALL_EXPERIENCE` permission (see docs/architecture.md). This method and the
+     * matching Mac-side handling are kept as a ready protocol for a future call-state source.
+     */
+    fun sendCallState(callId: String, state: String, callerName: String, callerNumber: String) {
+        if (!isFeatureAvailable(BridgeyFeature.CALLS)) return
+        val connectedSession = session ?: return
+        if (mutableState.value !is PairingState.Connected) return
+        scope.launch {
+            if (session !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
+            val payload = JSONObject()
+                .put("version", 1)
+                .put("callId", callId)
+                .put("state", state)
+                .put("callerName", callerName.take(128))
+                .put("callerNumber", callerNumber.take(32))
+                .toString()
+                .toByteArray()
+            val encrypted = Crypto.encrypt(connectedSession.pairingKey!!, payload)
+            connectedSession.send(
+                Message(
+                    kind = "calls.state",
+                    sessionId = connectedSession.id,
+                    messageId = UUID.randomUUID().toString(),
+                    nonce = encrypted.nonce,
+                    ciphertext = encrypted.ciphertext,
+                ),
+            )
+            diagnostics.record("calls", "state_sent", outcome = state)
+        }
     }
 
     private fun sendNotificationReference(kind: String, notificationId: String) {
@@ -810,6 +860,8 @@ class PairingCoordinator(
     }
 
     fun pause() {
+        reconnectJob?.cancel()
+        reconnectJob = null
         val current = session
         session = null
         current?.close()
@@ -839,6 +891,23 @@ class PairingCoordinator(
     }
 
     private fun handle(socket: Socket, initiatedLocally: Boolean, peerHint: String?) {
+        val existing = session
+        if (existing != null && existing.remoteDeviceId.isNotEmpty() &&
+            mutableState.value !is PairingState.Failed && mutableState.value !is PairingState.Idle
+        ) {
+            // A session that has already identified its peer (received pairing.offer/answer) is
+            // actively mid-handshake or connected; a brand new connection attempt racing against
+            // it — ours or the peer's — must not tear it down, or two devices reconnecting near
+            // the same moment can flap forever without either ever completing. Once a session
+            // hasn't yet identified a peer, it's cheap enough (a fresh socket, no handshake
+            // progress) that letting a fresh contender replace it is fine.
+            android.util.Log.i(
+                "Bridgey",
+                "CONNECT rejecting new connection: session with peer=${existing.remoteDeviceId.take(8)} already in progress",
+            )
+            runCatching { socket.close() }
+            return
+        }
         session?.close()
         socket.keepAlive = true
         socket.tcpNoDelay = true
@@ -902,13 +971,14 @@ class PairingCoordinator(
             clearPingStatus()
             quickActions.reset()
             mutableRemoteFeatures.value = defaultFeatureState()
+            reconnectAttempt = 0
             mutableState.value = PairingState.Idle
             diagnostics.record("transport", "disconnected", "reconnecting")
-            android.util.Log.i("Bridgey", "TRANSPORT disconnected")
+            android.util.Log.i("Bridgey", "CONNECTION lost: clean disconnect after being connected")
         } else if (session === current) {
-            result.exceptionOrNull()?.let {
-                android.util.Log.w("Bridgey", "PAIRING disconnected before confirmation")
-            }
+            val reason = result.exceptionOrNull()?.let { "disconnected before confirmation: ${it.message}" }
+                ?: "disconnected before confirmation"
+            android.util.Log.w("Bridgey", "CONNECTION lost: $reason")
             fail("Pairing connection lost")
         }
     }
@@ -1000,6 +1070,7 @@ class PairingCoordinator(
             "notifications.dismiss" -> receiveNotificationDismiss(current, message)
             "notifications.action" -> receiveNotificationAction(current, message)
             "calls.request" -> receiveCallRequest(current, message)
+            "calls.action" -> receiveCallAction(current, message)
             "find.start" -> receiveFindCommand(current, message, start = true)
             "find.stop" -> receiveFindCommand(current, message, start = false)
             "find.started" -> receiveFindAcknowledgement(current, message, started = true)
@@ -1090,6 +1161,52 @@ class PairingCoordinator(
         val result = remoteCallRequest.execute(number, settings.state.value.directCallsEnabled)
         current.send(Message(kind = result.wireKind, sessionId = current.id, messageId = messageId))
         diagnostics.record("calls", "request", outcome = result.name.lowercase())
+    }
+
+    /** Handles a Mac-initiated answer/decline/hangup for a call tracked via Telecom. */
+    private fun receiveCallAction(current: Session, message: Message) {
+        val messageId = message.messageId ?: return
+        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id ||
+            !current.acceptMessageId(messageId)
+        ) return
+        if (!settings.isEnabled(BridgeyFeature.CALLS, current.remoteDeviceId)) {
+            sendFeatureState()
+            return
+        }
+        val plaintext = Crypto.decrypt(
+            current.pairingKey!!,
+            message.nonce ?: return fail("Invalid encrypted call action"),
+            message.ciphertext ?: return fail("Invalid encrypted call action"),
+        ) ?: return fail("Invalid encrypted call action")
+        val payload = runCatching { JSONObject(plaintext.toString(Charsets.UTF_8)) }.getOrNull()
+            ?: return fail("Invalid call action")
+        val callId = payload.optString("callId")
+        val action = payload.optString("action")
+        if (runCatching { UUID.fromString(callId) }.isFailure || action !in setOf("answer", "decline", "hangup")) {
+            return fail("Invalid call action")
+        }
+        // There is no per-call tracking without InCallService (see sendCallState's doc comment),
+        // so this always acts on whatever call is currently ringing or active rather than
+        // looking up this specific callId.
+        val accepted = BridgeyNotificationListenerService.performCallAction(action)
+        val ackPayload = JSONObject()
+            .put("version", 1)
+            .put("callId", callId)
+            .put("action", action)
+            .put("accepted", accepted)
+            .toString()
+            .toByteArray()
+        val encrypted = Crypto.encrypt(current.pairingKey!!, ackPayload)
+        current.send(
+            Message(
+                kind = "calls.action.ack",
+                sessionId = current.id,
+                messageId = UUID.randomUUID().toString(),
+                nonce = encrypted.nonce,
+                ciphertext = encrypted.ciphertext,
+            ),
+        )
+        diagnostics.record("calls", "action_received", outcome = "$action:${if (accepted) "accepted" else "rejected"}")
     }
 
     private fun receiveNotificationAction(current: Session, message: Message) {
@@ -1352,6 +1469,9 @@ class PairingCoordinator(
     private fun completeIfConfirmed(current: Session) {
         if (current.localConfirmed && current.remoteConfirmed) {
             trust.save(current.remoteDeviceId, current.peerName, current.remoteIdentityKey!!)
+            reconnectJob?.cancel()
+            reconnectJob = null
+            reconnectAttempt = 0
             mutableState.value = PairingState.Connected(current.remoteDeviceId, current.peerName)
             diagnostics.record("pairing", "connected")
             sendFeatureState()
@@ -1434,6 +1554,7 @@ class PairingCoordinator(
     }
 
     private fun fail(message: String) {
+        android.util.Log.w("Bridgey", "PAIRING failed: $message (state was ${mutableState.value})")
         session?.close()
         session = null
         cancelIncomingFiles()
@@ -1445,6 +1566,34 @@ class PairingCoordinator(
         refreshFileTransferSummary("File transfer interrupted")
         mutableState.value = PairingState.Failed(message)
         diagnostics.record("protocol", "session_failed", "rejected")
+        scheduleReconnect()
+    }
+
+    /**
+     * `Failed` must not be a dead end. Before this, the only way out was the user manually
+     * dismissing the "Couldn't connect" dialog (MainActivity -> pairing.cancel()), and the
+     * auto-reconnect collector in BridgeyApplication only ever acts while state is Idle. This
+     * reuses that existing, already-working mechanism — it does not dial anything itself, it
+     * just gives the app a chance to return to Idle on its own, gated by the existing
+     * exponential backoff (Reliability.kt's reconnectDelayMillis, previously never called).
+     */
+    private fun scheduleReconnect() {
+        reconnectJob?.cancel()
+        val attempt = reconnectAttempt
+        reconnectAttempt = (reconnectAttempt + 1).coerceAtMost(30)
+        // Jitter is added here (not inside reconnectDelayMillis, which stays a pure, tested
+        // function) so two devices racing to reconnect at the same moment don't stay in lockstep
+        // and keep colliding on every subsequent retry.
+        val delayMillis = reconnectDelayMillis(attempt) + kotlin.random.Random.nextLong(1_000L)
+        android.util.Log.i("Bridgey", "RECONNECT scheduling retry in ${delayMillis}ms (attempt=$attempt)")
+        diagnostics.record("reconnect", "scheduled")
+        reconnectJob = scope.launch {
+            delay(delayMillis)
+            if (mutableState.value !is PairingState.Failed) return@launch
+            android.util.Log.i("Bridgey", "RECONNECT attempt $attempt: returning to idle to retry discovery")
+            diagnostics.record("reconnect", "attempt")
+            mutableState.value = PairingState.Idle
+        }
     }
 
     private fun cancelIncomingFiles() {

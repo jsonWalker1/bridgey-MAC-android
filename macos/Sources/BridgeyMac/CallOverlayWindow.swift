@@ -122,16 +122,4 @@ private struct CallActionButtonStyle: ButtonStyle {
     }
 }
 
-func orderedCallActions(_ actions: [RemoteCallAction]) -> [RemoteCallAction] {
-    actions.enumerated().sorted { left, right in
-        let leftRank = callActionRank(left.element.title)
-        let rightRank = callActionRank(right.element.title)
-        return leftRank == rightRank ? left.offset < right.offset : leftRank < rightRank
-    }.map(\.element)
-}
-
-private func callActionRank(_ title: String) -> Int {
-    if title.localizedCaseInsensitiveContains("answer") { return 0 }
-    if title.localizedCaseInsensitiveContains("decline") { return 2 }
-    return 1
-}
+// orderedCallActions lives in Calls.swift alongside the rest of the call-domain logic.

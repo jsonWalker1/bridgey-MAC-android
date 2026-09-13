@@ -20,4 +20,13 @@ class RemoteCallRequestTest {
         assertNull(normalizedPhoneNumber("7 +999 123"))
         assertNull(normalizedPhoneNumber("١٢٣٤٥"))
     }
+
+    @Test
+    fun wireKindsMatchTheDocumentedProtocol() {
+        // Locks docs/protocol.md's calls.v1 reply kinds so the Phase 0.5 extraction
+        // cannot silently drift the wire protocol.
+        assertEquals("calls.started", RemoteCallResult.STARTED.wireKind)
+        assertEquals("calls.confirmation_required", RemoteCallResult.CONFIRMATION_REQUIRED.wireKind)
+        assertEquals("calls.rejected", RemoteCallResult.REJECTED.wireKind)
+    }
 }
