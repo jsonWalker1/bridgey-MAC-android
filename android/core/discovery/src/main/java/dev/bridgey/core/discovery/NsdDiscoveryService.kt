@@ -3,6 +3,7 @@ package dev.bridgey.core.discovery
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.util.Log
 import java.net.InetAddress
@@ -18,10 +19,17 @@ class NsdDiscoveryService(
     private val servicePort: Int = DEFAULT_PORT,
 ) : DiscoveryService {
     private val nsd = context.applicationContext.getSystemService(NsdManager::class.java)
+    private val wifiManager = context.applicationContext.getSystemService(WifiManager::class.java)
     private val found = ConcurrentHashMap<String, DiscoveredPeer>()
     private val mutablePeers = MutableStateFlow<List<DiscoveredPeer>>(emptyList())
     override val peers: StateFlow<List<DiscoveredPeer>> = mutablePeers.asStateFlow()
     private var running = false
+
+    // Without this, the Wi-Fi radio can silently drop incoming mDNS multicast packets to save
+    // power (observed in practice: our own service registers fine, but the peer's advertisement
+    // is never received — most reliably reproduced right after a device reboot or Wi-Fi
+    // reassociation). NsdManager does not acquire this on the app's behalf.
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     private val registrationListener = object : NsdManager.RegistrationListener {
         override fun onServiceRegistered(info: NsdServiceInfo) {
@@ -69,6 +77,13 @@ class NsdDiscoveryService(
     override fun start() {
         if (running) return
         running = true
+        runCatching {
+            wifiManager?.createMulticastLock("bridgey-discovery")?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }.onSuccess { multicastLock = it }
+            .onFailure { Log.w(TAG, "DISCOVERY could not acquire multicast lock: ${it.message}") }
         val info = NsdServiceInfo().apply {
             serviceName = registeredServiceName
             serviceType = SERVICE_TYPE
@@ -88,6 +103,8 @@ class NsdDiscoveryService(
         running = false
         runCatching { nsd.stopServiceDiscovery(discoveryListener) }
         runCatching { nsd.unregisterService(registrationListener) }
+        runCatching { multicastLock?.release() }
+        multicastLock = null
         found.clear()
         emitPeers()
     }
