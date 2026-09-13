@@ -19,6 +19,49 @@ client can later implement the same public protocol without Android changes.
 > phone call from macOS over the local network. Discovery data is intentionally
 > treated as untrusted.
 
+## Since forking from singeol/bridgey
+
+This repository diverged from [singeol/bridgey](https://github.com/singeol/bridgey)
+at `33a398c` ("Prepare 0.6.0-rc.2 with macOS panel sizing fix"); upstream has not
+moved since. Everything below was added here:
+
+- **Media Continuity** — Android's currently active `MediaSession` (Spotify,
+  YouTube, or any other app that exposes one) now shows and is controllable
+  live from the macOS menu bar: artwork, title, artist, progress,
+  play/pause/next/previous/seek/volume, all gated by what the active session
+  actually supports. Physical Play/Pause/Next/Previous keys on the Mac
+  keyboard work globally — independent of whether a Mac-native media app is
+  even running — via a raw hardware media-key event tap, routed through the
+  same action path as the on-screen controls. New: `MediaContinuityManager.kt`,
+  `MediaRemoteController.swift`, `MediaRemoteView.swift`,
+  `GlobalMediaCommandCenter.swift`, and the `media.remote.v1` protocol family
+  documented in `docs/protocol.md`. Hardware-validated on a Samsung Galaxy S23
+  Ultra + MacBook with Spotify and YouTube.
+- **Photo & video sync** — new Android media automatically syncs to a chosen
+  Mac folder or directly into Photos.app, with backlog control so a first run
+  doesn't flood the connection, and reliability handling for interrupted
+  syncs. New: `PhotoSync.kt`, `PhotoSyncManager.kt`, `PhotosImport.swift`.
+- **Connection reliability** — three real bugs found and fixed on physical
+  hardware: Android's `NsdManager` never actually acquired the Wi-Fi
+  multicast lock mDNS discovery needs (pairing could take minutes or fail
+  outright after a Wi-Fi toggle); discovery didn't restart when the network
+  changed, so reconnect after regaining Wi-Fi could silently take up to
+  ~18 minutes waiting on mDNS's own backoff schedule instead of ~10 seconds;
+  and the connection layer is now self-healing after disconnects, with an
+  explicit Android-side connect timeout and screen-lock diagnostics.
+- **Calls infrastructure** — the call-handling code was extracted into
+  dedicated modules (`CallsController.kt`, `Calls.swift`, replacing the old
+  `NotificationCall.swift`), and a `calls.v2` Telecom-based protocol
+  (`calls.state`/`calls.action`, stable call IDs, explicit ringing/active/
+  ended/missed) was designed and implemented end to end. A non-UI companion
+  `InCallService` was prototyped as the real call-state source for that
+  protocol and confirmed on a real device to require
+  `CONTROL_INCALL_EXPERIENCE`, a `signature|privileged` permission no
+  sideloaded app can hold — documented in `docs/architecture.md` and kept as
+  a tested-but-currently-unused wire format for a future default-dialer path.
+- Android now restarts its connection service automatically after a device
+  reboot (`BootCompletedReceiver.kt`), if Bridgey was already enabled.
+
 ## MVP scope
 
 - Explicit two-device pairing with a shared verification code
