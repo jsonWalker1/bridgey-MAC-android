@@ -14,6 +14,18 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-feature android:name="android.hardware.telephony" android:required="false" />
 
+    <!-- Media Continuity resolves a human-readable app name (e.g. "YouTube", "Spotify") for
+         whatever app owns the current MediaSession, so it can show that instead of a raw package
+         name. Package visibility restrictions (API 30+) would otherwise silently fail that lookup
+         for any third-party app Bridgey doesn't already have visibility into. This intentionally
+         targets "any launchable app" rather than naming specific media apps. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:name=".BridgeyApplication"
         android:allowBackup="false"

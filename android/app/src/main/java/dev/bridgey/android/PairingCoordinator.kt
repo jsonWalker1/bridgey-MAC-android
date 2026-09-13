@@ -104,6 +104,11 @@ class PairingCoordinator(
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val quickActions = QuickActions(appContext, scope, ::isFeatureAvailable, ::sendQuickPayload)
+    val mediaRemote = MediaContinuityManager(
+        appContext,
+        available = { mutableState.value is PairingState.Connected && isFeatureAvailable(BridgeyFeature.MEDIA) },
+        send = ::sendQuickPayload,
+    )
     private val mutableState = MutableStateFlow<PairingState>(PairingState.Idle)
     val state: StateFlow<PairingState> = mutableState.asStateFlow()
     private val identity = AndroidIdentity(context.applicationContext)
@@ -149,12 +154,14 @@ class PairingCoordinator(
     private var reconnectJob: Job? = null
 
     init {
+        mediaRemote.start()
         scope.launch {
             settings.state.collect {
                 if (!featureEnabled(BridgeyFeature.CLIPBOARD)) mutableClipboardStatus.value = null
                 if (!featureEnabled(BridgeyFeature.BATTERY)) mutableRemoteBattery.value = null
                 if (!featureEnabled(BridgeyFeature.PING)) clearPingStatus()
                 quickActions.policyChanged()
+                mediaRemote.policyChanged()
                 sendFeatureState()
             }
         }
@@ -211,6 +218,7 @@ class PairingCoordinator(
         mutableRemoteBattery.value = null
         clearPingStatus()
         quickActions.reset()
+        mediaRemote.reset()
         mutableRemoteFeatures.value = defaultFeatureState()
         mutableState.value = PairingState.Idle
     }
@@ -227,6 +235,7 @@ class PairingCoordinator(
         mutableRemoteBattery.value = null
         clearPingStatus()
         quickActions.reset()
+        mediaRemote.reset()
         mutableRemoteFeatures.value = defaultFeatureState()
         mutableState.value = PairingState.Idle
     }
@@ -883,6 +892,7 @@ class PairingCoordinator(
         mutableRemoteBattery.value = null
         clearPingStatus()
         quickActions.reset()
+        mediaRemote.reset()
         mutableRemoteFeatures.value = defaultFeatureState()
         server?.close()
         server = null
@@ -931,6 +941,7 @@ class PairingCoordinator(
         mutableRemoteBattery.value = null
         clearPingStatus()
         quickActions.reset()
+        mediaRemote.reset()
         mutableRemoteFeatures.value = defaultFeatureState()
         if (initiatedLocally) {
             current.peerName = peerHint ?: "Mac"
@@ -1006,6 +1017,7 @@ class PairingCoordinator(
             mutableRemoteBattery.value = null
             clearPingStatus()
             quickActions.reset()
+            mediaRemote.reset()
             mutableRemoteFeatures.value = defaultFeatureState()
             reconnectAttempt = 0
             mutableState.value = PairingState.Idle
@@ -1107,6 +1119,7 @@ class PairingCoordinator(
             "notifications.action" -> receiveNotificationAction(current, message)
             "calls.request" -> receiveCallRequest(current, message)
             "calls.action" -> receiveCallAction(current, message)
+            "media.remote.action" -> receiveMediaRemoteAction(current, message)
             "find.start" -> receiveFindCommand(current, message, start = true)
             "find.stop" -> receiveFindCommand(current, message, start = false)
             "find.started" -> receiveFindAcknowledgement(current, message, started = true)
@@ -1243,6 +1256,43 @@ class PairingCoordinator(
             ),
         )
         diagnostics.record("calls", "action_received", outcome = "$action:${if (accepted) "accepted" else "rejected"}")
+    }
+
+    /** Handles a Mac-initiated media.remote.action (play/pause/toggle/next/previous/seek)
+     * targeting whatever MediaSession MediaContinuityManager currently considers primary. */
+    private fun receiveMediaRemoteAction(current: Session, message: Message) {
+        val messageId = message.messageId ?: return
+        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id ||
+            !current.acceptMessageId(messageId)
+        ) return
+        if (!isFeatureAvailable(BridgeyFeature.MEDIA)) {
+            sendFeatureState()
+            return
+        }
+        val plaintext = Crypto.decrypt(
+            current.pairingKey!!,
+            message.nonce ?: return fail("Invalid encrypted media action"),
+            message.ciphertext ?: return fail("Invalid encrypted media action"),
+        ) ?: return fail("Invalid encrypted media action")
+        if (plaintext.size > 4_096) return fail("Media action payload too large")
+        val payload = runCatching { JSONObject(plaintext.toString(Charsets.UTF_8)) }.getOrNull()
+            ?: return fail("Invalid media action")
+        val requestId = payload.optString("requestId")
+        if (payload.optInt("version") != 1 || runCatching { UUID.fromString(requestId) }.isFailure) {
+            return fail("Invalid media action")
+        }
+        val (accepted, reason) = mediaRemote.handleAction(payload)
+        android.util.Log.i(
+            "Bridgey",
+            "MEDIA action received action=${payload.optString("action")} accepted=$accepted reason=${reason ?: "-"}",
+        )
+        val ackPayload = JSONObject()
+            .put("version", 1)
+            .put("requestId", requestId)
+            .put("accepted", accepted)
+            .apply { reason?.let { put("reason", it) } }
+        sendQuickPayload("media.remote.action.ack", ackPayload)
+        diagnostics.record("media", "action_received", outcome = "${payload.optString("action")}:${if (accepted) "accepted" else reason}")
     }
 
     private fun receiveNotificationAction(current: Session, message: Message) {
@@ -1511,6 +1561,7 @@ class PairingCoordinator(
             mutableState.value = PairingState.Connected(current.remoteDeviceId, current.peerName)
             diagnostics.record("pairing", "connected")
             sendFeatureState()
+            mediaRemote.sendFreshState()
             android.util.Log.i("Bridgey", "PAIRING verified peer=${current.peerName}")
         }
     }
@@ -1562,6 +1613,7 @@ class PairingCoordinator(
         }
         mutableRemoteFeatures.value = received
         quickActions.policyChanged()
+        mediaRemote.policyChanged()
         if (received[BridgeyFeature.CLIPBOARD] == false) mutableClipboardStatus.value = null
         if (received[BridgeyFeature.BATTERY] == false) mutableRemoteBattery.value = null
         if (received[BridgeyFeature.PING] == false) clearPingStatus()
@@ -1597,6 +1649,7 @@ class PairingCoordinator(
         mutableRemoteBattery.value = null
         clearPingStatus()
         quickActions.reset()
+        mediaRemote.reset()
         mutableRemoteFeatures.value = defaultFeatureState()
         mutableFileTransfers.value = recoverInterruptedTransfers(mutableFileTransfers.value)
         refreshFileTransferSummary("File transfer interrupted")

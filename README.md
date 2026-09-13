@@ -83,6 +83,14 @@ the stable release.
 - [x] Add a lightweight Ping action separate from Find Device
 - [x] Show Mac battery status on Android
 - [x] Add an Android Quick Settings tile and configurable macOS shortcuts
+- [x] Show Android's currently playing media (Spotify, YouTube, and any other
+      app exposing a `MediaSession`) live in the macOS menu bar: artwork,
+      title, artist, source app, progress, and playback state
+- [x] Control Android playback from macOS — Play/Pause, Next, Previous, seek,
+      and volume — gated by whatever the active session actually supports
+- [x] Route global macOS Play/Pause/Next/Previous media keys to whichever
+      side, Mac or Android, is actually playing, with no Mac-native media
+      app required
 - [ ] Complete multi-OEM stabilization of the v0.5 call and notification lifecycle
 
 The 0.6 feature implementation is ready for release-candidate testing, not yet
@@ -90,7 +98,11 @@ device-certified. See the [complete 0.6 acceptance checklist](docs/testing-0.6.m
 Media control is opt-in on Mac and uses public player automation; it is not
 universal browser/system media control. Artwork is optional, local-only, and
 currently limited to Music. Other Android vendors still need physical-device
-validation; unit-test coverage is not a substitute.
+validation; unit-test coverage is not a substitute. Media Continuity's
+Android → Mac direction (the live player and global hardware media keys) has
+been hardware-validated on a Samsung Galaxy S23 Ultra and a MacBook with
+Spotify and YouTube; Bluetooth audio output and other Android OEMs are not
+yet tested.
 
 ### v0.7.0 — remote input and presentations
 
@@ -259,12 +271,17 @@ Bridgey asks for access only when the related feature needs it:
   encrypted connections to Android devices.
 - macOS notifications are optional and are requested only when the user enables
   Android notification display on the Mac.
+- macOS Input Monitoring is optional and is requested only if the user wants
+  physical keyboard media keys (Play/Pause, Next, Previous) to control
+  whichever device — Mac or Android — is currently playing. Bridgey reads
+  only the dedicated hardware media-key events; it never reads regular typed
+  keystrokes, and nothing is monitored unless this is explicitly granted.
 - File access is scoped to a file selected by the user and the Bridgey receive
   directory (`Downloads/Bridgey`).
 
 Bridgey does not request location, contacts, SMS, call-log, camera, microphone,
-screen recording, Accessibility, Input Monitoring, or Full Disk Access.
-Permission denial disables only the corresponding optional integration.
+screen recording, Accessibility, or Full Disk Access. Permission denial
+disables only the corresponding optional integration.
 
 ## Settings
 
@@ -297,6 +314,21 @@ Incoming and active calls appear in a compact floating macOS call panel with
 explicit controls. It stays available across Spaces without activating Bridgey
 or taking focus from the current app; hiding it leaves the same controls in the
 Bridgey menu-bar panel.
+
+Whatever is currently playing on the paired Android device — Spotify, YouTube,
+or any other app exposing a `MediaSession` — appears live in the Bridgey
+menu-bar panel: artwork, title, artist, source app, and progress, with
+Play/Pause, Previous, Next, seek, and volume controls. The card only appears
+while Android actually has an active session; it never shows a stale or
+placeholder "now playing" state. Controls are shown only for what the active
+session genuinely supports — for example, a volume slider appears only when
+Android reports the session's volume as adjustable. The same physical
+Play/Pause/Next/Previous keys on a Mac keyboard control whichever side, Mac or
+Android, is currently playing, even while Bridgey isn't the active
+application; this needs the optional Input Monitoring permission described
+above. This is entirely separate from Bridgey's existing Mac → Android
+direction (controlling Music/Spotify on the Mac itself from Android), which is
+unaffected.
 
 Connected devices exchange their effective feature state over the encrypted
 session. A feature is available only when both devices enable it, so controls

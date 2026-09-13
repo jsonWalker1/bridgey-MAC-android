@@ -9,6 +9,7 @@ struct BridgeyApp: App {
     @StateObject private var settings: BridgeySettings
     private let settingsWindow: SettingsWindowController
     private let callServiceProvider: CallServiceProvider
+    private let globalMediaCommandCenter: GlobalMediaCommandCenter
 
     init() {
         LegacyPreferences.migrateIfNeeded()
@@ -23,6 +24,7 @@ struct BridgeyApp: App {
         self.callServiceProvider = callServiceProvider
         NSApplication.shared.servicesProvider = callServiceProvider
         settingsWindow = SettingsWindowController(discovery: discovery, pairing: pairing, settings: settings)
+        globalMediaCommandCenter = GlobalMediaCommandCenter(mediaRemote: pairing.mediaRemote, mediaController: pairing.mediaController)
         phoneURLHandler.configure { [weak pairing] number in pairing?.sendCallWhenConnected(number) }
     }
 
@@ -182,6 +184,10 @@ private struct BridgeyPanel: View {
                 }
                 .padding(12)
                 .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+
+            if pairing.isFeatureAvailable(.media) {
+                MediaRemoteCard(media: pairing.mediaRemote)
             }
 
             LazyVGrid(columns: quickActionColumns, spacing: 8) {

@@ -158,6 +158,61 @@ Music artwork comes from player automation, not filesystem browsing; it is
 optional and may be unavailable. Spotify artwork is not downloaded. Metadata
 refreshes after commands/settings changes and on the ten-second heartbeat.
 
+### Media Continuity (`media.remote.v1`)
+
+A separate, dedicated message family for the opposite direction from `media`/
+`media.state` above: Android's own currently active `MediaSession` (Spotify,
+YouTube, or any other app that exposes one), shown and controllable live on
+macOS. Kept distinct from the `media` feature's wire vocabulary so the two
+directions — "Mac's player, shown on Android" and "Android's player, shown on
+Mac" — can never collide or be confused with each other.
+
+- `media.remote.state`: Android → Mac, at most 32 KiB. `version`, monotonic
+  `generation` (bumped only when the primary session itself changes — a
+  different app, or a session appearing/disappearing — never on every
+  playback tick), monotonic per-generation `sequence`, boolean `hasSession`.
+  When `hasSession`, also `packageName`, human-readable `appLabel` (never the
+  raw package identifier — see below), `title`/`artist`/`album` (256
+  characters each), `playing`, `position`/`duration`/`playbackSpeed`,
+  `positionTimestamp` (epoch milliseconds the position was sampled at, so the
+  receiver can extrapolate a live progress bar without polling Android),
+  `capabilities` (subset of `play`/`pause`/`next`/`previous`/`seek`/`volume`,
+  reflecting what the active session actually supports), optional `volume`
+  (0…100, only present when the session's volume is actually adjustable —
+  local device-stream volume for ordinary phone playback, or a remote
+  `VolumeProvider` otherwise), and optional `artworkHash`/`artwork` (SHA-256
+  hex / base64 JPEG, at most 16 KiB, at most 128×128 — sent only when the
+  hash changes from what the receiver already has cached).
+- `media.remote.action`: Mac → Android. `version`, UUID `requestId`, `action`
+  (`play`/`pause`/`toggle`/`next`/`previous`/`seek`/`volume`), integer
+  `value` (seek position in milliseconds, or volume percent), and the
+  `generation` the Mac last received — Android rejects the action outright if
+  its current generation has since moved on, rather than applying a command
+  to a session the Mac's UI no longer actually reflects.
+- `media.remote.action.ack`: Android → Mac. `version`, `requestId`, boolean
+  `accepted`, optional `reason` (`no_session`, `stale_generation`,
+  `unsupported`, `invalid`, `execution_failed`, `rate_limited`).
+
+`next`/`previous` are rate-limited to one accepted change per 900 ms
+regardless of source (GUI or a physical media key): some players (YouTube in
+particular) have to fetch and buffer the next item rather than switch
+instantly, and issuing another skip before that settles desyncs the player's
+own queue position badly enough to surface as a playback error.
+
+Android's app name for the current session is resolved through
+`PackageManager`, never shown as the raw reverse-DNS package name — a result
+that equals the package name itself (the documented fallback when resolution
+fails, most commonly a package-visibility restriction) is treated as "no
+name resolved" and macOS falls back to the platform name alone.
+
+macOS also intercepts real hardware media keys (a keyboard's dedicated
+Play/Pause/Next/Previous, Touch Bar equivalents) globally, independent of
+whether Bridgey is the frontmost app, and routes them through the same
+action path as the on-screen controls — to Android's session or to the
+existing Mac-native player (`media`/`media.state` above), whichever is
+actually current. This requires the user to separately grant macOS Input
+Monitoring; see the Permissions section in the README.
+
 ### Battery (`battery.send.v1`)
 
 Either battery-powered peer sends `battery.update` after a secure session is

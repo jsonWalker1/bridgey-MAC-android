@@ -19,6 +19,7 @@ struct QuickActionsPanel: View {
 
 struct MediaSettingsView: View {
     @ObservedObject var media: MediaController
+    @State private var hardwareKeyAccessGranted = GlobalMediaCommandCenter.hardwareKeyAccessGranted
     var body: some View {
         Section("Media") {
             Text("Enable Media controls above, then choose a player. macOS asks for Automation access to that app. Open the player on your Mac first.")
@@ -31,6 +32,17 @@ struct MediaSettingsView: View {
                 .font(.caption).foregroundStyle(.secondary)
             if !media.snapshot.detail.isEmpty { Text(media.snapshot.detail).font(.caption).foregroundStyle(.secondary) }
             Button("Refresh player", action: media.refresh)
+            Text("Your keyboard's Play/Pause, Next, and Previous keys control whichever media - this Mac's or your phone's - is currently active.")
+                .font(.caption).foregroundStyle(.secondary)
+            if !hardwareKeyAccessGranted {
+                Button("Enable hardware media keys…") {
+                    GlobalMediaCommandCenter.requestHardwareKeyAccess()
+                    GlobalMediaCommandCenter.openInputMonitoringSettings()
+                }
+                Text("Needs Input Monitoring access (Privacy & Security) so Bridgey can see your keyboard's media keys. Bridgey never reads anything you type.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
+        .onAppear { hardwareKeyAccessGranted = GlobalMediaCommandCenter.hardwareKeyAccessGranted }
     }
 }

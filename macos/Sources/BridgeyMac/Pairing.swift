@@ -166,6 +166,7 @@ final class PairingCoordinator: ObservableObject {
     @Published private(set) var pingStatus: String?
     let quickActions = QuickActions()
     let mediaController = MediaController()
+    let mediaRemote = MediaRemoteController()
     let shortcuts = ShortcutSettings()
 
     var trustedDevices: [TrustedDeviceInfo] {
@@ -267,6 +268,13 @@ final class PairingCoordinator: ObservableObject {
         mediaController.onState = { [weak self] in
             _ = self?.sendQuickPayload(kind: "media.state", payload: $0)
         }
+        mediaRemote.allowed = { [weak self] in
+            guard let self, case .connected = self.state else { return false }
+            return self.isFeatureAvailable(.media)
+        }
+        mediaRemote.sendAction = { [weak self] action, value, generation in
+            self?.sendMediaRemoteAction(action: action, value: value, generation: generation)
+        }
         shortcuts.perform = { [weak self] action in
             switch action {
             case .clipboard: self?.sendClipboard()
@@ -289,6 +297,7 @@ final class PairingCoordinator: ObservableObject {
                     if !self.featureEnabled(.ping) { self.clearPingStatus() }
                     if !self.isFeatureAvailable(.links) { self.quickActions.reset() }
                     self.mediaController.reset()
+                    self.mediaRemote.reset()
                     if !self.featureEnabled(.clipboard) { self.clearClipboardSendStatus() }
                     if !self.featureEnabled(.notifications) { self.clearRemoteCall() }
                     if !self.featureEnabled(.calls) {
@@ -380,6 +389,7 @@ final class PairingCoordinator: ObservableObject {
         clearPingStatus()
         quickActions.reset()
         mediaController.reset()
+        mediaRemote.reset()
         lastSentBattery = nil
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
@@ -440,6 +450,7 @@ final class PairingCoordinator: ObservableObject {
         clearPingStatus()
         quickActions.reset()
         mediaController.reset()
+        mediaRemote.reset()
         lastSentBattery = nil
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
@@ -465,6 +476,7 @@ final class PairingCoordinator: ObservableObject {
         clearPingStatus()
         quickActions.reset()
         mediaController.reset()
+        mediaRemote.reset()
         lastSentBattery = nil
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
@@ -571,6 +583,27 @@ final class PairingCoordinator: ObservableObject {
             ciphertext: encrypted.ciphertext
         ))
         diagnostics.record(category: "calls", event: "action_sent", outcome: action)
+    }
+
+    /// Sends a play/pause/toggle/next/previous/seek command targeting whatever MediaSession
+    /// Android currently reports as primary. `generation` pins the command to the session context
+    /// mediaRemote last received a state update for, so Android can reject it if its primary
+    /// session has since changed underneath the Mac.
+    private func sendMediaRemoteAction(action: String, value: Int64?, generation: Int64) {
+        guard case .connected = state, let current = session,
+              isFeatureAvailable(.media),
+              let plaintext = try? JSONEncoder().encode(MediaRemoteActionPayload(
+                version: 1, requestId: UUID().uuidString.lowercased(), action: action, value: value, generation: generation
+              )),
+              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
+        current.send(PairingMessage(
+            kind: "media.remote.action",
+            sessionId: current.id,
+            messageId: UUID().uuidString.lowercased(),
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext
+        ))
+        diagnostics.record(category: "media", event: "remote_action_sent", outcome: action)
     }
 
     // Called from the incoming-call state machine in Calls.swift, hence not `private`.
@@ -1130,6 +1163,7 @@ final class PairingCoordinator: ObservableObject {
         clearPingStatus()
         quickActions.reset()
         mediaController.reset()
+        mediaRemote.reset()
         lastSentBattery = nil
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
@@ -1167,6 +1201,7 @@ final class PairingCoordinator: ObservableObject {
             self.clearPingStatus()
             self.quickActions.reset()
             self.mediaController.reset()
+            self.mediaRemote.reset()
             self.lastSentBattery = nil
             self.clearRemoteCall()
             self.remoteFeatures = defaultRemoteFeatureState()
@@ -1198,6 +1233,7 @@ final class PairingCoordinator: ObservableObject {
                     self.clearPingStatus()
                     self.quickActions.reset()
                     self.mediaController.reset()
+                    self.mediaRemote.reset()
                     self.lastSentBattery = nil
                     self.clearRemoteCall()
                     self.remoteFeatureStateReceived = false
@@ -1301,6 +1337,7 @@ final class PairingCoordinator: ObservableObject {
                 remoteFeatureStateReceived = true
                 if !isFeatureAvailable(.links) { quickActions.reset() }
                 mediaController.reset()
+                mediaRemote.reset()
                 mediaController.refresh()
                 if remoteFeatures[.battery] == false { remoteBattery = nil }
                 if remoteFeatures[.ping] == false { clearPingStatus() }
@@ -1468,6 +1505,34 @@ final class PairingCoordinator: ObservableObject {
                 if !payload.accepted, remoteCall?.notificationID == payload.callId {
                     setTransientCallStatus("Android could not \(payload.action) the call")
                 }
+            case "media.remote.state":
+                guard featureEnabled(.media, current: current) else { return }
+                guard case .connected = state,
+                      message.sessionId == current.id,
+                      let messageID = message.messageId,
+                      current.acceptMessageID(messageID),
+                      let nonce = message.nonce,
+                      let ciphertext = message.ciphertext,
+                      let plaintext = try? decrypt(nonce: nonce, ciphertext: ciphertext, key: current.pairingKey!),
+                      plaintext.count <= 32_768,
+                      let payload = try? JSONDecoder().decode(MediaRemoteStatePayload.self, from: plaintext),
+                      payload.version == 1 else {
+                    throw PairingError.invalidMessage
+                }
+                mediaRemote.receive(payload)
+            case "media.remote.action.ack":
+                guard case .connected = state,
+                      message.sessionId == current.id,
+                      let messageID = message.messageId,
+                      current.acceptMessageID(messageID),
+                      let nonce = message.nonce,
+                      let ciphertext = message.ciphertext,
+                      let plaintext = try? decrypt(nonce: nonce, ciphertext: ciphertext, key: current.pairingKey!),
+                      let payload = try? JSONDecoder().decode(MediaRemoteActionAckPayload.self, from: plaintext),
+                      payload.version == 1 else {
+                    throw PairingError.invalidMessage
+                }
+                mediaRemote.receiveAck(payload)
             case "files.offer":
                 guard case .connected = state,
                       message.sessionId == current.id,
