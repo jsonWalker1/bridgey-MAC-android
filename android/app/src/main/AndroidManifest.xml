@@ -136,5 +136,20 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/kvm_accessibility_service_config" />
         </service>
+        <!-- Part 3 KVM POC #2 keyboard-injection test. Requires the user to explicitly enable and
+             switch to this keyboard under Settings > System > Languages & input > Manage keyboards -
+             the same standard mechanism any third-party keyboard app uses. -->
+        <service
+            android:name=".BridgeyInputMethodService"
+            android:exported="false"
+            android:label="@string/kvm_input_method_label"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/kvm_input_method" />
+        </service>
     </application>
 </manifest>

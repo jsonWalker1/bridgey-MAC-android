@@ -35,9 +35,27 @@ internal class KvmInputInjector(private val context: Context, videoChannel: Vide
     private fun handle(event: InputEvent) {
         when (event) {
             is InputEvent.Pointer -> handlePointer(event)
-            is InputEvent.Key -> Log.i(TAG, "KEY events not injected in this POC (needs an InputMethodService - see Part 3 report)")
-            is InputEvent.Text -> Log.i(TAG, "TEXT events not injected in this POC (needs an InputMethodService - see Part 3 report)")
+            is InputEvent.Key -> handleKey(event)
+            is InputEvent.Text -> handleText(event)
         }
+    }
+
+    private fun handleKey(key: InputEvent.Key) {
+        val service = BridgeyInputMethodService.instance
+        if (service == null) {
+            Log.w(TAG, "KEY event received but Bridgey's KVM Keyboard is not the active input method")
+            return
+        }
+        mainHandler.post { service.injectKey(key.keyCode, key.action) }
+    }
+
+    private fun handleText(text: InputEvent.Text) {
+        val service = BridgeyInputMethodService.instance
+        if (service == null) {
+            Log.w(TAG, "TEXT event received but Bridgey's KVM Keyboard is not the active input method")
+            return
+        }
+        mainHandler.post { service.injectText(text.text) }
     }
 
     private fun handlePointer(pointer: InputEvent.Pointer) {
