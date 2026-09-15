@@ -29,6 +29,7 @@ class BridgeySettingsTest {
     fun newerFeaturesAreOffForLegacyPeers() {
         assertFalse(featureEnabledByLegacyPeer(BridgeyFeature.CALLS))
         assertFalse(featureEnabledByLegacyPeer(BridgeyFeature.PING))
+        assertFalse(featureEnabledByLegacyPeer(BridgeyFeature.REMOTE_SCREEN_SHARE))
         assertTrue(featureEnabledByLegacyPeer(BridgeyFeature.BATTERY))
     }
 }

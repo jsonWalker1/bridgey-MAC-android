@@ -13,6 +13,7 @@ enum BridgeyFeature: String, CaseIterable, Identifiable {
     case media
     case calls
     case photoSync = "photo_sync"
+    case remoteScreenShare = "remote_screen_share"
 
     var id: String { rawValue }
     var title: String {
@@ -27,12 +28,17 @@ enum BridgeyFeature: String, CaseIterable, Identifiable {
         case .media: "Media controls"
         case .calls: "Calls from Mac"
         case .photoSync: "Photo & video sync"
+        case .remoteScreenShare: "Remote Start from Trusted Mac"
         }
     }
+
+    /// Opt-in rather than Bridgey's usual default-on convenience features - lets a peer trigger
+    /// local device behavior, so it must not be silently enabled until the user turns it on.
+    static let optIn: Set<BridgeyFeature> = [.remoteScreenShare]
 }
 
 func featureEnabledByLegacyPeer(_ feature: BridgeyFeature) -> Bool {
-    ![.calls, .ping, .links, .media, .photoSync].contains(feature)
+    ![.calls, .ping, .links, .media, .photoSync, .remoteScreenShare].contains(feature)
 }
 
 enum PhotoSyncDestination: String, CaseIterable, Identifiable {
@@ -97,7 +103,7 @@ final class BridgeySettings: ObservableObject {
         hasCompletedOnboarding = storedDefaults.bool(forKey: "settings.onboarding.completed")
         notificationHistoryEnabled = storedDefaults.bool(forKey: "settings.notificationHistory.enabled")
         globalFeatures = Dictionary(uniqueKeysWithValues: BridgeyFeature.allCases.map {
-            ($0, storedDefaults.object(forKey: "settings.global.\($0.rawValue)") as? Bool ?? ![.media, .photoSync].contains($0))
+            ($0, storedDefaults.object(forKey: "settings.global.\($0.rawValue)") as? Bool ?? !(([.media, .photoSync] as Set<BridgeyFeature>).union(BridgeyFeature.optIn).contains($0)))
         })
         var perDevice: [String: [BridgeyFeature: Bool]] = [:]
         for (key, value) in storedDefaults.dictionaryRepresentation() where key.hasPrefix("settings.device.") {

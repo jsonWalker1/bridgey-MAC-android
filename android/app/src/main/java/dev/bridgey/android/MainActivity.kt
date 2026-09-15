@@ -5,6 +5,7 @@ import android.app.NotificationManager
 import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -103,6 +104,7 @@ class MainActivity : ComponentActivity() {
     private var notificationAccessEnabled by mutableStateOf(false)
     private var appNotificationsEnabled by mutableStateOf(false)
     private var mediaPermissionGranted by mutableStateOf(false)
+    private var kvmAccessibilityEnabled by mutableStateOf(false)
     private var sharedContent by mutableStateOf<SharedContent?>(null)
     private var showOnboarding by mutableStateOf(false)
     private val notificationPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -117,6 +119,24 @@ class MainActivity : ComponentActivity() {
         if (mediaPermissionGranted) {
             bridgeySettings.setGlobal(BridgeyFeature.PHOTO_SYNC, true)
             (application as BridgeyApplication).photoSync.requestScan()
+        }
+    }
+    private val screenCaptureLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val data = result.data
+        if (result.resultCode == RESULT_OK && data != null) {
+            startForegroundService(
+                Intent(this, ScreenCaptureService::class.java)
+                    .putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, result.resultCode)
+                    .putExtra(ScreenCaptureService.EXTRA_DATA, data),
+            )
+        }
+    }
+    private val overlayPermissionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        if (Settings.canDrawOverlays(this)) bridgeySettings.setPocketModeEnabled(true)
+    }
+    private val notificationPolicyAccessLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        if (getSystemService(NotificationManager::class.java).isNotificationPolicyAccessGranted) {
+            bridgeySettings.setGlobal(BridgeyFeature.REMOTE_SCREEN_SHARE, true)
         }
     }
 
@@ -134,6 +154,7 @@ class MainActivity : ComponentActivity() {
         discovery = bridgey.discovery
         bridgeySettings = bridgey.settings
         sharedContent = intent.toSharedContent()
+        handleRemoteStartIfRequested(intent)
         startForegroundService(Intent(this, BridgeyConnectionService::class.java))
         setContent {
             BridgeyTheme {
@@ -156,6 +177,14 @@ class MainActivity : ComponentActivity() {
                     onRequestDirectCalls = ::requestDirectCalls,
                     mediaPermissionGranted = mediaPermissionGranted,
                     onRequestPhotoSync = ::requestPhotoSync,
+                    onRequestScreenShare = ::requestScreenShare,
+                    onStopScreenShare = ::stopScreenShare,
+                    onEnterPocketMode = ::enterPocketMode,
+                    onRequestPocketMode = ::requestPocketMode,
+                    onRequestRemoteScreenShare = ::requestRemoteScreenShare,
+                    onRequestKvmInput = ::requestKvmInput,
+                    onOpenKvmAccessibilitySettings = ::openKvmAccessibilitySettings,
+                    kvmAccessibilityEnabled = kvmAccessibilityEnabled,
                     onExportDiagnostics = ::exportDiagnostics,
                     sharedContent = sharedContent,
                     onSharedContentHandled = ::clearSharedContent,
@@ -179,6 +208,19 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         sharedContent = intent.toSharedContent()
+        handleRemoteStartIfRequested(intent)
+    }
+
+    /** Advanced Screen Continuity - Remote Start, Case B: the notification's "Start" action carries
+     *  this extra. Tapping it IS the minimum legitimate user interaction the spec requires - it
+     *  directly (and only) triggers the exact same unmodified requestScreenShare() a manual tap on
+     *  the in-app Start button would, so Android's own mandatory MediaProjection consent dialog
+     *  still requires its own separate tap right afterwards. Nothing here bypasses that. */
+    private fun handleRemoteStartIfRequested(intent: Intent) {
+        if (!intent.getBooleanExtra(EXTRA_REMOTE_START, false)) return
+        intent.removeExtra(EXTRA_REMOTE_START)
+        if (::pairing.isInitialized) pairing.clearRemoteScreenShareRequest()
+        requestScreenShare()
     }
 
     private fun Intent.toSharedContent(): SharedContent? {
@@ -212,6 +254,7 @@ class MainActivity : ComponentActivity() {
         appNotificationsEnabled = getSystemService(NotificationManager::class.java).areNotificationsEnabled()
         notificationAccessEnabled = NotificationAccess.isEnabled(this)
         mediaPermissionGranted = hasMediaIntegrationPermissions()
+        kvmAccessibilityEnabled = BridgeyAccessibilityService.isEnabled(this)
         if (
             ::bridgeySettings.isInitialized && bridgeySettings.state.value.directCallsEnabled &&
             !hasCallIntegrationPermissions()
@@ -249,6 +292,62 @@ class MainActivity : ComponentActivity() {
         } else {
             callPermissionLauncher.launch(CALL_INTEGRATION_PERMISSIONS)
         }
+    }
+
+    private fun requestScreenShare() {
+        val manager = getSystemService(MediaProjectionManager::class.java)
+        screenCaptureLauncher.launch(manager.createScreenCaptureIntent())
+    }
+
+    private fun stopScreenShare() {
+        startService(Intent(this, ScreenCaptureService::class.java).setAction(ScreenCaptureService.ACTION_STOP))
+    }
+
+    private fun enterPocketMode() {
+        (application as BridgeyApplication).pocketGuard.engage()
+    }
+
+    /** Remote Start's notification is otherwise silenced by the user's own Do Not Disturb setting
+     *  (confirmed on a real device) - "Do Not Disturb access" is the standard, legitimate mechanism
+     *  alarms/calls use to ring through DND, requested only the first time the user opts in here. */
+    private fun requestRemoteScreenShare(enabled: Boolean) {
+        if (!enabled) {
+            bridgeySettings.setGlobal(BridgeyFeature.REMOTE_SCREEN_SHARE, false)
+            return
+        }
+        if (getSystemService(NotificationManager::class.java).isNotificationPolicyAccessGranted) {
+            bridgeySettings.setGlobal(BridgeyFeature.REMOTE_SCREEN_SHARE, true)
+        } else {
+            notificationPolicyAccessLauncher.launch(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
+        }
+    }
+
+    /** Pocket Mode's touch guard needs SYSTEM_ALERT_WINDOW - a standard "special app access"
+     *  permission granted via Settings, requested only the first time the user opts in. */
+    private fun requestPocketMode(enabled: Boolean) {
+        if (!enabled) {
+            bridgeySettings.setPocketModeEnabled(false)
+            return
+        }
+        if (Settings.canDrawOverlays(this)) {
+            bridgeySettings.setPocketModeEnabled(true)
+        } else {
+            overlayPermissionLauncher.launch(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+        }
+    }
+
+    /** KVM Input (Part 3 POC) needs no special permission at the Bridgey layer itself - this only
+     *  toggles whether Android will accept an "input.offer" from a paired Mac at all (see
+     *  PairingCoordinator.receiveVideoChannelMessage). Actual gesture injection additionally requires
+     *  BridgeyAccessibilityService to be enabled under Settings > Accessibility, a separate,
+     *  independent, revocable consent step this only links out to - Android has no API for an app to
+     *  request that enablement directly, unlike overlay/notification-policy access. */
+    private fun requestKvmInput(enabled: Boolean) {
+        bridgeySettings.setGlobal(BridgeyFeature.KVM_INPUT, enabled)
+    }
+
+    private fun openKvmAccessibilitySettings() {
+        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
     }
 
     private fun requestPhotoSync() {
@@ -301,6 +400,10 @@ class MainActivity : ComponentActivity() {
             "Export Bridgey diagnostics",
         ))
     }
+
+    companion object {
+        const val EXTRA_REMOTE_START = "dev.bridgey.android.REMOTE_START"
+    }
 }
 
 @Composable
@@ -336,6 +439,14 @@ private fun BridgeyApp(
     onRequestDirectCalls: () -> Unit,
     mediaPermissionGranted: Boolean,
     onRequestPhotoSync: () -> Unit,
+    onRequestScreenShare: () -> Unit,
+    onStopScreenShare: () -> Unit,
+    onEnterPocketMode: () -> Unit,
+    onRequestPocketMode: (Boolean) -> Unit,
+    onRequestRemoteScreenShare: (Boolean) -> Unit,
+    onRequestKvmInput: (Boolean) -> Unit,
+    onOpenKvmAccessibilitySettings: () -> Unit,
+    kvmAccessibilityEnabled: Boolean,
     onExportDiagnostics: () -> Unit,
     sharedContent: SharedContent?,
     onSharedContentHandled: () -> Unit,
@@ -386,6 +497,10 @@ private fun BridgeyApp(
                 onGlobalFeatureChanged = { feature, enabled ->
                     if (feature == BridgeyFeature.PHOTO_SYNC && enabled && !mediaPermissionGranted) {
                         permissionPrompt = PermissionPrompt.PhotoSync
+                    } else if (feature == BridgeyFeature.REMOTE_SCREEN_SHARE) {
+                        onRequestRemoteScreenShare(enabled)
+                    } else if (feature == BridgeyFeature.KVM_INPUT) {
+                        onRequestKvmInput(enabled)
                     } else {
                         settings.setGlobal(feature, enabled)
                         if (feature == BridgeyFeature.FIND_DEVICE && !enabled) pairing.stopFinding()
@@ -414,6 +529,10 @@ private fun BridgeyApp(
                     }
                 },
                 onSyncExistingLibraryChanged = settings::setSyncExistingLibraryEnabled,
+                onPocketModeChanged = onRequestPocketMode,
+                onAutoPocketDetectionChanged = settings::setAutoPocketDetectionEnabled,
+                onOpenKvmAccessibilitySettings = onOpenKvmAccessibilitySettings,
+                kvmAccessibilityEnabled = kvmAccessibilityEnabled,
                 onForget = pairing::forget,
                 onExportDiagnostics = onExportDiagnostics,
                 modifier = Modifier.padding(padding),
@@ -445,6 +564,10 @@ private fun BridgeyApp(
                     else permissionPrompt = PermissionPrompt.NotificationForwarding
                 },
                 onTurnOff = onTurnOff,
+                onRequestScreenShare = onRequestScreenShare,
+                onStopScreenShare = onStopScreenShare,
+                pocketModeSettingEnabled = settingsState.pocketModeEnabled,
+                onEnterPocketMode = onEnterPocketMode,
                 modifier = Modifier.padding(padding),
             )
         }
@@ -594,6 +717,10 @@ private fun SettingsScreen(
     onNotificationApplicationChanged: (String, Boolean) -> Unit,
     onDirectCallsChanged: (Boolean) -> Unit,
     onSyncExistingLibraryChanged: (Boolean) -> Unit,
+    onPocketModeChanged: (Boolean) -> Unit,
+    onAutoPocketDetectionChanged: (Boolean) -> Unit,
+    onOpenKvmAccessibilitySettings: () -> Unit,
+    kvmAccessibilityEnabled: Boolean,
     onForget: (String) -> Unit,
     onExportDiagnostics: () -> Unit,
     modifier: Modifier = Modifier,
@@ -631,12 +758,88 @@ private fun SettingsScreen(
                 style = MaterialTheme.typography.bodySmall,
             )
         }
-        items(BridgeyFeature.entries, key = { it.key }) { feature ->
+        items(
+            BridgeyFeature.entries.filterNot { it == BridgeyFeature.REMOTE_SCREEN_SHARE || it == BridgeyFeature.KVM_INPUT },
+            key = { it.key },
+        ) { feature ->
             FeatureToggle(
                 title = feature.title,
                 enabled = state.globalFeatures[feature] != false,
                 onChanged = { onGlobalFeatureChanged(feature, it) },
             )
+        }
+
+        item { SectionTitle("Advanced Screen Continuity") }
+        item {
+            FeatureToggle(
+                title = "Remote Start from Trusted Mac",
+                subtitle = "Allow trusted Macs to start Screen Share without opening Bridgey.",
+                enabled = state.globalFeatures[BridgeyFeature.REMOTE_SCREEN_SHARE] != false,
+                onChanged = { onGlobalFeatureChanged(BridgeyFeature.REMOTE_SCREEN_SHARE, it) },
+            )
+        }
+        item {
+            FeatureToggle(
+                title = "Pocket Mode",
+                subtitle = "Blocks accidental touches while Screen Share is active. Automatically dims the " +
+                    "screen when triggered by the proximity sensor. Unlock: swipe down with two fingers.",
+                enabled = state.pocketModeEnabled,
+                onChanged = onPocketModeChanged,
+            )
+        }
+        if (state.pocketModeEnabled) {
+            item {
+                FeatureToggle(
+                    title = "Automatic Pocket Detection",
+                    subtitle = "Use the proximity sensor to enter Pocket Mode automatically after a short delay.",
+                    enabled = state.autoPocketDetectionEnabled,
+                    onChanged = onAutoPocketDetectionChanged,
+                )
+            }
+        }
+        item {
+            Text(
+                "True display-off streaming isn't supported: Android stops screen sharing the instant " +
+                    "the lock screen engages, to prevent apps from recording content you can't see.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        item { SectionTitle("Digital KVM (POC)") }
+        item {
+            FeatureToggle(
+                title = "KVM Input",
+                subtitle = "Let a trusted, paired Mac move the pointer and tap on this phone - " +
+                    "works with or without Screen Share running.",
+                enabled = state.globalFeatures[BridgeyFeature.KVM_INPUT] != false,
+                onChanged = { onGlobalFeatureChanged(BridgeyFeature.KVM_INPUT, it) },
+            )
+        }
+        if (state.globalFeatures[BridgeyFeature.KVM_INPUT] != false) {
+            item {
+                Card(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                if (kvmAccessibilityEnabled) "Accessibility Service: enabled" else "Accessibility Service: not enabled",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                "Required for KVM to actually move the pointer or tap. Bridgey never reads " +
+                                    "screen content - only dispatches gestures.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        TextButton(onClick = onOpenKvmAccessibilitySettings) { Text("Open Settings") }
+                    }
+                }
+            }
         }
 
         if (state.globalFeatures[BridgeyFeature.CALLS] != false) {
@@ -795,10 +998,15 @@ private val MEDIA_SYNC_PERMISSIONS = if (Build.VERSION.SDK_INT >= 33) {
 }
 
 @Composable
-private fun FeatureToggle(title: String, enabled: Boolean, onChanged: (Boolean) -> Unit) {
+private fun FeatureToggle(title: String, enabled: Boolean, onChanged: (Boolean) -> Unit, subtitle: String? = null) {
     Card(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
         Row(Modifier.padding(horizontal = 18.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(title, modifier = Modifier.weight(1f), fontWeight = FontWeight.Medium)
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(title, fontWeight = FontWeight.Medium)
+                subtitle?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
             Switch(checked = enabled, onCheckedChange = onChanged)
         }
     }
@@ -822,9 +1030,14 @@ private fun DeviceScreen(
     onAppNotifications: () -> Unit,
     onNotificationForwarding: () -> Unit,
     onTurnOff: () -> Unit,
+    onRequestScreenShare: () -> Unit,
+    onStopScreenShare: () -> Unit,
+    pocketModeSettingEnabled: Boolean,
+    onEnterPocketMode: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(pairing::sendFile) }
+    val screenSharing by pairing.screenCapture.isActive.collectAsStateWithLifecycle()
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
@@ -855,6 +1068,26 @@ private fun DeviceScreen(
                 item {
                     QuickActionsCard(pairing.quickActions, enabledFeatures[BridgeyFeature.LINKS] == true,
                         enabledFeatures[BridgeyFeature.MEDIA] == true)
+                }
+            }
+            item {
+                ServiceCard(
+                    enabled = screenSharing,
+                    title = "Screen sharing",
+                    detail = if (screenSharing) "Streaming this screen to your Mac" else "Show this phone's screen on your Mac",
+                    action = if (screenSharing) "Stop" else "Start",
+                    onClick = if (screenSharing) onStopScreenShare else onRequestScreenShare,
+                )
+            }
+            if (screenSharing && pocketModeSettingEnabled) {
+                item {
+                    ServiceCard(
+                        enabled = false,
+                        title = "Pocket Mode",
+                        detail = "Blocks touch while this phone is put away - stream keeps running. Unlock: swipe down with two fingers.",
+                        action = "Enable now",
+                        onClick = onEnterPocketMode,
+                    )
                 }
             }
         } else {

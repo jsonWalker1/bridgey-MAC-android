@@ -456,6 +456,122 @@ call is currently ringing or active rather than looking up the specific
 with `calls.action.ack` echoing `callId` and `action` plus `accepted`; Mac
 ignores an ack that does not match the call it currently displays.
 
+### Video / Input dedicated channels (`video.channel.v1`) — M1 transport foundation, no encoder/decoder/UI yet
+
+M1 of the Bridgey Video Transport + Digital KVM design (see `docs/architecture.md`
+for the full audit/proposal). Establishes two independent, dedicated TCP
+sockets — one for video frames, one for input events — alongside the existing
+control-channel session, because both carry payloads (encoded video frames;
+a continuous stream of pointer/key events) far too large or too frequent for
+the 65,536-byte JSON-line control channel. **Status:** the transport,
+security, framing, lifecycle, and backpressure machinery below is fully
+implemented and unit/integration tested on both platforms; there is no
+encoder/decoder, KVM input-injection, or user-facing UI wired up yet — later
+milestones consume `VideoTransport`/`InputTransport` as already-solid
+building blocks.
+
+Negotiation happens over the existing encrypted control channel, reusing its
+established pairing trust — no second bootstrap or key exchange. Video and
+input negotiate **independently**: `video.offer`/`video.accept`/`video.reject`/
+`video.stop` and `input.offer`/`input.accept`/`input.reject`/`input.stop` are
+separate message families, each its own request/response pair, so one media
+type can be active without implying anything about the other.
+
+`video.offer` / `input.offer` (either peer → the other, whichever side is
+initiating that particular channel):
+
+```json
+{ "version": 1, "channelId": "c1b0d9e3-...", "direction": "android_to_mac",
+  "width": 1080, "height": 2400, "bitrateKbps": 4000, "fps": 30 }
+```
+
+`input.offer` omits `width`/`height`/`bitrateKbps`/`fps`. `direction` is
+`android_to_mac` or `mac_to_android` and is decided once by whichever side
+sends the offer; it is never re-sent by the acceptor, since both sides derive
+the same channel key from the same locally-known value. The receiving side
+replies `*.accept` with the ephemeral TCP port it just opened to listen on, or
+`*.reject` with a `reason` (`busy` if that channel is already active,
+`unavailable` otherwise) — `channelId` is echoed back in both:
+
+```json
+{ "version": 1, "channelId": "c1b0d9e3-...", "port": 54321 }
+```
+
+The offering side then dials that port on the same host its control session
+is already talking to. `*.stop` (either direction, `{version, channelId}`)
+requests a clean shutdown; a stop initiated by the peer is treated as a normal
+close (not a failure) on the receiving side.
+
+**Security.** The dedicated channel's `channelKey` is derived from the
+already-established pairing key, binding in the session, the channel's
+purpose, and its direction, so a video channel, an input channel, and the two
+directions of either can never collide even if several are active at once:
+
+```
+channelKey = HKDF-SHA-256(
+  IKM = pairingKey,
+  salt = SHA-256(sessionId + " " + purpose + " " + direction),
+  info = "bridgey-channel-v1", 32 bytes
+)
+```
+
+Once connected, the socket runs a mutually-authenticated handshake before any
+frame is trusted. The initiator sends its raw 16-byte session ID, a 1-byte
+purpose tag, a 16-byte random `openNonce`, and a 32-byte `token`; the acceptor
+verifies the claimed session ID/purpose match what it independently expects
+before checking the token, then proves itself back with an `ackProof` the
+initiator verifies before treating the channel as active — a bare
+unauthenticated acknowledgement was deliberately rejected during design in
+favor of this second HMAC proof:
+
+```
+token     = HMAC-SHA-256(channelKey, "bridgey-channel-open-v1 " + sessionId + " " + purpose + openNonce)
+ackProof  = HMAC-SHA-256(channelKey, "bridgey-channel-ack-v1 "  + sessionId + " " + purpose + openNonce)
+```
+
+Every frame after the handshake is independently encrypted (AES-GCM, random
+12-byte nonce, 16-byte tag) under `channelKey` — the channel does not rely on
+TCP alone for confidentiality/integrity, matching the rest of the protocol's
+application-layer encryption posture.
+
+**Framing.** Both the video and input channels share one binary frame format:
+
+```
+[4B frameLength][1B version][1B type][8B streamId][8B sequence][8B captureTimestampMs][12B nonce][ciphertext + 16B tag]
+```
+
+`frameLength` counts everything after itself and is validated against the
+transport's `maxFrameBytes` cap *before* the declared length is read, so a
+malicious or corrupted length prefix cannot force an unbounded read. `type`
+distinguishes `CONFIG`/`KEYFRAME`/`DELTA`/`KEYFRAME_REQUEST`/`STREAM_RESTART`
+(video) from `POINTER`/`KEY`/`TEXT` (input) — the two ranges never overlap.
+`sequence` is per-channel and strictly increasing; a frame at or below the
+last accepted sequence is silently dropped (replay/reorder), without closing
+the connection. A frame that fails to parse, claims an unknown type, or fails
+AES-GCM verification closes the channel as a protocol violation.
+
+Input event payloads (before encryption): `POINTER` is `[1B action][4B x
+Float32][4B y Float32]` with `x`/`y` normalized 0.0–1.0 (never absolute
+pixels, so either side's actual screen resolution is irrelevant to the wire
+format); `KEY` is `[4B keyCode][1B action]`; `TEXT` is raw UTF-8 bytes.
+
+**Lifecycle.** Each channel (video, input) is an independent state machine:
+`idle → negotiating → connecting → handshaking → active → closing → idle`,
+with `failed` reachable from a connect/handshake failure or an unexpected
+socket close while active, and an unconditional `sessionReset` event forcing
+`idle` from any state — fired whenever the main paired session itself resets,
+tearing down any in-progress or active video/input channel alongside it. A
+peer-initiated `*.stop` is routed as a normal `stopRequested` event, not a
+socket-closed failure.
+
+**Backpressure.** Each direction has its own bounded send queue. For video,
+`CONFIG`/`KEYFRAME` frames are never silently dropped; `DELTA` frames may be,
+evicting the oldest droppable entry first when the queue is full. For input,
+only pointer `MOVE` is coalescible/droppable; pointer down/up, key down/up,
+and text are never dropped — the policies differ because a lost video delta
+just costs a frame until the next keyframe, while a lost key or click is a
+correctness bug from the user's perspective.
+
 ## Compatibility
 
 Adding optional fields or message types is backward compatible. Changing field

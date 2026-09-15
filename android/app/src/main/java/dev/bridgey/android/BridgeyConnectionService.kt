@@ -56,6 +56,16 @@ class BridgeyConnectionService : Service() {
                 enableVibration(false)
             },
         )
+        notificationManager.createNotificationChannel(
+            NotificationChannel(REMOTE_START_CHANNEL_ID, "Remote Screen Share", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "Shows when a trusted Mac asks to start Screen Share"
+                // Only takes effect once the user has separately granted Do Not Disturb access
+                // (Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS, requested from the Remote
+                // Start toggle in MainActivity) - the same legitimate mechanism alarms/calls use to
+                // ring through DND, not a bypass of the user's own DND choice.
+                setBypassDnd(true)
+            },
+        )
         startForeground(NOTIFICATION_ID, buildNotification(lastStatus))
         serviceScope.launch {
             (application as BridgeyApplication).pairing.state.collect { state ->
@@ -91,6 +101,45 @@ class BridgeyConnectionService : Service() {
                 else notificationManager.cancel(FIND_NOTIFICATION_ID)
             }
         }
+        serviceScope.launch {
+            bridgey.pairing.remoteScreenShareRequest.collect { peerName ->
+                if (peerName != null) notificationManager.notify(REMOTE_START_NOTIFICATION_ID, buildRemoteStartNotification(peerName))
+                else notificationManager.cancel(REMOTE_START_NOTIFICATION_ID)
+            }
+        }
+    }
+
+    /** Advanced Screen Continuity - Remote Start, Case B (no MediaProjection session currently
+     *  alive): the minimum legitimate user interaction is one tap here, which brings MainActivity to
+     *  the foreground and immediately triggers the same unmodified system MediaProjection consent
+     *  flow a manual "Start" tap would - Android's mandatory permission dialog still requires its
+     *  own separate tap, which this cannot and must not bypass. */
+    private fun buildRemoteStartNotification(peerName: String): android.app.Notification {
+        val startIntent = Intent()
+            .setComponent(ComponentName(this, MainActivity::class.java))
+            .putExtra(MainActivity.EXTRA_REMOTE_START, true)
+            .apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+            }
+        val pendingStart = PendingIntent.getActivity(
+            this,
+            6,
+            startIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        return android.app.Notification.Builder(this, REMOTE_START_CHANNEL_ID)
+            .setSmallIcon(dev.bridgey.android.R.drawable.ic_bridgey_notification)
+            .setContentTitle("$peerName wants to start Screen Share")
+            .setContentText("Tap Start, then confirm the system screen-sharing prompt")
+            .setCategory(android.app.Notification.CATEGORY_CALL)
+            .setVisibility(android.app.Notification.VISIBILITY_PUBLIC)
+            .setOnlyAlertOnce(true)
+            .setAutoCancel(true)
+            .setContentIntent(pendingStart)
+            .addAction(android.R.drawable.ic_media_play, "Start", pendingStart)
+            .build()
     }
 
     private val shownTransferNotifications = mutableSetOf<Int>()
@@ -274,6 +323,8 @@ class BridgeyConnectionService : Service() {
         private const val TRANSFER_CHANNEL_ID = "bridgey_file_transfers_v1"
         private const val FIND_CHANNEL_ID = "bridgey_find_device_v1"
         private const val FIND_NOTIFICATION_ID = 42_459
+        private const val REMOTE_START_CHANNEL_ID = "bridgey_remote_start_v1"
+        private const val REMOTE_START_NOTIFICATION_ID = 42_461
         private const val ACTION_RESTORE_NOTIFICATION = "dev.bridgey.android.RESTORE_NOTIFICATION"
         const val ACTION_TURN_OFF = "dev.bridgey.android.TURN_OFF"
         private const val ACTION_CANCEL_TRANSFER = "dev.bridgey.android.CANCEL_TRANSFER"

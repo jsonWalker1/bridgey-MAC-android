@@ -2,6 +2,8 @@
 <resources>
     <string name="app_name">Bridgey</string>
     <string name="notification_forwarding_label">Bridgey notification forwarding</string>
+    <string name="kvm_accessibility_service_label">Bridgey KVM Input</string>
+    <string name="kvm_accessibility_service_description">Lets a trusted, paired Mac move the pointer and tap on this phone over Bridgey\'s existing encrypted connection. Only used while KVM Input is turned on in Bridgey\'s settings; does not read screen content.</string>
     <string name="welcome_title">Welcome to Bridgey</string>
     <string name="welcome_body">Keep your Mac and phone on the same local network. Choose the Mac, compare the pairing code, then confirm it on both devices. Optional permissions are requested only when you enable the related feature.</string>
     <string name="welcome_continue">Get started</string>

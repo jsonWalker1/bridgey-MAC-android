@@ -109,6 +109,20 @@ class PairingCoordinator(
         available = { mutableState.value is PairingState.Connected && isFeatureAvailable(BridgeyFeature.MEDIA) },
         send = ::sendQuickPayload,
     )
+    // M1: transport/security/lifecycle foundation only - no BridgeyFeature gate yet (that's M3),
+    // no encoder/decoder/KVM consumer wired up yet (M2/M4/M5).
+    internal val videoChannel = VideoChannelManager(
+        available = { mutableState.value is PairingState.Connected },
+        send = ::sendQuickPayload,
+        pairingKeyProvider = { session?.pairingKey },
+        sessionIdProvider = { session?.id },
+        remoteHostProvider = { session?.remoteHost },
+    )
+    // M2: adapts the verified screen-capture PoC onto the M1 video channel above.
+    internal val screenCapture = ScreenCaptureManager(appContext, videoChannel)
+    // Part 3 KVM POC: binds the same-frozen input channel to real Android input injection -
+    // independent of screenCapture above (see KvmInputInjector's doc comment).
+    internal val kvmInput = KvmInputInjector(appContext, videoChannel)
     private val mutableState = MutableStateFlow<PairingState>(PairingState.Idle)
     val state: StateFlow<PairingState> = mutableState.asStateFlow()
     private val identity = AndroidIdentity(context.applicationContext)
@@ -136,6 +150,13 @@ class PairingCoordinator(
     private val mutablePingStatus = MutableStateFlow<String?>(null)
     val pingStatus: StateFlow<String?> = mutablePingStatus.asStateFlow()
     private var pendingPingId: String? = null
+    // Advanced Screen Continuity - Remote Start: peer name of a trusted Mac's remote-start request
+    // that still needs the user to complete Android's mandatory MediaProjection consent (Case B).
+    // Non-null exactly while BridgeyConnectionService's notification is showing; cleared once the
+    // user acts (MainActivity relaunch with EXTRA_REMOTE_START) or the request goes stale.
+    private val mutableRemoteScreenShareRequest = MutableStateFlow<String?>(null)
+    val remoteScreenShareRequest: StateFlow<String?> = mutableRemoteScreenShareRequest.asStateFlow()
+    private var pendingRemoteStartRequestId: String? = null
     private val mutableRemoteFeatures = MutableStateFlow(defaultFeatureState())
     val remoteFeatures: StateFlow<Map<BridgeyFeature, Boolean>> = mutableRemoteFeatures.asStateFlow()
     private val incomingFiles = ConcurrentHashMap<String, IncomingFileTransfer>()
@@ -219,6 +240,7 @@ class PairingCoordinator(
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
+        videoChannel.reset()
         mutableRemoteFeatures.value = defaultFeatureState()
         mutableState.value = PairingState.Idle
     }
@@ -236,6 +258,7 @@ class PairingCoordinator(
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
+        videoChannel.reset()
         mutableRemoteFeatures.value = defaultFeatureState()
         mutableState.value = PairingState.Idle
     }
@@ -429,6 +452,74 @@ class PairingCoordinator(
         }
         current.send(Message(kind = "ping.ack", sessionId = current.id, messageId = messageId))
         android.util.Log.i("Bridgey", "PLUGIN ping received")
+    }
+
+    /** Advanced Screen Continuity - Remote Start (Case A/B). `current` only ever reaches here after
+     *  the full SAS-verified pairing handshake already completed (PairingState.Connected), and -
+     *  like every other actionable command Bridgey supports (ping, find-device, ...) - the request
+     *  must additionally carry an AES-GCM payload that decrypts with the session's pairingKey.
+     *  `kind`/`sessionId`/`messageId` travel as plain JSON alongside the ciphertext and are NOT
+     *  cryptographically bound to it, so requiring a successful decrypt (not just a sessionId match)
+     *  is what actually proves the sender holds the shared secret from the real ECDH+SAS-verified
+     *  handshake, rather than a LAN observer who merely saw/replayed those plaintext envelope fields. */
+    private fun receiveRemoteScreenShareStart(current: Session, message: Message) {
+        if (!featureEnabled(BridgeyFeature.REMOTE_SCREEN_SHARE, current)) {
+            android.util.Log.w("Bridgey", "REMOTE_START rejected: feature disabled locally")
+            sendFeatureState()
+            return
+        }
+        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        val messageId = message.messageId ?: return
+        if (!current.acceptMessageId(messageId)) return
+        val plaintext = Crypto.decrypt(
+            current.pairingKey!!,
+            message.nonce ?: return fail("Invalid encrypted remote-start request"),
+            message.ciphertext ?: return fail("Invalid encrypted remote-start request"),
+        ) ?: return fail("Invalid encrypted remote-start request")
+        if (runCatching { JSONObject(plaintext.toString(Charsets.UTF_8)).getInt("version") }.getOrNull() != 1) {
+            return fail("Invalid remote-start request")
+        }
+        android.util.Log.i("Bridgey", "REMOTE_START request received from trusted peer=${current.peerName}")
+        if (screenCapture.isActive.value) {
+            android.util.Log.i("Bridgey", "REMOTE_START: MediaProjection session already alive - resuming with no user interaction")
+            current.send(Message(kind = "screenshare.remoteStartResult", sessionId = current.id, messageId = messageId, status = "already_active"))
+            return
+        }
+        if (pendingRemoteStartRequestId != null) {
+            android.util.Log.i("Bridgey", "REMOTE_START: a request is already pending user action - not showing a duplicate prompt")
+            current.send(Message(kind = "screenshare.remoteStartResult", sessionId = current.id, messageId = messageId, status = "pending_user_action"))
+            return
+        }
+        android.util.Log.i("Bridgey", "REMOTE_START: no active session - requesting minimum legitimate user interaction (notification + system consent)")
+        pendingRemoteStartRequestId = messageId
+        mutableRemoteScreenShareRequest.value = current.peerName
+        current.send(Message(kind = "screenshare.remoteStartResult", sessionId = current.id, messageId = messageId, status = "needs_user_action"))
+    }
+
+    private fun receiveRemoteScreenShareStop(current: Session, message: Message) {
+        if (!featureEnabled(BridgeyFeature.REMOTE_SCREEN_SHARE, current)) return
+        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        val messageId = message.messageId ?: return
+        if (!current.acceptMessageId(messageId)) return
+        val plaintext = Crypto.decrypt(
+            current.pairingKey!!,
+            message.nonce ?: return fail("Invalid encrypted remote-stop request"),
+            message.ciphertext ?: return fail("Invalid encrypted remote-stop request"),
+        ) ?: return fail("Invalid encrypted remote-stop request")
+        if (runCatching { JSONObject(plaintext.toString(Charsets.UTF_8)).getInt("version") }.getOrNull() != 1) {
+            return fail("Invalid remote-stop request")
+        }
+        android.util.Log.i("Bridgey", "REMOTE_STOP request received from trusted peer=${current.peerName}, active=${screenCapture.isActive.value}")
+        if (screenCapture.isActive.value) screenCapture.stop()
+        clearRemoteScreenShareRequest()
+    }
+
+    /** Called once the pending request has been resolved one way or another - the user acted on the
+     *  notification (see MainActivity's EXTRA_REMOTE_START handling), the request went stale, or a
+     *  remoteStop arrived. Also cancels the notification via BridgeyConnectionService's collector. */
+    fun clearRemoteScreenShareRequest() {
+        pendingRemoteStartRequestId = null
+        mutableRemoteScreenShareRequest.value = null
     }
 
     private fun clearPingStatus() {
@@ -893,6 +984,7 @@ class PairingCoordinator(
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
+        videoChannel.reset()
         mutableRemoteFeatures.value = defaultFeatureState()
         server?.close()
         server = null
@@ -942,6 +1034,7 @@ class PairingCoordinator(
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
+        videoChannel.reset()
         mutableRemoteFeatures.value = defaultFeatureState()
         if (initiatedLocally) {
             current.peerName = peerHint ?: "Mac"
@@ -970,16 +1063,7 @@ class PairingCoordinator(
                     receive(current, Message.decode(line))
                 } catch (_: SocketTimeoutException) {
                     if (session !== current) break
-                    // DIAGNOSTIC (temporary): logs every ~10s soTimeout tick so we can see whether
-                    // the read loop keeps running normally across a screen lock, or stops ticking
-                    // altogether (which would point at the thread/process being suspended rather
-                    // than the socket/network actually failing).
                     val sinceLastReceivedMs = SystemClock.elapsedRealtime() - current.lastReceivedAtMillis
-                    android.util.Log.d(
-                        "Bridgey",
-                        "CONNECTION soTimeout tick: state=${mutableState.value} " +
-                            "heartbeatSupported=${current.heartbeatSupported} sinceLastReceivedMs=$sinceLastReceivedMs",
-                    )
                     if (mutableState.value is PairingState.Connected) {
                         if (heartbeatExpired(
                                 supported = current.heartbeatSupported,
@@ -1018,6 +1102,8 @@ class PairingCoordinator(
             clearPingStatus()
             quickActions.reset()
             mediaRemote.reset()
+            videoChannel.reset()
+        videoChannel.reset()
             mutableRemoteFeatures.value = defaultFeatureState()
             reconnectAttempt = 0
             mutableState.value = PairingState.Idle
@@ -1120,10 +1206,14 @@ class PairingCoordinator(
             "calls.request" -> receiveCallRequest(current, message)
             "calls.action" -> receiveCallAction(current, message)
             "media.remote.action" -> receiveMediaRemoteAction(current, message)
+            "video.offer", "video.accept", "video.reject", "video.stop",
+            "input.offer", "input.accept", "input.reject", "input.stop" -> receiveVideoChannelMessage(current, message)
             "find.start" -> receiveFindCommand(current, message, start = true)
             "find.stop" -> receiveFindCommand(current, message, start = false)
             "find.started" -> receiveFindAcknowledgement(current, message, started = true)
             "find.stopped" -> receiveFindAcknowledgement(current, message, started = false)
+            "screenshare.remoteStart" -> receiveRemoteScreenShareStart(current, message)
+            "screenshare.remoteStop" -> receiveRemoteScreenShareStop(current, message)
             "ping.request" -> receivePing(current, message)
             "ping.ack" -> {
                 if (session !== current || message.sessionId != current.id || mutableState.value !is PairingState.Connected) return
@@ -1293,6 +1383,36 @@ class PairingCoordinator(
             .apply { reason?.let { put("reason", it) } }
         sendQuickPayload("media.remote.action.ack", ackPayload)
         diagnostics.record("media", "action_received", outcome = "${payload.optString("action")}:${if (accepted) "accepted" else reason}")
+    }
+
+    /** Dedicated control-channel dispatch for the video/input channel negotiation family
+     * (video.offer/accept/reject/stop, input.offer/accept/reject/stop) - decrypts and hands the
+     * plain JSON payload to VideoChannelManager, which owns all negotiation/establishment logic. */
+    private fun receiveVideoChannelMessage(current: Session, message: Message) {
+        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        val messageId = message.messageId ?: return
+        if (!current.acceptMessageId(messageId)) return
+        val nonce = message.nonce ?: return
+        val ciphertext = message.ciphertext ?: return
+        val plaintext = Crypto.decrypt(current.pairingKey!!, nonce, ciphertext) ?: return
+        if (plaintext.size > 8_192) return
+        val payload = runCatching { JSONObject(plaintext.toString(Charsets.UTF_8)) }.getOrNull() ?: return
+        // KVM PART 3: unlike video (only Android ever offers), Mac is the initiator of "input.offer"
+        // - so unlike video's channel-level available() (connection-only), an incoming input.offer
+        // must additionally be gated on the user having explicitly opted in to KVM_INPUT. A rejected
+        // offer is answered exactly the way VideoChannelManager itself would (same wire shape), so
+        // the channel cleanly settles back to idle on the Mac side too.
+        if (message.kind == "input.offer" && !settings.isEnabled(BridgeyFeature.KVM_INPUT, current.remoteDeviceId)) {
+            val channelId = payload.optString("channelId")
+            if (channelId.isNotEmpty()) {
+                sendQuickPayload(
+                    "input.reject",
+                    JSONObject().put("version", 1).put("channelId", channelId).put("reason", "unavailable"),
+                )
+            }
+            return
+        }
+        videoChannel.receive(message.kind, payload)
     }
 
     private fun receiveNotificationAction(current: Session, message: Message) {
@@ -1650,6 +1770,7 @@ class PairingCoordinator(
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
+        videoChannel.reset()
         mutableRemoteFeatures.value = defaultFeatureState()
         mutableFileTransfers.value = recoverInterruptedTransfers(mutableFileTransfers.value)
         refreshFileTransferSummary("File transfer interrupted")
@@ -1712,6 +1833,9 @@ class PairingCoordinator(
     }
 
     private class Session(private val socket: Socket) {
+        // Used by VideoChannelManager to dial the dedicated video/input socket to the same peer
+        // this control session is already talking to - no separate discovery/addressing needed.
+        val remoteHost: String? = socket.inetAddress?.hostAddress
         val input = BufferedInputStream(socket.getInputStream())
         private val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
         var id = ""
@@ -1879,6 +2003,7 @@ private data class Message(
     val ciphertext: String? = null,
     val transferId: String? = null,
     val sequence: Long? = null,
+    val status: String? = null,
 ) {
     fun encode(): String = JSONObject().apply {
         put("kind", kind)
@@ -1894,6 +2019,7 @@ private data class Message(
         ciphertext?.let { put("ciphertext", it) }
         transferId?.let { put("transferId", it) }
         sequence?.let { put("sequence", it) }
+        status?.let { put("status", it) }
     }.toString()
 
     companion object {
@@ -1912,6 +2038,7 @@ private data class Message(
                 ciphertext = it.optString("ciphertext").takeIf(String::isNotEmpty),
                 transferId = it.optString("transferId").takeIf(String::isNotEmpty),
                 sequence = if (it.has("sequence")) it.getLong("sequence") else null,
+                status = it.optString("status").takeIf(String::isNotEmpty),
             )
         }
     }

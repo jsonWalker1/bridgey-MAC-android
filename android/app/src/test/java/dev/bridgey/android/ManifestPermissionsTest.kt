@@ -20,6 +20,7 @@ class ManifestPermissionsTest {
                 "android.permission.POST_NOTIFICATIONS",
                 "android.permission.FOREGROUND_SERVICE",
                 "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",
+                "android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION",
                 "android.permission.CALL_PHONE",
                 "android.permission.READ_PHONE_STATE",
                 "android.permission.ANSWER_PHONE_CALLS",
@@ -27,6 +28,8 @@ class ManifestPermissionsTest {
                 "android.permission.READ_MEDIA_VIDEO",
                 "android.permission.READ_EXTERNAL_STORAGE",
                 "android.permission.RECEIVE_BOOT_COMPLETED",
+                "android.permission.SYSTEM_ALERT_WINDOW",
+                "android.permission.ACCESS_NOTIFICATION_POLICY",
             ),
             declared,
         )

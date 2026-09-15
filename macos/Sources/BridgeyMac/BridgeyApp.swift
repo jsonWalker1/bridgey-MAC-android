@@ -217,6 +217,9 @@ private struct BridgeyPanel: View {
                 if pairing.isFeatureAvailable(.links) {
                     actionButton("Link", icon: "link") { pairing.quickActions.sendClipboardLink() }
                 }
+                // M2: no BridgeyFeature gate yet (that lands in M3, matching the video channel
+                // itself) - the window shows "waiting for stream" until Android actually starts one.
+                actionButton("Screen", icon: "rectangle.on.rectangle") { pairing.showScreenShareWindow() }
             }
             QuickActionsPanel(actions: pairing.quickActions)
             if pairing.isFeatureAvailable(.files) {

@@ -108,6 +108,10 @@ private struct PingPayload: Codable {
     let version: Int
 }
 
+private struct RemoteScreenSharePayload: Codable {
+    let version: Int
+}
+
 private struct FeatureStatePayload: Codable {
     let version: Int
     let features: [String: Bool]
@@ -168,6 +172,21 @@ final class PairingCoordinator: ObservableObject {
     let mediaController = MediaController()
     let mediaRemote = MediaRemoteController()
     let shortcuts = ShortcutSettings()
+    // M1: transport/security/lifecycle foundation only - no BridgeyFeature gate yet (that's M3), no
+    // encoder/decoder/KVM consumer wired up yet (M2/M4/M5).
+    lazy var videoChannel = VideoChannelController(
+        available: { [weak self] in
+            guard let self else { return false }
+            if case .connected = self.state { return true }
+            return false
+        },
+        send: { [weak self] kind, payload in self?.sendQuickPayload(kind: kind, payload: payload) == true },
+        pairingKeyProvider: { [weak self] in self?.session?.pairingKey },
+        sessionIdProvider: { [weak self] in self?.session?.id },
+        remoteHostProvider: { [weak self] in self?.session?.remoteHost }
+    )
+    // M2: adapts the verified ~/screen-poc-mac decode/display pipeline onto the video channel above.
+    let screenStreamDecoder = ScreenStreamDecoder()
 
     var trustedDevices: [TrustedDeviceInfo] {
         trustRegistry.devices.map { device in
@@ -209,6 +228,7 @@ final class PairingCoordinator: ObservableObject {
     private var fileOperationID: UUID?
     private var filePreparationCancellation: FileCancellationToken?
     private var fileTransferWindow: FileTransferWindowController?
+    private var screenShareWindow: ScreenShareWindowController?
     private var fileDropWindow: FileDropWindowController?
     // Accessed from the call-domain extension in Calls.swift, hence not `private`.
     lazy var callOverlayWindow = CallOverlayWindowController(pairing: self)
@@ -275,6 +295,15 @@ final class PairingCoordinator: ObservableObject {
         mediaRemote.sendAction = { [weak self] action, value, generation in
             self?.sendMediaRemoteAction(action: action, value: value, generation: generation)
         }
+        videoChannel.onVideoFrame = { [weak self] frame in
+            DispatchQueue.main.async { self?.screenStreamDecoder.handle(frame) }
+        }
+        screenStreamDecoder.requestKeyframe = { [weak self] in
+            _ = self?.videoChannel.sendVideoFrame(
+                EncodedVideoFrame(type: VideoFrameType.keyframeRequest, streamId: 0, captureTimestampMs: Int64(Date().timeIntervalSince1970 * 1000), payload: Data()),
+                droppable: false
+            )
+        }
         shortcuts.perform = { [weak self] action in
             switch action {
             case .clipboard: self?.sendClipboard()
@@ -298,6 +327,8 @@ final class PairingCoordinator: ObservableObject {
                     if !self.isFeatureAvailable(.links) { self.quickActions.reset() }
                     self.mediaController.reset()
                     self.mediaRemote.reset()
+                    self.videoChannel.reset()
+                    self.screenStreamDecoder.reset()
                     if !self.featureEnabled(.clipboard) { self.clearClipboardSendStatus() }
                     if !self.featureEnabled(.notifications) { self.clearRemoteCall() }
                     if !self.featureEnabled(.calls) {
@@ -379,6 +410,7 @@ final class PairingCoordinator: ObservableObject {
         NSLog("CONNECT attempting %@:%d peer=%@", host, port, peerName)
         let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
         let current = Session(connection: connection, peerName: peerName)
+        current.remoteHost = host
         current.initiatedLocally = true
         current.id = UUID().uuidString.lowercased()
         current.privateKey = P256.KeyAgreement.PrivateKey()
@@ -390,6 +422,8 @@ final class PairingCoordinator: ObservableObject {
         quickActions.reset()
         mediaController.reset()
         mediaRemote.reset()
+        videoChannel.reset()
+        screenStreamDecoder.reset()
         lastSentBattery = nil
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
@@ -451,6 +485,8 @@ final class PairingCoordinator: ObservableObject {
         quickActions.reset()
         mediaController.reset()
         mediaRemote.reset()
+        videoChannel.reset()
+        screenStreamDecoder.reset()
         lastSentBattery = nil
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
@@ -477,6 +513,8 @@ final class PairingCoordinator: ObservableObject {
         quickActions.reset()
         mediaController.reset()
         mediaRemote.reset()
+        videoChannel.reset()
+        screenStreamDecoder.reset()
         lastSentBattery = nil
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
@@ -796,6 +834,18 @@ final class PairingCoordinator: ObservableObject {
         return true
     }
 
+    /// Dedicated control-channel dispatch for the video/input channel negotiation family
+    /// (video.offer/accept/reject/stop, input.offer/accept/reject/stop) - decrypts and hands the
+    /// plain JSON payload to VideoChannelController, which owns all negotiation/establishment logic.
+    private func receiveVideoChannelMessage(_ message: PairingMessage, current: Session) {
+        guard case .connected = state, message.sessionId == current.id,
+              let key = current.pairingKey, let id = message.messageId, current.acceptMessageID(id),
+              let nonce = message.nonce, let ciphertext = message.ciphertext,
+              let data = try? decrypt(nonce: nonce, ciphertext: ciphertext, key: key), data.count <= 8192,
+              let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        videoChannel.receive(kind: message.kind, payload: payload)
+    }
+
     private func receiveQuickPayload(_ message: PairingMessage, current: Session) {
         guard session === current, case .connected = state, message.sessionId == current.id,
               let key = current.pairingKey, let id = message.messageId, current.acceptMessageID(id),
@@ -1105,6 +1155,49 @@ final class PairingCoordinator: ObservableObject {
         fileTransferWindow?.show()
     }
 
+    func showScreenShareWindow() {
+        if screenShareWindow == nil {
+            screenShareWindow = ScreenShareWindowController(decoder: screenStreamDecoder) { [weak self] in
+                self?.sendRemoteScreenShareStop()
+            }
+        }
+        screenShareWindow?.show()
+        sendRemoteScreenShareStart()
+    }
+
+    /// Advanced Screen Continuity - Remote Start (Case A/B). Reuses the same authenticated,
+    /// AES-GCM-encrypted session as every other Bridgey command (ping, find-device, ...) - no
+    /// separate pairing/handshake needed, since only a peer that already completed the real
+    /// ECDH+SAS-verified handshake holds the pairingKey this payload must decrypt with. A no-op if
+    /// the phone hasn't opted in (isFeatureAvailable(.remoteScreenShare) false) or nothing is paired.
+    private func sendRemoteScreenShareStart() {
+        guard let current = session, case .connected = state, isFeatureAvailable(.remoteScreenShare) else { return }
+        guard let plaintext = try? JSONEncoder().encode(RemoteScreenSharePayload(version: 1)),
+              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
+        current.send(PairingMessage(
+            kind: "screenshare.remoteStart",
+            sessionId: current.id,
+            messageId: UUID().uuidString.lowercased(),
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext
+        ))
+        NSLog("REMOTE_START request sent to Android")
+    }
+
+    private func sendRemoteScreenShareStop() {
+        guard let current = session, case .connected = state, isFeatureAvailable(.remoteScreenShare) else { return }
+        guard let plaintext = try? JSONEncoder().encode(RemoteScreenSharePayload(version: 1)),
+              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
+        current.send(PairingMessage(
+            kind: "screenshare.remoteStop",
+            sessionId: current.id,
+            messageId: UUID().uuidString.lowercased(),
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext
+        ))
+        NSLog("REMOTE_STOP request sent to Android")
+    }
+
     func showFileDropWindow() {
         if fileDropWindow == nil {
             fileDropWindow = FileDropWindowController(pairing: self)
@@ -1140,6 +1233,18 @@ final class PairingCoordinator: ObservableObject {
         }
     }
 
+    /// Extracts the peer's dotted-quad/host string from an accepted incoming connection, for
+    /// VideoChannelController to dial the dedicated video/input socket back to the same peer.
+    private static func remoteHostString(_ connection: NWConnection) -> String? {
+        guard case let .hostPort(host, _) = connection.endpoint else { return nil }
+        switch host {
+        case .ipv4(let address): return "\(address)"
+        case .ipv6(let address): return "\(address)"
+        case .name(let name, _): return name
+        @unknown default: return nil
+        }
+    }
+
     private func accept(_ connection: NWConnection) {
         // A session that has already identified its peer (received pairing.offer/answer) is
         // actively mid-handshake or connected; a brand new incoming connection racing against it
@@ -1157,6 +1262,7 @@ final class PairingCoordinator: ObservableObject {
         NSLog("CONNECT accepting incoming connection")
         session?.close()
         let current = Session(connection: connection, peerName: "Android device")
+        current.remoteHost = Self.remoteHostString(connection)
         current.initiatedLocally = false
         session = current
         remoteBattery = nil
@@ -1164,6 +1270,8 @@ final class PairingCoordinator: ObservableObject {
         quickActions.reset()
         mediaController.reset()
         mediaRemote.reset()
+        videoChannel.reset()
+        screenStreamDecoder.reset()
         lastSentBattery = nil
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
@@ -1202,6 +1310,8 @@ final class PairingCoordinator: ObservableObject {
             self.quickActions.reset()
             self.mediaController.reset()
             self.mediaRemote.reset()
+            self.videoChannel.reset()
+            self.screenStreamDecoder.reset()
             self.lastSentBattery = nil
             self.clearRemoteCall()
             self.remoteFeatures = defaultRemoteFeatureState()
@@ -1234,6 +1344,8 @@ final class PairingCoordinator: ObservableObject {
                     self.quickActions.reset()
                     self.mediaController.reset()
                     self.mediaRemote.reset()
+                    self.videoChannel.reset()
+                    self.screenStreamDecoder.reset()
                     self.lastSentBattery = nil
                     self.clearRemoteCall()
                     self.remoteFeatureStateReceived = false
@@ -1338,6 +1450,8 @@ final class PairingCoordinator: ObservableObject {
                 if !isFeatureAvailable(.links) { quickActions.reset() }
                 mediaController.reset()
                 mediaRemote.reset()
+                videoChannel.reset()
+                screenStreamDecoder.reset()
                 mediaController.refresh()
                 if remoteFeatures[.battery] == false { remoteBattery = nil }
                 if remoteFeatures[.ping] == false { clearPingStatus() }
@@ -1354,6 +1468,8 @@ final class PairingCoordinator: ObservableObject {
                 }
                 flushPendingCallIfPossible()
                 publishLocalBattery(force: true)
+            case "screenshare.remoteStartResult":
+                NSLog("REMOTE_START result from Android: %@", message.status ?? "unknown")
             case "ping.request":
                 try receivePing(message, in: current)
             case "ping.ack":
@@ -1533,6 +1649,9 @@ final class PairingCoordinator: ObservableObject {
                     throw PairingError.invalidMessage
                 }
                 mediaRemote.receiveAck(payload)
+            case "video.offer", "video.accept", "video.reject", "video.stop",
+                 "input.offer", "input.accept", "input.reject", "input.stop":
+                receiveVideoChannelMessage(message, current: current)
             case "files.offer":
                 guard case .connected = state,
                       message.sessionId == current.id,
@@ -1927,10 +2046,6 @@ final class PairingCoordinator: ObservableObject {
         let work = DispatchWorkItem { [weak self, weak current] in
             guard let self, let current, self.session === current, case .connected = self.state else { return }
             let sinceLastReceived = Date().timeIntervalSince(current.lastReceivedAt)
-            // DIAGNOSTIC (temporary): logs every ~10s heartbeat tick so we can see whether this
-            // timer keeps firing normally across a phone screen lock, and how stale the last
-            // received message was at each tick.
-            NSLog("CONNECTION heartbeat tick: heartbeatSupported=%@ sinceLastReceived=%.1fs", String(current.heartbeatSupported), sinceLastReceived)
             if heartbeatExpired(supported: current.heartbeatSupported, lastReceivedAt: current.lastReceivedAt) {
                 NSLog("CONNECTION lost: heartbeat timed out (sinceLastReceived=%.1fs)", sinceLastReceived)
                 current.close()
@@ -2156,6 +2271,9 @@ final class PairingCoordinator: ObservableObject {
 
 private final class Session {
     let connection: NWConnection
+    // Used by VideoChannelController to dial the dedicated video/input socket to the same peer this
+    // control session is already talking to.
+    var remoteHost: String?
     var peerName: String
     var remoteDeviceID = ""
     var remoteIdentityKey: String?
@@ -2253,6 +2371,7 @@ struct PairingMessage: Codable {
     var ciphertext: String? = nil
     var transferId: String? = nil
     var sequence: Int64? = nil
+    var status: String? = nil
 }
 
 enum PairingError: Error { case invalidMessage, cancelled }

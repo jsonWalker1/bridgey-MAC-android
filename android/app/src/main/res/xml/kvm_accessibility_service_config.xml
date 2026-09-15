@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Part 3 KVM POC: gesture-dispatch-only accessibility service. No content retrieval
+     (canRetrieveWindowContent omitted/false), minimal eventTypes (we never react to accessibility
+     events, only dispatch gestures), canPerformGestures is the one capability this actually needs. -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeViewFocused"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/kvm_accessibility_service_description"
+    android:notificationTimeout="100" />

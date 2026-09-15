@@ -5,6 +5,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.CALL_PHONE" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
@@ -12,7 +13,20 @@
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Pocket Mode's touch guard: a fully transparent, non-rendering overlay window that only
+         intercepts touches while Screen Share is active and the feature is explicitly opted in.
+         Standard "special app access" permission granted via Settings, not a hidden/hacky API. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- Lets a granted "Do Not Disturb access" (requested separately via Settings, see
+         requestRemoteScreenShare) actually bypass DND for the Remote Start notification channel -
+         the same standard mechanism alarm/call apps use, not a hidden or forced bypass. -->
+    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
     <uses-feature android:name="android.hardware.telephony" android:required="false" />
+    <!-- Part 3 KVM: BIND_ACCESSIBILITY_SERVICE needs no <uses-permission> declaration here (it is
+         declared on the <service> below); the service only becomes active once the user explicitly
+         enables it under Settings > Accessibility, same as any accessibility/remote-support app
+         (TeamViewer, AnyDesk QuickSupport). The cursor overlay reuses Pocket Mode's already-declared
+         SYSTEM_ALERT_WINDOW permission above - no new permission needed for it either. -->
 
     <!-- Media Continuity resolves a human-readable app name (e.g. "YouTube", "Spotify") for
          whatever app owns the current MediaSession, so it can show that instead of a raw package
@@ -83,6 +97,10 @@
             android:name=".BridgeyConnectionService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+        <service
+            android:name=".ScreenCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
         <receiver android:name=".BootCompletedReceiver" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
@@ -101,6 +119,22 @@
             <intent-filter>
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
+        </service>
+        <!-- Part 3 KVM POC input-injection layer - see BridgeyAccessibilityService's doc comment.
+             Requires explicit, revocable user enablement under Settings > Accessibility; only ever
+             dispatches gestures, never inspects window/content (see canRetrieveWindowContent below
+             and the config's minimal eventTypes). -->
+        <service
+            android:name=".BridgeyAccessibilityService"
+            android:exported="false"
+            android:label="@string/kvm_accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/kvm_accessibility_service_config" />
         </service>
     </application>
 </manifest>

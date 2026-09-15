@@ -24,7 +24,17 @@ final class BridgeySettingsTests: XCTestCase {
         XCTAssertFalse(featureEnabledByLegacyPeer(.calls))
         XCTAssertFalse(featureEnabledByLegacyPeer(.ping))
         XCTAssertFalse(featureEnabledByLegacyPeer(.photoSync))
+        XCTAssertFalse(featureEnabledByLegacyPeer(.remoteScreenShare))
         XCTAssertTrue(featureEnabledByLegacyPeer(.battery))
+    }
+
+    /// Advanced Screen Continuity - Remote Start must be opt-in (off by default), unlike Bridgey's
+    /// usual default-on convenience features: it lets a trusted peer trigger local device behavior.
+    @MainActor
+    func testRemoteScreenShareDefaultsToDisabled() {
+        UserDefaults.standard.removeObject(forKey: "settings.global.remote_screen_share")
+        let settings = BridgeySettings()
+        XCTAssertFalse(settings.isEnabled(.remoteScreenShare, for: nil))
     }
 
     @MainActor
