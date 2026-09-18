@@ -30,4 +30,16 @@ enum VideoContentGeometry {
             return CGRect(origin: origin, size: size)
         }
     }
+
+    /// Inverse of `contentRect`: a point in the same coordinate space as `bounds` (e.g. a mouse
+    /// location already converted into the hosting view's own coordinate system) -> a normalized
+    /// (0...1, 0...1) fraction of the displayed content, or nil if the point falls outside the
+    /// displayed content rectangle entirely (e.g. in FIT's letterbox bars). Callers are responsible
+    /// for the point and `bounds` sharing one consistent axis convention (e.g. both from a flipped,
+    /// top-left-origin view) - this function does no flipping of its own.
+    static func normalizedPoint(_ point: CGPoint, sourceSize: CGSize?, mode: VideoPresentationMode, in bounds: CGRect) -> CGPoint? {
+        let rect = contentRect(sourceSize: sourceSize, mode: mode, in: bounds)
+        guard rect.width > 0, rect.height > 0, rect.contains(point) else { return nil }
+        return CGPoint(x: (point.x - rect.minX) / rect.width, y: (point.y - rect.minY) / rect.height)
+    }
 }

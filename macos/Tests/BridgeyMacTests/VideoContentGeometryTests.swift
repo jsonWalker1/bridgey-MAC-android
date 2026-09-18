@@ -35,4 +35,35 @@ final class VideoContentGeometryTests: XCTestCase {
             bounds
         )
     }
+
+    func testNormalizedPointRoundTripsTheCenterOfAFullyFillingContentRect() throws {
+        let bounds = CGRect(x: 0, y: 0, width: 1000, height: 1000)
+        let normalized = try XCTUnwrap(VideoContentGeometry.normalizedPoint(
+            CGPoint(x: 500, y: 500), sourceSize: CGSize(width: 1000, height: 1000), mode: .fit, in: bounds
+        ))
+        XCTAssertEqual(Double(normalized.x), 0.5, accuracy: 0.001)
+        XCTAssertEqual(Double(normalized.y), 0.5, accuracy: 0.001)
+    }
+
+    func testNormalizedPointReturnsNilOutsideTheLetterboxedContentRect() {
+        // A portrait source inside a wide, short container leaves horizontal letterbox bars.
+        let bounds = CGRect(x: 0, y: 0, width: 2000, height: 500)
+        let normalized = VideoContentGeometry.normalizedPoint(
+            CGPoint(x: 5, y: 250), sourceSize: CGSize(width: 1080, height: 2340), mode: .fit, in: bounds
+        )
+        XCTAssertNil(normalized, "a click in the letterbox bar must not map to any phone-screen position")
+    }
+
+    func testNormalizedPointMapsTopLeftAndBottomRightCornersOfTheContentRect() throws {
+        let bounds = CGRect(x: 0, y: 0, width: 1080, height: 2340)
+        let topLeft = try XCTUnwrap(VideoContentGeometry.normalizedPoint(
+            CGPoint(x: 0, y: 0), sourceSize: CGSize(width: 1080, height: 2340), mode: .fit, in: bounds
+        ))
+        let bottomRight = VideoContentGeometry.normalizedPoint(
+            CGPoint(x: 1080, y: 2340), sourceSize: CGSize(width: 1080, height: 2340), mode: .fit, in: bounds
+        )
+        XCTAssertEqual(Double(topLeft.x), 0, accuracy: 0.001)
+        XCTAssertEqual(Double(topLeft.y), 0, accuracy: 0.001)
+        XCTAssertNil(bottomRight, "the far corner point is exclusive of the rect (matches CGRect.contains)")
+    }
 }

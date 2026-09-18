@@ -1157,9 +1157,22 @@ final class PairingCoordinator: ObservableObject {
 
     func showScreenShareWindow() {
         if screenShareWindow == nil {
-            screenShareWindow = ScreenShareWindowController(decoder: screenStreamDecoder) { [weak self] in
-                self?.sendRemoteScreenShareStop()
-            }
+            screenShareWindow = ScreenShareWindowController(
+                decoder: screenStreamDecoder,
+                onUserClosedWindow: { [weak self] in
+                    self?.sendRemoteScreenShareStop()
+                    // KVM Mouse Input v1: the capture surface is gone with this window, so the input
+                    // channel it was feeding has no reason to stay open either.
+                    self?.videoChannel.stopInput()
+                },
+                onPointerEvent: { [weak self] action, x, y in
+                    guard let self else { return }
+                    // offerInput() is a no-op once the channel is already offered/connecting/active
+                    // (frozen VideoChannelController guard) - safe to call on every event.
+                    videoChannel.offerInput(direction: "mac_to_android")
+                    _ = videoChannel.sendInputEvent(.pointer(action: action, x: x, y: y))
+                }
+            )
         }
         screenShareWindow?.show()
         sendRemoteScreenShareStart()
