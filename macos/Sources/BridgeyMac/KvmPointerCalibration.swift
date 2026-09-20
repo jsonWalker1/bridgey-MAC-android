@@ -20,11 +20,11 @@ import CoreGraphics
 /// proportionally correct if a differently-sized Android display connects, rather than hard-coding
 /// a pixel offset for one specific device.
 ///
-/// The Y value below (-123px / 3088) was subsequently confirmed by live, on-device visual
-/// calibration (moving the KVM cursor to a recognizable on-screen target and iterating), superseding
-/// the -3.8140px statistically-fit value from KVM_CALIBRATION_MODEL_ANALYSIS.md - the live result and
-/// the offline fit agree on sign and rough scale but not on magnitude. X is left at 0 (no correction)
-/// pending its own confirmation pass.
+/// Both values below were subsequently confirmed by live, on-device visual calibration (moving the
+/// KVM cursor to a recognizable on-screen target and iterating): Y needed a -123px / 3088 correction,
+/// superseding the -3.8140px statistically-fit value from KVM_CALIBRATION_MODEL_ANALYSIS.md (same
+/// sign and rough scale, different magnitude); X needed no correction (confirmed at 0), which also
+/// differs from the -3.5335px offline fit.
 ///
 /// KNOWN LIMITATION: this value was derived/tuned at one specific Mac window size. Because the
 /// correction is applied in already-normalized space (after VideoContentGeometry's contentRect
