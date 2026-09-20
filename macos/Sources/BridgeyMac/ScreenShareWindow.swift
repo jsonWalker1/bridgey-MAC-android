@@ -1,6 +1,14 @@
 import AppKit
 import AVFoundation
+import Combine
 import SwiftUI
+
+/// Plain reference-type holder for the KvmMouseCaptureView instance SwiftUI creates - see
+/// ScreenShareWindowController.captureViewBox for why this indirection exists.
+@MainActor
+private final class CaptureViewBox {
+    weak var view: KvmMouseCaptureView?
+}
 
 @MainActor
 final class ScreenShareWindowController: NSWindowController, NSWindowDelegate {
@@ -18,16 +26,114 @@ final class ScreenShareWindowController: NSWindowController, NSWindowDelegate {
         onPointerEvent: @escaping (PointerAction, Float, Float) -> Void
     ) {
         self.onUserClosedWindow = onUserClosedWindow
-        let root = ScreenShareView(decoder: decoder, onPointerEvent: onPointerEvent)
+        let captureViewBox = CaptureViewBox()
+        self.captureViewBox = captureViewBox
+        let root = ScreenShareView(decoder: decoder, onPointerEvent: onPointerEvent) { view in
+            captureViewBox.view = view
+        }
         let window = NSWindow(contentViewController: NSHostingController(rootView: root))
         window.title = "Bridgey Screen Mirror"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.setContentSize(NSSize(width: 480, height: 900))
+        window.setContentSize(ScreenShareWindowController.windowSize(forLandscape: false))
         window.minSize = NSSize(width: 240, height: 420)
         window.isReleasedWhenClosed = false
+        window.collectionBehavior.insert(.fullScreenPrimary)
         window.center()
         super.init(window: window)
         window.delegate = self
+
+        // KVM pointer calibration is a single constant offset, correct only near the window size it
+        // was tuned at - the further a resize pushes the content rect away from that size, the more
+        // the effective correction drifts (this is a hard mathematical limit of any single-constant
+        // model, not a bug - see KvmPointerCalibration). The window defaults to a portrait shape
+        // (480x900) matched to a portrait phone video; showing landscape video in that shape forces
+        // extreme letterboxing (a ~2:1 video width-constrained into a narrow window), which makes
+        // ordinary resizes swing the content rect size - and therefore the calibration drift -
+        // dramatically more than the portrait case ever did. Switching to a landscape-shaped default
+        // as soon as the video's orientation is known keeps everyday resizes closer to the tuned
+        // reference size instead of starting from the worst-case mismatch. This does not fully solve
+        // resize sensitivity (no single constant can); see KVM_CALIBRATION_MODEL_ANALYSIS.md follow-up
+        // for a proper multi-size measurement pass if tighter behavior is needed later.
+        //
+        // ONLY while windowed, though (the `!window.styleMask.contains(.fullScreen)` guard): this is
+        // the actual root cause of the "fullscreen but video stays tiny" bug. `sourceSize` only becomes
+        // known once the first video frame decodes, which typically lands AFTER the fullscreen
+        // animation this window opens with (see show()) has already completed. Without the guard,
+        // setContentSize() here would fire on an already-fullscreen window and forcibly shrink its
+        // CONTENT VIEW down to the small windowed default size - the window frame stays fullscreen
+        // (hence the full black backdrop), but the actual content area - and the video inside it - gets
+        // pinned to 480x900/900x480 regardless. The exact same thing happened on every later portrait
+        // <-> landscape rotation while sharing, for the same reason (a fresh orientation value re-fires
+        // this sink). A manual resize-then-fullscreen "fixed" it only because that sequence doesn't run
+        // through this sink again (the orientation hasn't changed), so nothing re-shrinks the content.
+        sourceOrientationObservation = decoder.$sourceSize
+            .compactMap { sourceSize -> Bool? in
+                guard let sourceSize, sourceSize.width > 0, sourceSize.height > 0 else { return nil }
+                return sourceSize.width > sourceSize.height
+            }
+            .removeDuplicates()
+            .sink { [weak window] isLandscape in
+                guard let window, !window.styleMask.contains(.fullScreen) else { return }
+                window.setContentSize(ScreenShareWindowController.windowSize(forLandscape: isLandscape))
+                window.center()
+            }
+
+        // Video/KVM geometry lifecycle fix: KvmMouseCaptureView.layout() is the single source of truth
+        // for both the video layer's frame and pointer mapping (see its doc comment), and relies on
+        // AppKit invoking it whenever the view's own bounds change. That is NOT guaranteed to happen
+        // promptly for every relevant transition when the view is hosted via NSViewRepresentable inside
+        // NSHostingController - observed in practice: starting screen sharing already in fullscreen, or
+        // rotating the phone's orientation while sharing, could leave the video at its stale/initial
+        // size until an unrelated later resize happened to trigger a fresh layout pass. Rather than
+        // trust that implicit propagation, explicitly force a synchronous layout pass on the capture
+        // view for every OS-level event that can invalidate its geometry: window resize (including the
+        // live-resize case), and fullscreen enter/exit. `updateNSView` already covers sourceSize/
+        // orientation changes (a SwiftUI state update, not a raw AppKit resize) by setting needsLayout.
+        for name in [
+            NSWindow.didResizeNotification,
+            NSWindow.didEndLiveResizeNotification,
+            NSWindow.didEnterFullScreenNotification,
+            NSWindow.didExitFullScreenNotification,
+        ] {
+            let token = NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak window, captureViewBox] _ in
+                MainActor.assumeIsolated {
+                    // Force the layout pass from the TOP of the hierarchy (the window's content view,
+                    // i.e. the NSHostingController's own view), not just the leaf capture view: SwiftUI's
+                    // own internal relayout of its hosted content in response to the window's new frame
+                    // is a separate step from the window itself having already resized, and isn't
+                    // guaranteed to have already happened by the time this notification fires. Calling
+                    // layoutSubtreeIfNeeded() on the leaf view alone risks reading its `bounds` before
+                    // SwiftUI has actually resized it to match, silently reusing the previous value.
+                    // Starting from contentView forces SwiftUI to reconcile against the window's current,
+                    // already-final frame first, cascading down correctly into KvmMouseCaptureView.
+                    window?.contentView?.needsLayout = true
+                    window?.contentView?.layoutSubtreeIfNeeded()
+                    guard let captureView = captureViewBox.view else { return }
+                    captureView.needsLayout = true
+                    captureView.layoutSubtreeIfNeeded()
+                }
+            }
+            windowLifecycleObservers.append(token)
+        }
+    }
+
+    private var sourceOrientationObservation: AnyCancellable?
+    private var windowLifecycleObservers: [NSObjectProtocol] = []
+    /// Set once by DisplayLayerView.makeNSView (via the onCaptureViewCreated callback passed down
+    /// through ScreenShareView), so the window-lifecycle observers above can force a synchronous
+    /// relayout directly on the actual view that owns the video layer and pointer mapping geometry,
+    /// instead of hoping a generic "needsLayout" on some ancestor cascades down to it. A plain
+    /// reference-type box (rather than a `weak var` property on self) because it must be captured by
+    /// the `root` view's callback closure before `super.init()` makes `self` available.
+    private let captureViewBox: CaptureViewBox
+    /// This app is a MenuBarExtra scene (see BridgeyApp.swift), not a WindowGroup - so it never gets
+    /// AppKit's usual auto-generated "View > Enter Full Screen" menu item, and with it the standard
+    /// system Control+Command+F shortcut. That binding simply does not exist anywhere in this app by
+    /// default; it has to be installed by hand for this specific window.
+    private var fullScreenKeyMonitor: Any?
+
+    private static func windowSize(forLandscape isLandscape: Bool) -> NSSize {
+        isLandscape ? NSSize(width: 900, height: 480) : NSSize(width: 480, height: 900)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -36,9 +142,37 @@ final class ScreenShareWindowController: NSWindowController, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
+        // Dispatched, not called inline: calling toggleFullScreen() synchronously in the same run-loop
+        // pass as makeKeyAndOrderFront() - before AppKit has actually finished presenting the window -
+        // could enter fullscreen without the video layer's layout() pass ever running against the
+        // final fullscreen bounds, leaving the phone's picture stuck at its pre-fullscreen size even
+        // though the window itself is genuinely fullscreen.
+        DispatchQueue.main.async { [weak self] in
+            guard let window = self?.window, !window.styleMask.contains(.fullScreen) else { return }
+            window.toggleFullScreen(nil)
+        }
+        installFullScreenKeyMonitorIfNeeded()
+    }
+
+    private func installFullScreenKeyMonitorIfNeeded() {
+        guard fullScreenKeyMonitor == nil else { return }
+        fullScreenKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, let window = self.window, event.window === window else { return event }
+            let isFullScreenShortcut = event.charactersIgnoringModifiers?.lowercased() == "f"
+                && event.modifierFlags.intersection(.deviceIndependentFlagsMask) == [.control, .command]
+            guard isFullScreenShortcut else { return event }
+            window.toggleFullScreen(nil)
+            return nil
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
+        if let fullScreenKeyMonitor {
+            NSEvent.removeMonitor(fullScreenKeyMonitor)
+        }
+        fullScreenKeyMonitor = nil
+        windowLifecycleObservers.forEach(NotificationCenter.default.removeObserver)
+        windowLifecycleObservers.removeAll()
         onUserClosedWindow()
     }
 }
@@ -46,6 +180,7 @@ final class ScreenShareWindowController: NSWindowController, NSWindowDelegate {
 private struct ScreenShareView: View {
     @ObservedObject var decoder: ScreenStreamDecoder
     let onPointerEvent: (PointerAction, Float, Float) -> Void
+    let onCaptureViewCreated: (KvmMouseCaptureView) -> Void
 
     var body: some View {
         ZStack {
@@ -54,7 +189,8 @@ private struct ScreenShareView: View {
                 layer: decoder.displayLayer,
                 presentationMode: decoder.presentationMode,
                 sourceSize: decoder.sourceSize,
-                onPointerEvent: onPointerEvent
+                onPointerEvent: onPointerEvent,
+                onCaptureViewCreated: onCaptureViewCreated
             )
             if !decoder.isReceivingVideo {
                 VStack(spacing: 10) {
@@ -95,6 +231,7 @@ private struct DisplayLayerView: NSViewRepresentable {
     let presentationMode: VideoPresentationMode
     let sourceSize: CGSize?
     let onPointerEvent: (PointerAction, Float, Float) -> Void
+    let onCaptureViewCreated: (KvmMouseCaptureView) -> Void
 
     func makeNSView(context: Context) -> KvmMouseCaptureView {
         let view = KvmMouseCaptureView()
@@ -111,6 +248,7 @@ private struct DisplayLayerView: NSViewRepresentable {
         view.presentationMode = presentationMode
         view.onPointerEvent = onPointerEvent
         view.needsLayout = true
+        onCaptureViewCreated(view)
         return view
     }
 
@@ -182,7 +320,7 @@ final class KvmMouseCaptureView: NSView {
 
     private func report(_ action: PointerAction, _ event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        let calibrated = KvmPointerCalibration.apply(point)
+        let calibrated = KvmPointerCalibration.apply(point, sourceSize: sourceSize)
         guard let normalized = VideoContentGeometry.normalizedPoint(calibrated, sourceSize: sourceSize, mode: presentationMode, in: bounds) else {
             return
         }
