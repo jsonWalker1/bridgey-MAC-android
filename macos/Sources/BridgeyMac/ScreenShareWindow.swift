@@ -124,7 +124,8 @@ private struct DisplayLayerView: NSViewRepresentable {
 
 /// KVM Mouse Input v1 - the real, production mouse-capture surface (not a debug/test view). Captures
 /// left-button down/drag/up and plain movement only, mapping each point through
-/// VideoContentGeometry.normalizedPoint (the existing, already-tested inverse of contentRect) before
+/// VideoContentGeometry.normalizedPoint (the existing, already-tested inverse of contentRect), then
+/// KvmPointerCalibration.apply (the empirical offset from KVM_CALIBRATION_MODEL_ANALYSIS.md) before
 /// handing it to `onPointerEvent`, which the caller wires straight into the existing, frozen
 /// videoChannel.offerInput/sendInputEvent - the exact same "input" channel/InputEvent.pointer wire
 /// format already proven end to end by the KVM Input Foundation checkpoint (commit 1facc3d).
@@ -163,6 +164,7 @@ final class KvmMouseCaptureView: NSView {
         guard let normalized = VideoContentGeometry.normalizedPoint(point, sourceSize: sourceSize, mode: presentationMode, in: bounds) else {
             return
         }
-        onPointerEvent?(action, Float(normalized.x), Float(normalized.y))
+        let calibrated = KvmPointerCalibration.apply(normalized)
+        onPointerEvent?(action, Float(calibrated.x), Float(calibrated.y))
     }
 }
