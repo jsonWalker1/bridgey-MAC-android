@@ -103,32 +103,44 @@ private struct DisplayLayerView: NSViewRepresentable {
         // Deliberately NO autoresizingMask: `.layerWidthSizable`/`.layerHeightSizable` would tell
         // Core Animation to continuously keep this sublayer's size matching the FULL superlayer
         // bounds on every layout pass - which fights and overrides the explicit, smaller, centered
-        // `contentRect` frame this code assigns below/in updateNSView. SwiftUI's own layout cycle
-        // calls updateNSView on every relevant resize, which is what keeps the frame correct instead.
+        // `contentRect` frame this view's own layout() override assigns instead.
         layer.videoGravity = .resize
-        layer.frame = VideoContentGeometry.contentRect(sourceSize: sourceSize, mode: presentationMode, in: view.bounds)
+        view.videoLayer = layer
         view.layer?.addSublayer(layer)
         view.sourceSize = sourceSize
         view.presentationMode = presentationMode
         view.onPointerEvent = onPointerEvent
+        view.needsLayout = true
         return view
     }
 
     func updateNSView(_ nsView: KvmMouseCaptureView, context: Context) {
-        layer.frame = VideoContentGeometry.contentRect(sourceSize: sourceSize, mode: presentationMode, in: nsView.bounds)
+        // Repositioning the layer here (driven by SwiftUI's updateNSView cadence) used to be able to
+        // lag behind an AppKit-driven resize - most visibly entering/leaving fullscreen, where the
+        // window's animated resize is not guaranteed to invoke updateNSView promptly for every frame.
+        // That produced two symptoms from one cause: the video visibly failing to recenter right
+        // away, AND KVM pointer mapping (which reads this view's own `bounds` - always fresh, since
+        // AppKit updates it directly) landing on the wrong on-screen spot relative to where the video
+        // was still actually drawn. Recomputing the layer frame in `layout()` instead ties both the
+        // video's position and the pointer mapping to the exact same live `bounds` at the exact same
+        // AppKit layout pass, so they can't diverge by construction - the "one geometry calculation"
+        // principle this file already documents, now enforced for resize/fullscreen too.
         nsView.sourceSize = sourceSize
         nsView.presentationMode = presentationMode
         nsView.onPointerEvent = onPointerEvent
+        nsView.needsLayout = true
     }
 }
 
 /// KVM Mouse Input v1 - the real, production mouse-capture surface (not a debug/test view). Captures
-/// left-button down/drag/up and plain movement only, mapping each point through
-/// VideoContentGeometry.normalizedPoint (the existing, already-tested inverse of contentRect), then
-/// KvmPointerCalibration.apply (the empirical offset from KVM_CALIBRATION_MODEL_ANALYSIS.md) before
-/// handing it to `onPointerEvent`, which the caller wires straight into the existing, frozen
-/// videoChannel.offerInput/sendInputEvent - the exact same "input" channel/InputEvent.pointer wire
-/// format already proven end to end by the KVM Input Foundation checkpoint (commit 1facc3d).
+/// left-button down/drag/up and plain movement only, first nudging the raw captured point through
+/// KvmPointerCalibration.apply (the live-verified offset - deliberately applied before normalization
+/// so it scales correctly with the current contentRect if the window is resized, see that type's
+/// doc comment), then mapping it through VideoContentGeometry.normalizedPoint (the existing,
+/// already-tested inverse of contentRect) before handing it to `onPointerEvent`, which the caller
+/// wires straight into the existing, frozen videoChannel.offerInput/sendInputEvent - the exact same
+/// "input" channel/InputEvent.pointer wire format already proven end to end by the KVM Input
+/// Foundation checkpoint (commit 1facc3d).
 ///
 /// Right button, middle button, and scroll are deliberately NOT captured here: the frozen
 /// InputEvent.Pointer wire format has no field for button identity or scroll delta, and
@@ -139,6 +151,10 @@ final class KvmMouseCaptureView: NSView {
     var sourceSize: CGSize?
     var presentationMode: VideoPresentationMode = .fit
     var onPointerEvent: ((PointerAction, Float, Float) -> Void)?
+    /// Set once in makeNSView. Repositioned in `layout()`, not in SwiftUI's `updateNSView`, so the
+    /// video's on-screen position and this view's own `bounds` (what pointer mapping reads) can never
+    /// diverge during a resize/fullscreen transition - see DisplayLayerView's doc comment.
+    var videoLayer: AVSampleBufferDisplayLayer?
 
     /// Top-left-origin, matching the same axis convention InputEvent.pointer's (x, y) already use
     /// elsewhere in Bridgey (0,0 = top-left) - avoids a manual Y-flip in the geometry math.
@@ -154,6 +170,11 @@ final class KvmMouseCaptureView: NSView {
         trackingArea = area
     }
 
+    override func layout() {
+        super.layout()
+        videoLayer?.frame = VideoContentGeometry.contentRect(sourceSize: sourceSize, mode: presentationMode, in: bounds)
+    }
+
     override func mouseDown(with event: NSEvent) { report(.down, event) }
     override func mouseDragged(with event: NSEvent) { report(.move, event) }
     override func mouseUp(with event: NSEvent) { report(.up, event) }
@@ -161,10 +182,10 @@ final class KvmMouseCaptureView: NSView {
 
     private func report(_ action: PointerAction, _ event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        guard let normalized = VideoContentGeometry.normalizedPoint(point, sourceSize: sourceSize, mode: presentationMode, in: bounds) else {
+        let calibrated = KvmPointerCalibration.apply(point)
+        guard let normalized = VideoContentGeometry.normalizedPoint(calibrated, sourceSize: sourceSize, mode: presentationMode, in: bounds) else {
             return
         }
-        let calibrated = KvmPointerCalibration.apply(normalized)
-        onPointerEvent?(action, Float(calibrated.x), Float(calibrated.y))
+        onPointerEvent?(action, Float(normalized.x), Float(normalized.y))
     }
 }

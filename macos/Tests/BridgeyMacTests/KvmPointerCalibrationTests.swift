@@ -2,31 +2,57 @@ import XCTest
 @testable import BridgeyMac
 
 final class KvmPointerCalibrationTests: XCTestCase {
-    func testAppliesTheFittedTranslationOffset() {
-        let result = KvmPointerCalibration.apply(CGPoint(x: 0.5, y: 0.5))
-        XCTAssertEqual(Double(result.x), 0.5 + Double(KvmPointerCalibration.offsetX), accuracy: 0.0000001)
-        XCTAssertEqual(Double(result.y), 0.5 + Double(KvmPointerCalibration.offsetY), accuracy: 0.0000001)
+    func testAppliesTheFittedWindowPointOffset() {
+        let result = KvmPointerCalibration.apply(CGPoint(x: 240, y: 450))
+        XCTAssertEqual(Double(result.x), 240 + Double(KvmPointerCalibration.offsetXPt), accuracy: 0.0000001)
+        XCTAssertEqual(Double(result.y), 450 + Double(KvmPointerCalibration.offsetYPt), accuracy: 0.0000001)
     }
 
-    func testClampsAtTheLowEdgeRatherThanGoingNegative() {
-        let result = KvmPointerCalibration.apply(CGPoint(x: 0, y: 0))
-        XCTAssertGreaterThanOrEqual(result.x, 0)
-        XCTAssertGreaterThanOrEqual(result.y, 0)
+    func testOffsetMagnitudeIsASmallPointNudgeNotAGrossCorrection() {
+        // Guards against a future edit accidentally turning this into a large offset: the live-tuned
+        // correction is tens of points, not hundreds, out of a KVM capture view that's typically a
+        // few hundred points wide/tall.
+        XCTAssertLessThan(abs(KvmPointerCalibration.offsetXPt), 50)
+        XCTAssertLessThan(abs(KvmPointerCalibration.offsetYPt), 50)
     }
 
-    func testClampsAtTheHighEdgeRatherThanExceedingOne() {
-        // offsetX/offsetY are both negative in the fitted model, so the high edge can't actually be
-        // exceeded today - this guards the invariant regardless, in case the fitted sign ever changes.
-        let result = KvmPointerCalibration.apply(CGPoint(x: 1, y: 1))
-        XCTAssertLessThanOrEqual(result.x, 1)
-        XCTAssertLessThanOrEqual(result.y, 1)
-    }
+    func testCorrectionScalesWithContentRectInsteadOfBeingFrozenToOneWindowSize() {
+        // This is the regression test for the resize bug: applying the SAME window-point offset
+        // before normalization must produce a DIFFERENT normalized delta at a different content
+        // width, because the physical few-point nudge is now a different fraction of the content.
+        // (A post-normalization fixed-fraction offset, the old design, would fail this by construction
+        // - the normalized delta would be identical regardless of content size.)
+        let smallBounds = CGRect(x: 0, y: 0, width: 480, height: 900)
+        let largeBounds = CGRect(x: 0, y: 0, width: 960, height: 1800)
+        let sourceSize = CGSize(width: 720, height: 1544)
 
-    func testOffsetMagnitudeIsASmallSubPixelFractionNotAGrossCorrection() {
-        // Guards against a future edit accidentally turning this into a large offset: even the
-        // larger, live-visually-tuned Y correction (-123px / 3088 ~= 0.0398) is still well under 5%
-        // of the coordinate space - a few tens of pixels out of a ~1440x3088 display, not hundreds.
-        XCTAssertLessThan(abs(KvmPointerCalibration.offsetX), 0.05)
-        XCTAssertLessThan(abs(KvmPointerCalibration.offsetY), 0.05)
+        let rawPoint = CGPoint(x: 240, y: 450)
+        let calibratedPoint = KvmPointerCalibration.apply(rawPoint)
+
+        let smallNormalized = try? XCTUnwrap(VideoContentGeometry.normalizedPoint(
+            calibratedPoint, sourceSize: sourceSize, mode: .fit, in: smallBounds
+        ))
+        let largeNormalized = try? XCTUnwrap(VideoContentGeometry.normalizedPoint(
+            calibratedPoint, sourceSize: sourceSize, mode: .fit, in: largeBounds
+        ))
+        let smallBaseline = try? XCTUnwrap(VideoContentGeometry.normalizedPoint(
+            rawPoint, sourceSize: sourceSize, mode: .fit, in: smallBounds
+        ))
+        let largeBaseline = try? XCTUnwrap(VideoContentGeometry.normalizedPoint(
+            rawPoint, sourceSize: sourceSize, mode: .fit, in: largeBounds
+        ))
+
+        guard let smallNormalized, let largeNormalized, let smallBaseline, let largeBaseline else {
+            XCTFail("expected all four points to fall inside their content rects")
+            return
+        }
+
+        let smallDelta = Double(smallNormalized.y - smallBaseline.y)
+        let largeDelta = Double(largeNormalized.y - largeBaseline.y)
+
+        XCTAssertNotEqual(smallDelta, largeDelta, accuracy: 0.0000001)
+        // The larger window has double the content height, so the same physical point offset should
+        // produce roughly half the normalized delta.
+        XCTAssertEqual(smallDelta / largeDelta, 2.0, accuracy: 0.05)
     }
 }
