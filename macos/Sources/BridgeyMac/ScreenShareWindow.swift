@@ -10,20 +10,25 @@ private final class CaptureViewBox {
     weak var view: KvmMouseCaptureView?
 }
 
+/// KVM Mouse V2, phase 1/2 (see KVM_MOUSE_V2_PHASE1.md): `button` only has meaning for
+/// down/up/move; `scrollDx`/`scrollDy` only have meaning for `.scroll` (mirrors
+/// InputEvent.pointer's own shape in InputTransport.swift, which this is wired directly into).
+typealias PointerEventHandler = (PointerAction, Float, Float, PointerButton, Float, Float) -> Void
+
 @MainActor
 final class ScreenShareWindowController: NSWindowController, NSWindowDelegate {
     /// Advanced Screen Continuity - Remote Start: the user closing this window is treated as an
     /// explicit "Stop Screen Share" request, mirrored to the phone as screenshare.remoteStop.
     private let onUserClosedWindow: () -> Void
 
-    /// KVM Mouse Input v1: `onPointerEvent` receives (action, normalizedX, normalizedY) already mapped
-    /// through VideoContentGeometry - see DisplayLayerView/KvmMouseCaptureView below. Only .down/.up/
-    /// .move are ever produced here (left button + movement/drag) - this is the real production input
-    /// path, wired from Pairing.showScreenShareWindow() into the existing frozen "input" channel.
+    /// KVM Mouse: `onPointerEvent` receives (action, normalizedX, normalizedY, button, scrollDx,
+    /// scrollDy) already mapped through VideoContentGeometry - see DisplayLayerView/
+    /// KvmMouseCaptureView below - wired from Pairing.showScreenShareWindow() into the existing
+    /// "input" channel (InputTransport.swift/InputEvent.pointer).
     init(
         decoder: ScreenStreamDecoder,
         onUserClosedWindow: @escaping () -> Void,
-        onPointerEvent: @escaping (PointerAction, Float, Float) -> Void
+        onPointerEvent: @escaping PointerEventHandler
     ) {
         self.onUserClosedWindow = onUserClosedWindow
         let captureViewBox = CaptureViewBox()
@@ -179,7 +184,7 @@ final class ScreenShareWindowController: NSWindowController, NSWindowDelegate {
 
 private struct ScreenShareView: View {
     @ObservedObject var decoder: ScreenStreamDecoder
-    let onPointerEvent: (PointerAction, Float, Float) -> Void
+    let onPointerEvent: PointerEventHandler
     let onCaptureViewCreated: (KvmMouseCaptureView) -> Void
 
     var body: some View {
@@ -230,7 +235,7 @@ private struct DisplayLayerView: NSViewRepresentable {
     let layer: AVSampleBufferDisplayLayer
     let presentationMode: VideoPresentationMode
     let sourceSize: CGSize?
-    let onPointerEvent: (PointerAction, Float, Float) -> Void
+    let onPointerEvent: PointerEventHandler
     let onCaptureViewCreated: (KvmMouseCaptureView) -> Void
 
     func makeNSView(context: Context) -> KvmMouseCaptureView {
@@ -270,25 +275,22 @@ private struct DisplayLayerView: NSViewRepresentable {
     }
 }
 
-/// KVM Mouse Input v1 - the real, production mouse-capture surface (not a debug/test view). Captures
-/// left-button down/drag/up and plain movement only, first nudging the raw captured point through
-/// KvmPointerCalibration.apply (the live-verified offset - deliberately applied before normalization
-/// so it scales correctly with the current contentRect if the window is resized, see that type's
-/// doc comment), then mapping it through VideoContentGeometry.normalizedPoint (the existing,
-/// already-tested inverse of contentRect) before handing it to `onPointerEvent`, which the caller
-/// wires straight into the existing, frozen videoChannel.offerInput/sendInputEvent - the exact same
-/// "input" channel/InputEvent.pointer wire format already proven end to end by the KVM Input
-/// Foundation checkpoint (commit 1facc3d).
+/// KVM Mouse - the real, production mouse-capture surface (not a debug/test view). First nudges the
+/// raw captured point through KvmPointerCalibration.apply (the live-verified offset - deliberately
+/// applied before normalization so it scales correctly with the current contentRect if the window is
+/// resized, see that type's doc comment), then maps it through VideoContentGeometry.normalizedPoint
+/// (the existing, already-tested inverse of contentRect) before handing it to `onPointerEvent`, which
+/// the caller wires into the "input" channel (InputTransport.swift/InputEvent.pointer).
 ///
-/// Right button, middle button, and scroll are deliberately NOT captured here: the frozen
-/// InputEvent.Pointer wire format has no field for button identity or scroll delta, and
-/// BridgeyAccessibilityService's dispatchGesture has no native concept of a mouse button or a scroll
-/// wheel at all (touchscreens don't have either) - supporting them would require extending the frozen
-/// foundation, out of scope for this task pending explicit approval (see the KVM Mouse Input v1 report).
+/// KVM Mouse V2 (see KVM_MOUSE_V2_PHASE1.md): captures right/middle button and scroll wheel, in
+/// addition to Mouse v1's left button and movement. AppKit only calls mouseDown/mouseDragged/mouseUp
+/// for the left/primary button - right and "other" (middle, and any further buttons) buttons have
+/// their own dedicated override points, which is why these are separate methods rather than a single
+/// handler branching on `event.buttonNumber`.
 final class KvmMouseCaptureView: NSView {
     var sourceSize: CGSize?
     var presentationMode: VideoPresentationMode = .fit
-    var onPointerEvent: ((PointerAction, Float, Float) -> Void)?
+    var onPointerEvent: PointerEventHandler?
     /// Set once in makeNSView. Repositioned in `layout()`, not in SwiftUI's `updateNSView`, so the
     /// video's on-screen position and this view's own `bounds` (what pointer mapping reads) can never
     /// diverge during a resize/fullscreen transition - see DisplayLayerView's doc comment.
@@ -318,12 +320,61 @@ final class KvmMouseCaptureView: NSView {
     override func mouseUp(with event: NSEvent) { report(.up, event) }
     override func mouseMoved(with event: NSEvent) { report(.move, event) }
 
-    private func report(_ action: PointerAction, _ event: NSEvent) {
+    /// KVM Mouse V2: right button -> PointerButton.right. RIGHT CLICK -> LONG PRESS / CONTEXT
+    /// GESTURE is an experimental Android-side interpretation (see BridgeyAccessibilityService) -
+    /// AccessibilityService's dispatchGesture has no real mouse-button semantic, only touch. This
+    /// side only captures and transports the fact that the RIGHT button was pressed/dragged/released;
+    /// what Android does with that identity is a separate, explicitly-labeled decision.
+    override func rightMouseDown(with event: NSEvent) { report(.down, event, button: .right) }
+    override func rightMouseDragged(with event: NSEvent) { report(.move, event, button: .right) }
+    override func rightMouseUp(with event: NSEvent) { report(.up, event, button: .right) }
+
+    /// KVM Mouse V2: middle button only (buttonNumber == 2) - AppKit's otherMouseDown/Dragged/Up fire
+    /// for every button beyond left/right (2, 3, 4, ...), and only button 2 is the conventional
+    /// "middle" button this phase models. Transport/model support only: Android has no scheduled
+    /// behavior for this yet (see KvmInputInjector - logs and no-ops, exactly like SCROLL previously
+    /// did in Mouse v1).
+    override func otherMouseDown(with event: NSEvent) {
+        guard event.buttonNumber == 2 else { return }
+        report(.down, event, button: .middle)
+    }
+    override func otherMouseDragged(with event: NSEvent) {
+        guard event.buttonNumber == 2 else { return }
+        report(.move, event, button: .middle)
+    }
+    override func otherMouseUp(with event: NSEvent) {
+        guard event.buttonNumber == 2 else { return }
+        report(.up, event, button: .middle)
+    }
+
+    /// KVM Mouse V2 scroll data path (KVM_MOUSE_V2_PHASE1.md phase 4 - transport only, no Android
+    /// scroll synthesis yet). Uses `scrollingDeltaX`/`scrollingDeltaY` (the modern, precise-scroll
+    /// API), not the legacy line-based `deltaX`/`deltaY` - and passes them through with NO sign
+    /// flip. Per Apple's own documented contract for `isDirectionInvertedFromDevice` (AppKit/NSEvent):
+    /// "the user may choose to change the scrolling behavior such that it feels like they are moving
+    /// the content instead of the scroll bar. To accomplish this, deltaX/Y and scrollingDeltaX/Y are
+    /// automatically inverted for [scroll wheel] events according to the user's preferences." AppKit
+    /// has therefore already applied the user's natural-vs-traditional scrolling preference to this
+    /// value before this method ever sees it - re-flipping it here would silently fight that system
+    /// preference. Not applied: the "when hasPreciseScrollingDeltas is NO, multiply by line/row
+    /// height" normalization Apple also documents for scrollingDeltaX/Y - deliberately deferred, see
+    /// the phase 4 report (the correct multiplier depends on how Android ultimately consumes the
+    /// delta, which is explicitly not decided yet).
+    override func scrollWheel(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         let calibrated = KvmPointerCalibration.apply(point, sourceSize: sourceSize)
         guard let normalized = VideoContentGeometry.normalizedPoint(calibrated, sourceSize: sourceSize, mode: presentationMode, in: bounds) else {
             return
         }
-        onPointerEvent?(action, Float(normalized.x), Float(normalized.y))
+        onPointerEvent?(.scroll, Float(normalized.x), Float(normalized.y), .left, Float(event.scrollingDeltaX), Float(event.scrollingDeltaY))
+    }
+
+    private func report(_ action: PointerAction, _ event: NSEvent, button: PointerButton = .left) {
+        let point = convert(event.locationInWindow, from: nil)
+        let calibrated = KvmPointerCalibration.apply(point, sourceSize: sourceSize)
+        guard let normalized = VideoContentGeometry.normalizedPoint(calibrated, sourceSize: sourceSize, mode: presentationMode, in: bounds) else {
+            return
+        }
+        onPointerEvent?(action, Float(normalized.x), Float(normalized.y), button, 0, 0)
     }
 }

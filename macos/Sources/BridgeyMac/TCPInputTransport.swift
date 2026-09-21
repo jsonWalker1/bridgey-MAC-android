@@ -102,7 +102,12 @@ final class TCPInputTransport: InputTransport {
         let bytes = VideoFrameFraming.encodeFrame(type: type, streamId: 0, sequence: sendSequence, captureTimestampMs: Int64(Date().timeIntervalSince1970 * 1000), nonce: nonce, ciphertext: ciphertext)
         if bytes.count > capabilities.maxFrameBytes { return .failed("frame exceeds maxFrameBytes") }
         let coalescible: Bool
-        if case .pointer(let action, _, _) = event, action == .move { coalescible = true } else { coalescible = false }
+        // KVM Mouse V2 phase 1 exception (explicitly approved, mechanical only - see
+        // KVM_MOUSE_V2_PHASE1.md): purely syntactic - InputEvent.pointer gained 3 more associated
+        // values (button, scrollDx, scrollDy) in InputTransport.swift, so this exhaustive pattern
+        // needs matching wildcards for them. Runtime behavior is byte-for-byte identical: MOVE is
+        // still the only coalescible action, DOWN/UP/KEY/TEXT are still never coalescible.
+        if case .pointer(let action, _, _, _, _, _) = event, action == .move { coalescible = true } else { coalescible = false }
 
         queueCondition.lock()
         var queueSize = sendQueue.count

@@ -1165,12 +1165,21 @@ final class PairingCoordinator: ObservableObject {
                     // channel it was feeding has no reason to stay open either.
                     self?.videoChannel.stopInput()
                 },
-                onPointerEvent: { [weak self] action, x, y in
+                onPointerEvent: { [weak self] action, x, y, button, scrollDx, scrollDy in
                     guard let self else { return }
                     // offerInput() is a no-op once the channel is already offered/connecting/active
                     // (frozen VideoChannelController guard) - safe to call on every event.
                     videoChannel.offerInput(direction: "mac_to_android")
-                    _ = videoChannel.sendInputEvent(.pointer(action: action, x: x, y: y))
+                    let outcome = videoChannel.sendInputEvent(.pointer(action: action, x: x, y: y, button: button, scrollDx: scrollDx, scrollDy: scrollDy))
+                    // TEMPORARY KVM MOUSE V2 RUNTIME VERIFICATION LOGGING - DO NOT COMMIT.
+                    // Only non-left-button and scroll events, to avoid flooding the log during plain
+                    // left-click/movement use - this is specifically to prove the button/scroll event
+                    // was generated with the right values and actually handed to the transport (not
+                    // silently dropped), for KVM_MOUSE_V2_PHASE1 runtime verification.
+                    if button != .left || action == .scroll {
+                        NSLog("[BRIDGEY-MOUSEV2-CAL] send action=%@ button=%@ pos=(%.4f,%.4f) scroll=(%.4f,%.4f) outcome=%@",
+                              String(describing: action), String(describing: button), x, y, scrollDx, scrollDy, String(describing: outcome))
+                    }
                 }
             )
         }
