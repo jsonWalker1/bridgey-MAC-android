@@ -26,7 +26,9 @@ internal object InputFrameType {
     const val KEY = 17
     const val TEXT = 18
     // 19 = CONTROLLER, reserved, unused in M1.
-    val ALL = setOf(POINTER, KEY, TEXT)
+    /** BRIDGEY KVM TOUCHPAD GESTURES V1. */
+    const val GESTURE = 20
+    val ALL = setOf(POINTER, KEY, TEXT, GESTURE)
 }
 
 internal data class FrameHeader(

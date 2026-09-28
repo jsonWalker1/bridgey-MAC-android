@@ -36,6 +36,10 @@ struct RemoteCallStatus: Equatable {
     let type: String
     let actions: [RemoteCallAction]
     let source: RemoteCallSource
+    // BRIDGEY CALL CONTINUITY: routes Android actually reports as available right now (never
+    // hardcoded - see CallsController.availableAudioRoutes on the Android side).
+    var availableAudioRoutes: [String] = []
+    var bluetoothRouteName: String? = nil
 }
 
 struct CallRequestPayload: Codable {
@@ -54,6 +58,14 @@ struct CallActionPayload: Codable {
     let version: Int
     let callId: String
     let action: String
+    let route: String?
+
+    init(version: Int, callId: String, action: String, route: String? = nil) {
+        self.version = version
+        self.callId = callId
+        self.action = action
+        self.route = route
+    }
 }
 
 struct CallActionAckPayload: Codable {
@@ -118,6 +130,15 @@ func isKnownRemoteCallState(_ value: String) -> Bool { knownRemoteCallStates.con
 
 func isKnownCallAction(_ value: String) -> Bool { knownCallActions.contains(value) }
 
+// BRIDGEY CALL CONTINUITY: audio route selection. `nil` (no route requested) is valid - existing
+// clients/sessions that never send a route keep today's default behavior unchanged.
+private let knownAudioRoutes: Set<String> = ["EARPIECE", "SPEAKER", "BLUETOOTH"]
+
+func isValidAudioRoute(_ route: String?) -> Bool {
+    guard let route else { return true }
+    return knownAudioRoutes.contains(route)
+}
+
 /// The overlay actions offered for a live (ringing/active) Telecom-sourced call. Titles match
 /// the notification-fallback path's systemCallActionTitles exactly, so orderedCallActions and
 /// the overlay's answer/decline color-coding need no Telecom-specific handling.
@@ -132,7 +153,7 @@ func telecomCallActions(for state: String) -> [RemoteCallAction] {
 // MARK: - Incoming-call presentation lifecycle (moved from Pairing.swift)
 
 extension PairingCoordinator {
-    func performRemoteCallAction(_ action: RemoteCallAction) {
+    func performRemoteCallAction(_ action: RemoteCallAction, route: String? = nil) {
         guard let call = remoteCall else { return }
         switch call.source {
         case .notification:
@@ -140,10 +161,11 @@ extension PairingCoordinator {
                 call.notificationID,
                 deviceID: call.deviceID,
                 actionToken: action.id,
-                replyText: nil
+                replyText: nil,
+                route: route
             )
         case .telecom:
-            sendCallControl(callID: call.notificationID, action: action.id, deviceID: call.deviceID)
+            sendCallControl(callID: call.notificationID, action: action.id, deviceID: call.deviceID, route: route)
         }
     }
 
@@ -173,7 +195,9 @@ extension PairingCoordinator {
             detail: remoteCallDetail(payload.text, type: callType),
             type: callType,
             actions: actions,
-            source: .notification
+            source: .notification,
+            availableAudioRoutes: callType == "incoming" ? (payload.availableAudioRoutes ?? []) : [],
+            bluetoothRouteName: payload.bluetoothRouteName
         )
         mediaController.callChanged(active: ["incoming", "ongoing"].contains(callType))
         if hiddenCallOverlayIdentity != identity {

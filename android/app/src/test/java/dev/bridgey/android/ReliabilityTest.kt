@@ -68,6 +68,38 @@ class ReliabilityTest {
         assertEquals(true, heartbeatExpired(true, lastReceivedAtMillis = 30_000, nowMillis = 60_000))
     }
 
+    @Test fun heartbeatSupportedSessionUsesTheShortTimeout() {
+        assertFalse(heartbeatExpired(true, lastReceivedAtMillis = 0, nowMillis = 29_999))
+        assertTrue(heartbeatExpired(true, lastReceivedAtMillis = 0, nowMillis = 30_000))
+    }
+
+    @Test fun heartbeatUnsupportedSessionFallsBackToALongerCeilingInsteadOfNeverExpiring() {
+        assertFalse(heartbeatExpired(false, lastReceivedAtMillis = 0, nowMillis = 89_999))
+        assertTrue(heartbeatExpired(false, lastReceivedAtMillis = 0, nowMillis = 90_000))
+    }
+
+    @Test fun heartbeatUnsupportedSessionDoesNotStayAliveIndefinitely() {
+        assertTrue(heartbeatExpired(false, lastReceivedAtMillis = 0, nowMillis = Long.MAX_VALUE))
+    }
+
+    @Test fun freshlyEstablishedSessionDoesNotExpireImmediatelyEitherWay() {
+        val now = 1_000_000L
+        assertFalse(heartbeatExpired(true, lastReceivedAtMillis = now, nowMillis = now))
+        assertFalse(heartbeatExpired(false, lastReceivedAtMillis = now, nowMillis = now))
+    }
+
+    @Test fun networkLossActsImmediatelyOnTheFirstEverCallback() {
+        assertTrue(shouldActOnNetworkLoss(lastHandledElapsedMs = 0, nowMillis = 500_000))
+    }
+
+    @Test fun networkLossIsSuppressedWithinTheDebounceWindow() {
+        assertFalse(shouldActOnNetworkLoss(lastHandledElapsedMs = 100_000, nowMillis = 102_999))
+    }
+
+    @Test fun networkLossActsAgainOnceTheDebounceWindowElapses() {
+        assertTrue(shouldActOnNetworkLoss(lastHandledElapsedMs = 100_000, nowMillis = 103_000))
+    }
+
     @Test fun interruptedTransfersBecomeRecoverableHistory() {
         val active = FileTransferState("a", "one", "Sending", true, 42, 2, true)
         val complete = FileTransferState("b", "two", "Saved", false, 100, 1, false)

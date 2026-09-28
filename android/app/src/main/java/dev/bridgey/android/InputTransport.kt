@@ -7,6 +7,27 @@ package dev.bridgey.android
 internal enum class PointerAction { DOWN, UP, MOVE, SCROLL }
 internal enum class KeyAction { DOWN, UP }
 
+/** BRIDGEY KVM KEYBOARD V1 (protocol extension - see InputEventCodec's doc comment for the wire byte
+ * this occupies). Bitmask, not an enum: a real key event can carry any combination simultaneously
+ * (e.g. Ctrl+Shift+Z). Declaration must match Swift's KeyModifier enum exactly (same bit positions are
+ * the wire value), mirroring how GestureAction's ordinals are a frozen cross-platform contract
+ * elsewhere in this file. */
+internal object KeyModifier {
+    const val SHIFT: Int = 1 shl 0
+    const val CONTROL: Int = 1 shl 1
+    const val ALT: Int = 1 shl 2
+    const val META: Int = 1 shl 3
+}
+
+/** BRIDGEY KVM TOUCHPAD GESTURES V1: a fully resolved semantic action - never coordinates, velocity,
+ * duration, or raw touch points. [FORWARD] deliberately has no Android-side action (there is no
+ * system-wide "forward" concept in AccessibilityService's GLOBAL_ACTION_* API, confirmed against the
+ * actual android.jar - not guessed) - [BridgeyAccessibilityService.handleGesture] logs/reports it as
+ * unsupported rather than silently ignoring it. Declaration order must match Swift's GestureAction
+ * rawValue order exactly (BACK=0, FORWARD=1, HOME=2, NOTIFICATIONS=3, RECENTS=4) - ordinal is the wire
+ * value, mirroring how PointerAction/PointerButton/KeyAction already do it above. */
+internal enum class GestureAction { BACK, FORWARD, HOME, NOTIFICATIONS, RECENTS }
+
 /** KVM Mouse V2, phase 1 (protocol extension only). No mouse-button semantic existed anywhere in
  * Mouse v1 - dispatchGesture is touch-only, and left-click was the only button Mouse v1 ever
  * received, so there was nothing to distinguish it from. */
@@ -25,8 +46,13 @@ internal sealed class InputEvent {
         val scrollDx: Float = 0f,
         val scrollDy: Float = 0f
     ) : InputEvent()
-    data class Key(val keyCode: Int, val action: KeyAction) : InputEvent()
+    /** BRIDGEY KVM KEYBOARD V1: [modifiers] is a [KeyModifier] bitmask, defaulted so every pre-existing
+     * call site (and test) that only ever passed [keyCode]/[action] keeps compiling unchanged. */
+    data class Key(val keyCode: Int, val action: KeyAction, val modifiers: Int = 0) : InputEvent()
     data class Text(val text: String) : InputEvent()
+    /** BRIDGEY KVM TOUCHPAD GESTURES V1: a fully resolved semantic action only - see [GestureAction]'s
+     * own doc comment for why no coordinates/velocity/duration/raw touch data are carried. */
+    data class Gesture(val action: GestureAction) : InputEvent()
     // Controller (gaming, section 12) intentionally not modeled yet - not part of M1.
 }
 
@@ -34,8 +60,9 @@ internal sealed class InputEvent {
  * POINTER (down/up/move): [1B action][4B x Float32 BE][4B y Float32 BE][1B button]      -- 10 bytes
  * POINTER (scroll):       [1B action][4B x Float32 BE][4B y Float32 BE][4B scrollDx][4B scrollDy]
  *                                                                          Float32 BE   -- 17 bytes
- * KEY:     [4B keyCode BE][1B action]
+ * KEY:     [4B keyCode BE][1B action][1B modifiers]                                       -- 6 bytes
  * TEXT:    UTF-8 bytes directly
+ * GESTURE: [1B action]                                                                     -- 1 byte
  *
  * KVM Mouse V2 phase 1 backward compatibility: the original Mouse v1 payload was exactly 9 bytes
  * ([1B action][4B x][4B y], no button/scroll tail at all). [decode] below still accepts that legacy
@@ -45,7 +72,12 @@ internal sealed class InputEvent {
  * This is why no new frame type or version byte was needed: POINTER's own decode was already
  * tolerant of a payload longer than 9 bytes (`>=`, never `==`), so appending fields is
  * forward-compatible by construction, and reading them optionally, gated on payload length, is
- * backward-compatible with any peer still sending the plain 9-byte v1 shape. */
+ * backward-compatible with any peer still sending the plain 9-byte v1 shape.
+ *
+ * BRIDGEY KVM KEYBOARD V1 backward compatibility: the original KEY payload was exactly 5 bytes (no
+ * modifiers byte at all). [decode] still accepts that legacy 5-byte shape, defaulting modifiers to 0
+ * (no modifiers held) - exactly the same `>=` floor + optional-trailing-byte pattern as POINTER's
+ * button/scroll extension above. */
 internal object InputEventCodec {
     fun encode(event: InputEvent): Pair<Int, ByteArray> = when (event) {
         is InputEvent.Pointer -> {
@@ -63,12 +95,14 @@ internal object InputEventCodec {
             InputFrameType.POINTER to buffer.array()
         }
         is InputEvent.Key -> {
-            val buffer = java.nio.ByteBuffer.allocate(5).order(java.nio.ByteOrder.BIG_ENDIAN)
+            val buffer = java.nio.ByteBuffer.allocate(6).order(java.nio.ByteOrder.BIG_ENDIAN)
             buffer.putInt(event.keyCode)
             buffer.put(event.action.ordinal.toByte())
+            buffer.put(event.modifiers.toByte())
             InputFrameType.KEY to buffer.array()
         }
         is InputEvent.Text -> InputFrameType.TEXT to event.text.toByteArray(Charsets.UTF_8)
+        is InputEvent.Gesture -> InputFrameType.GESTURE to byteArrayOf(event.action.ordinal.toByte())
     }
 
     fun decode(type: Int, payload: ByteArray): InputEvent? = when (type) {
@@ -99,9 +133,15 @@ internal object InputEventCodec {
             val keyCode = buffer.int
             val actionOrdinal = buffer.get().toInt()
             val action = KeyAction.entries.getOrNull(actionOrdinal) ?: return null
-            InputEvent.Key(keyCode, action)
+            val modifiers = if (payload.size >= 6) buffer.get().toInt() and 0xFF else 0
+            InputEvent.Key(keyCode, action, modifiers)
         }
         InputFrameType.TEXT -> InputEvent.Text(String(payload, Charsets.UTF_8))
+        InputFrameType.GESTURE -> {
+            if (payload.isEmpty()) return null
+            val action = GestureAction.entries.getOrNull(payload[0].toInt()) ?: return null
+            InputEvent.Gesture(action)
+        }
         else -> null
     }
 }

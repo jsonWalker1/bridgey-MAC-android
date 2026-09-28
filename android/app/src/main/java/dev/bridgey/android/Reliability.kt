@@ -60,12 +60,41 @@ internal fun connectWithTimeout(host: String, port: Int, timeoutMillis: Int = CO
     return socket
 }
 
+/**
+ * A session with negotiated heartbeat support (the peer has proven it understands
+ * heartbeat.ping/pong at least once - see Session.heartbeatSupported) is declared dead after
+ * [timeoutMillis] of silence, a tight bound since a missed heartbeat is a fast, reliable signal.
+ * A session that has never negotiated heartbeat support instead gets the longer
+ * [fallbackTimeoutMillis]: without it, a peer that never completes heartbeat negotiation (older
+ * peer, or a connection that goes dark before the first heartbeat round-trip) would never expire
+ * at all, leaving PairingCoordinator.handle()'s existing-session guard rejecting every future
+ * reconnection attempt indefinitely. [lastReceivedAtMillis] defaults to session-creation time
+ * (see Session.lastReceivedAtMillis), so a freshly established session with zero elapsed time
+ * never expires under either branch.
+ */
 internal fun heartbeatExpired(
     supported: Boolean,
     lastReceivedAtMillis: Long,
     nowMillis: Long,
     timeoutMillis: Long = 30_000L,
-): Boolean = supported && nowMillis - lastReceivedAtMillis >= timeoutMillis
+    fallbackTimeoutMillis: Long = 90_000L,
+): Boolean {
+    val elapsedMillis = nowMillis - lastReceivedAtMillis
+    return elapsedMillis >= if (supported) timeoutMillis else fallbackTimeoutMillis
+}
+
+/**
+ * Whether a `ConnectivityManager.onLost` callback should actually act (close the current session
+ * early) or be suppressed as debounce noise. Mirrors `NsdDiscoveryService.restartNsd()`'s own
+ * network-callback debounce (same 3s window, same reasoning: transient callback churn shouldn't
+ * each trigger a real action). Kept as a pure function, like [heartbeatExpired] and
+ * [reconnectDelayMillis], so the decision is unit-testable without a real ConnectivityManager.
+ */
+internal fun shouldActOnNetworkLoss(
+    lastHandledElapsedMs: Long,
+    nowMillis: Long,
+    debounceMillis: Long = 3_000L,
+): Boolean = nowMillis - lastHandledElapsedMs >= debounceMillis
 
 internal fun recoverInterruptedTransfers(
     transfers: Map<String, FileTransferState>,

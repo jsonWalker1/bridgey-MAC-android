@@ -1,6 +1,7 @@
 package dev.bridgey.android
 
 import android.inputmethodservice.InputMethodService
+import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
 import android.view.View
@@ -61,9 +62,21 @@ class BridgeyInputMethodService : InputMethodService() {
         currentInputConnection?.commitText(text, 1)
     }
 
-    internal fun injectKey(keyCode: Int, action: KeyAction) {
+    /** BRIDGEY KVM KEYBOARD V1: [modifiers] is a [KeyModifier] bitmask. The bare 2-arg KeyEvent
+     * constructor (used pre-V1) carries no metaState at all, so Ctrl/Shift/Alt/Meta chords (Ctrl+C,
+     * Shift+arrow, ...) would arrive at the receiving app indistinguishable from the unmodified key.
+     * The richer constructor lets us set metaState explicitly instead. */
+    internal fun injectKey(keyCode: Int, action: KeyAction, modifiers: Int = 0) {
         val motionAction = if (action == KeyAction.DOWN) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP
-        currentInputConnection?.sendKeyEvent(KeyEvent(motionAction, keyCode))
+        var metaState = 0
+        if (modifiers and KeyModifier.SHIFT != 0) metaState = metaState or KeyEvent.META_SHIFT_ON or KeyEvent.META_SHIFT_LEFT_ON
+        if (modifiers and KeyModifier.CONTROL != 0) metaState = metaState or KeyEvent.META_CTRL_ON or KeyEvent.META_CTRL_LEFT_ON
+        if (modifiers and KeyModifier.ALT != 0) metaState = metaState or KeyEvent.META_ALT_ON or KeyEvent.META_ALT_LEFT_ON
+        if (modifiers and KeyModifier.META != 0) metaState = metaState or KeyEvent.META_META_ON or KeyEvent.META_META_LEFT_ON
+        val now = SystemClock.uptimeMillis()
+        currentInputConnection?.sendKeyEvent(
+            KeyEvent(now, now, motionAction, keyCode, 0, metaState),
+        )
     }
 
     companion object {

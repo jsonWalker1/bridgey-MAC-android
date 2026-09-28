@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Display
@@ -55,6 +56,43 @@ internal class ScreenCaptureManager(
     @Volatile private var reconfigureCompletedAtMs = 0L
     private var pipelineThread: Thread? = null
 
+    // BRIDGEY VIDEO REGRESSION WAKELOCK EXPERIMENT (2026-09-24): hypothesis, not yet confirmed - the
+    // phone's screen timing out/locking during an otherwise-idle Screen Share session destabilizes
+    // the pairing TCP connection (Wi-Fi power-save/Doze transitions tied to screen state, already
+    // observed independently this session with other triggers). SCREEN_DIM_WAKE_LOCK, not
+    // PARTIAL_WAKE_LOCK: PARTIAL only keeps the CPU running and explicitly still allows the screen to
+    // turn off and lock - exactly the device state this experiment needs to rule out, not permit.
+    // SCREEN_DIM_WAKE_LOCK is deprecated (API 17) in favor of Activity-level FLAG_KEEP_SCREEN_ON, but
+    // this capture session is owned by a bare Service (ScreenCaptureService) with no guaranteed
+    // foreground Activity/window to attach that flag to, so the deprecated PowerManager API remains
+    // the only mechanism that keeps the screen on (dimmed, not full brightness) from here. Scope is
+    // strictly this file: acquire/release only, no other Screen Share/KVM/video/reconnect behavior
+    // touched.
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    @Suppress("DEPRECATION")
+    private fun acquireWakeLockIfNeeded() {
+        if (wakeLock?.isHeld == true) return
+        val powerManager = context.getSystemService(PowerManager::class.java) ?: return
+        val lock = powerManager.newWakeLock(PowerManager.SCREEN_DIM_WAKE_LOCK, "Bridgey:ScreenShare")
+        lock.setReferenceCounted(false)
+        runCatching { lock.acquire() }
+            .onSuccess {
+                wakeLock = lock
+                Log.i(TAG, "WakeLock acquired")
+            }
+            .onFailure { Log.e(TAG, "WakeLock acquire failed: ${it.message}") }
+    }
+
+    private fun releaseWakeLockIfNeeded() {
+        val lock = wakeLock ?: return
+        wakeLock = null
+        if (lock.isHeld) {
+            runCatching { lock.release() }
+            Log.i(TAG, "WakeLock released")
+        }
+    }
+
     private fun orientationLabel(width: Int, height: Int) = if (width >= height) "landscape" else "portrait"
 
     private val displayManager by lazy { context.getSystemService(DisplayManager::class.java) }
@@ -95,8 +133,10 @@ internal class ScreenCaptureManager(
     /** Called once, right after MediaProjectionManager.createScreenCaptureIntent() was granted. */
     fun start(projectionManager: MediaProjectionManager, resultCode: Int, data: Intent, displayWidthPx: Int, displayHeightPx: Int, densityDpi: Int) {
         if (running) return
+        Log.i(TAG, "Screen Share started")
         val proj = projectionManager.getMediaProjection(resultCode, data) ?: return
         projection = proj
+        acquireWakeLockIfNeeded()
         proj.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
                 Log.i(TAG, "projection stopped by system")
@@ -125,8 +165,15 @@ internal class ScreenCaptureManager(
      *  stop()/release() concurrently with dequeueOutputBuffer()/releaseOutputBuffer() being called
      *  on it from a different thread, which is exactly the crash this used to be able to hit. */
     fun stop() {
+        // Released unconditionally, ahead of the `running` guard below (not gated by it) - stop() is
+        // called from several independent places (UI tap, MediaProjection.Callback.onStop(), a Remote
+        // Stop message) and may run more than once for the same session; releaseWakeLockIfNeeded()
+        // is itself idempotent, so this guarantees the lock never outlives the session regardless of
+        // which caller's stop() actually "wins" the running-guard below.
+        releaseWakeLockIfNeeded()
         if (!running) return
         running = false
+        Log.i(TAG, "Screen Share stopped")
         runCatching { displayManager.unregisterDisplayListener(displayListener) }
         pendingResize = null
         reconfigureCompletedAtMs = 0L
@@ -145,6 +192,19 @@ internal class ScreenCaptureManager(
             setInteger(MediaFormat.KEY_BIT_RATE, 6_000_000)
             setInteger(MediaFormat.KEY_FRAME_RATE, 30)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            // BRIDGEY VIDEO STUTTER FIX (2026-09-24): KEY_FRAME_RATE above is only a bitrate-control
+            // hint - it does NOT throttle how often SurfaceFlinger actually feeds this Surface-input
+            // encoder. Real-hardware logs showed bursts up to 121 fps during fast scrolling/animation
+            // (vs. the 30 fps target), instantly overflowing TcpVideoTransport's 8-frame send queue and
+            // forcing it to evict DELTA frames - since a keyframe only comes every KEY_I_FRAME_INTERVAL
+            // (2s), the decoder was stuck on stale content until the next one, reading as bad stutter.
+            // KEY_MAX_FPS_TO_ENCODER (API 31+) is the real fix for exactly this Surface-input scenario:
+            // frames arriving faster than this are dropped by the platform BEFORE they ever reach the
+            // encoder or our send queue, so a burst degrades to "capped at 60fps" instead of "queue
+            // overflow drops frames essentially at random relative to the network's actual capacity."
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                setInteger(MediaFormat.KEY_MAX_FPS_TO_ENCODER, 60)
+            }
         }
         val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
             configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -246,9 +306,6 @@ internal class ScreenCaptureManager(
 
         val bufferInfo = MediaCodec.BufferInfo()
         var lastReconnectAttempt = 0L
-        var frameCount = 0
-        var byteCount = 0L
-        var windowStart = System.currentTimeMillis()
         while (running) {
             if (videoChannel.currentVideoState == ChannelState.IDLE && System.currentTimeMillis() - lastReconnectAttempt > 2_000) {
                 lastReconnectAttempt = System.currentTimeMillis()
@@ -287,18 +344,9 @@ internal class ScreenCaptureManager(
                             }
                         }
                         videoChannel.sendVideoFrame(frame, droppable = type == VideoFrameType.DELTA)
-                        frameCount++
-                        byteCount += bytes.size
                     }
                     codec.releaseOutputBuffer(index, false)
                 }
-            }
-            val now = System.currentTimeMillis()
-            if (now - windowStart >= 1000) {
-                Log.d(TAG, "stats: fps=$frameCount bytesPerSec=$byteCount")
-                frameCount = 0
-                byteCount = 0
-                windowStart = now
             }
         }
         // The only place the encoder/VirtualDisplay/projection are ever stopped/released - see

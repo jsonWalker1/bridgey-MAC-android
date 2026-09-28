@@ -94,6 +94,27 @@ class BridgeyAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() {}
 
+    /** BRIDGEY KVM TOUCHPAD GESTURES V1: a semantic action only - not a synthesized touch gesture like
+     * every other handle* method in this class, since Android has real system-wide actions for these
+     * (unlike e.g. right-click, which has no touch equivalent and has to be approximated). [GestureAction.FORWARD]
+     * has no AccessibilityService equivalent - confirmed against the actual android.jar, not guessed -
+     * so it is explicitly logged as unsupported rather than silently doing nothing or guessing at one. */
+    internal fun handleGesture(action: GestureAction) {
+        val globalAction = when (action) {
+            GestureAction.BACK -> GLOBAL_ACTION_BACK
+            GestureAction.HOME -> GLOBAL_ACTION_HOME
+            GestureAction.NOTIFICATIONS -> GLOBAL_ACTION_NOTIFICATIONS
+            GestureAction.RECENTS -> GLOBAL_ACTION_RECENTS
+            GestureAction.FORWARD -> {
+                Log.w(TAG, "GESTURE FORWARD received - Android has no system-wide forward action " +
+                    "(AccessibilityService.GLOBAL_ACTION_* has no FORWARD) - unsupported, ignoring")
+                return
+            }
+        }
+        val performed = performGlobalAction(globalAction)
+        Log.i(TAG, "GESTURE $action -> performGlobalAction($globalAction) performed=$performed")
+    }
+
     /** KVM Mouse V2 (see KVM_MOUSE_V2_PHASE1.md): [button] selects which Android-side gesture
      * strategy applies. LEFT is byte-for-byte Mouse v1 behavior. SCROLL is never routed here -
      * KvmInputInjector intercepts it before this call, since it isn't a button gesture at all. */

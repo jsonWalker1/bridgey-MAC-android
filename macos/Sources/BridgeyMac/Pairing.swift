@@ -68,6 +68,9 @@ struct RemoteNotificationPayload: Codable {
     let actions: [RemoteNotificationActionPayload]?
     let applicationIcon: String?
     let callType: String?
+    let hasSound: Bool?
+    let availableAudioRoutes: [String]?
+    let bluetoothRouteName: String?
 }
 
 struct RemoteNotificationActionPayload: Codable {
@@ -84,6 +87,7 @@ private struct NotificationActionCommandPayload: Codable {
     let notificationId: String
     let actionToken: String
     let replyText: String?
+    let route: String?
 }
 
 private struct FileOfferPayload: Codable {
@@ -109,6 +113,13 @@ private struct PingPayload: Codable {
 }
 
 private struct RemoteScreenSharePayload: Codable {
+    let version: Int
+}
+
+/// BRIDGEY KVM KEYBOARD V1 (switch shortcut): fire-and-forget, no consent/negotiation needed (unlike
+/// Remote Screen Share) - an old Android peer that doesn't understand "kvm.switchKeyboard" simply
+/// ignores the unknown `kind`, the same backward-compatible fallback every other command kind gets.
+private struct SwitchKeyboardPayload: Codable {
     let version: Int
 }
 
@@ -218,9 +229,19 @@ final class PairingCoordinator: ObservableObject {
     private var pendingCallExpiryWorkItem: DispatchWorkItem?
     private var remoteFeatureStateReceived = false
     private var clipboardSendID: String?
+    /// BRIDGEY KVM COPY/PASTE INTEGRATION: lets a caller of `sendClipboard(completion:)` (namely
+    /// Command+V during KVM - see `onPasteRequested`) know once the sync has definitely either
+    /// succeeded or failed, so it can safely follow up with a KEY(Ctrl+V) forward to Android without
+    /// racing the clipboard update across the separate control/input TCP channels. `nil` for the
+    /// existing manual-trigger call sites (menu button, global hotkey), which don't need to know.
+    private var clipboardCompletion: ((Bool) -> Void)?
     private var clipboardTimeoutWorkItem: DispatchWorkItem?
     private let notificationPresenter = NotificationPresenter()
     private var remoteNotificationCategories: [String: UNNotificationCategory] = [:]
+    // BRIDGEY NOTIFICATION++ SOUND POLISH: highest Android postTime already delivered per logical
+    // notification identity - see shouldPlayNotificationSound's doc comment for why this is keyed
+    // by timestamp rather than a simple "already posted" flag.
+    private var lastNotificationSoundTimestamp: [String: Int64] = [:]
     private var incomingFiles: [String: IncomingFileTransfer] = [:]
     private var incomingSyncAssets: [String: (assetKey: String, isVideo: Bool)] = [:]
     private var outgoingFiles: [String: OutgoingFileTransfer] = [:]
@@ -601,7 +622,7 @@ final class PairingCoordinator: ObservableObject {
 
     /// Sends an answer/decline/hangup command for a call reported over the Telecom v2 channel.
     /// Called from performRemoteCallAction in Calls.swift, hence not `private`.
-    func sendCallControl(callID: String, action: String, deviceID: String) {
+    func sendCallControl(callID: String, action: String, deviceID: String, route: String? = nil) {
         guard case let .connected(connectedDeviceID, _) = state,
               connectedDeviceID == deviceID,
               let current = session,
@@ -609,8 +630,9 @@ final class PairingCoordinator: ObservableObject {
               featureEnabled(.calls, current: current),
               UUID(uuidString: callID) != nil,
               isKnownCallAction(action),
+              isValidAudioRoute(route),
               let plaintext = try? JSONEncoder().encode(
-                CallActionPayload(version: 1, callId: callID, action: action)
+                CallActionPayload(version: 1, callId: callID, action: action, route: route)
               ),
               let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
         current.send(PairingMessage(
@@ -700,18 +722,28 @@ final class PairingCoordinator: ObservableObject {
         )
     }
 
-    func sendClipboard() {
-        guard let current = session, case .connected = state else { return }
+    /// BRIDGEY KVM COPY/PASTE INTEGRATION: `completion` is `nil` for every pre-existing call site
+    /// (the menu button, the global keyboard shortcut) - only `onPasteRequested` (Command+V during
+    /// KVM) passes one, to know once the sync has definitely finished (delivered, rejected, or timed
+    /// out) before forwarding the follow-up KEY(Ctrl+V). Behavior for existing callers is unchanged.
+    func sendClipboard(completion: ((Bool) -> Void)? = nil) {
+        guard let current = session, case .connected = state else {
+            completion?(false)
+            return
+        }
         guard isFeatureAvailable(.clipboard) else {
             clipboardStatus = "Clipboard is turned off on one of your devices"
+            completion?(false)
             return
         }
         guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
             clipboardStatus = "Clipboard is empty or unavailable"
+            completion?(false)
             return
         }
         guard clipboardTextFits(text) else {
             clipboardStatus = "Clipboard exceeds 32 KiB. Send large text or diagnostics as a file."
+            completion?(false)
             return
         }
         let html = NSPasteboard.general.data(forType: .html)
@@ -720,6 +752,7 @@ final class PairingCoordinator: ObservableObject {
         let plaintext = richContent.flatMap { try? JSONEncoder().encode($0) } ?? Data(text.utf8)
         guard let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else {
             clipboardStatus = "Encryption failed"
+            completion?(false)
             return
         }
         let messageID = UUID().uuidString.lowercased()
@@ -732,6 +765,7 @@ final class PairingCoordinator: ObservableObject {
         ))
         clipboardTimeoutWorkItem?.cancel()
         clipboardSendID = messageID
+        clipboardCompletion = completion
         clipboardStatus = "Sending…"
         let timeout = DispatchWorkItem { [weak self, weak current] in
             guard let self, let current, self.session === current,
@@ -740,6 +774,9 @@ final class PairingCoordinator: ObservableObject {
             self.clipboardTimeoutWorkItem = nil
             self.clipboardStatus = "No delivery acknowledgement"
             self.sendFeatureState()
+            let completion = self.clipboardCompletion
+            self.clipboardCompletion = nil
+            completion?(false)
         }
         clipboardTimeoutWorkItem = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: timeout)
@@ -751,6 +788,9 @@ final class PairingCoordinator: ObservableObject {
         clipboardTimeoutWorkItem = nil
         clipboardSendID = nil
         clipboardStatus = nil
+        let completion = clipboardCompletion
+        clipboardCompletion = nil
+        completion?(false)
     }
 
     func sendPing() {
@@ -1170,15 +1210,40 @@ final class PairingCoordinator: ObservableObject {
                     // offerInput() is a no-op once the channel is already offered/connecting/active
                     // (frozen VideoChannelController guard) - safe to call on every event.
                     videoChannel.offerInput(direction: "mac_to_android")
-                    let outcome = videoChannel.sendInputEvent(.pointer(action: action, x: x, y: y, button: button, scrollDx: scrollDx, scrollDy: scrollDy))
-                    // TEMPORARY KVM MOUSE V2 RUNTIME VERIFICATION LOGGING - DO NOT COMMIT.
-                    // Only non-left-button and scroll events, to avoid flooding the log during plain
-                    // left-click/movement use - this is specifically to prove the button/scroll event
-                    // was generated with the right values and actually handed to the transport (not
-                    // silently dropped), for KVM_MOUSE_V2_PHASE1 runtime verification.
-                    if button != .left || action == .scroll {
-                        NSLog("[BRIDGEY-MOUSEV2-CAL] send action=%@ button=%@ pos=(%.4f,%.4f) scroll=(%.4f,%.4f) outcome=%@",
-                              String(describing: action), String(describing: button), x, y, scrollDx, scrollDy, String(describing: outcome))
+                    _ = videoChannel.sendInputEvent(.pointer(action: action, x: x, y: y, button: button, scrollDx: scrollDx, scrollDy: scrollDy))
+                },
+                onGestureEvent: { [weak self] action in
+                    guard let self else { return }
+                    // BRIDGEY KVM TOUCHPAD GESTURES V1: same authenticated/encrypted "input" channel
+                    // as every other InputEvent - no new socket, no new trust mechanism.
+                    videoChannel.offerInput(direction: "mac_to_android")
+                    _ = videoChannel.sendInputEvent(.gesture(action: action))
+                },
+                onKeyboardEvent: { [weak self] event in
+                    guard let self else { return }
+                    // BRIDGEY KVM KEYBOARD V1: same authenticated/encrypted "input" channel as every
+                    // other InputEvent - no new socket, no new trust mechanism.
+                    videoChannel.offerInput(direction: "mac_to_android")
+                    _ = videoChannel.sendInputEvent(event)
+                },
+                onSwitchKeyboardRequested: { [weak self] in
+                    self?.sendSwitchKeyboard()
+                },
+                onPasteRequested: { [weak self] in
+                    guard let self else { return }
+                    // BRIDGEY KVM COPY/PASTE INTEGRATION: reuses the EXISTING, unmodified Clipboard
+                    // Continuity sendClipboard() - no second clipboard transport/monitor/protocol.
+                    // Whether or not the sync itself succeeds (e.g. Mac clipboard empty, feature off),
+                    // still forward Ctrl+V - Android just pastes whatever it already has, matching
+                    // ordinary paste semantics rather than silently doing nothing on a sync failure.
+                    self.sendClipboard { [weak self] _ in
+                        guard let self else { return }
+                        guard let androidKeyCode = KvmKeyMapping.androidKeyCode(forLetterOrDigit: "v") else { return }
+                        let modifiers = KvmKeyMapping.modifierBits(shift: false, control: true, option: false, command: false)
+                        videoChannel.offerInput(direction: "mac_to_android")
+                        _ = videoChannel.sendInputEvent(.key(keyCode: androidKeyCode, action: .down, modifiers: modifiers))
+                        _ = videoChannel.sendInputEvent(.key(keyCode: androidKeyCode, action: .up, modifiers: modifiers))
+                        NSLog("PLUGIN KVM paste: clipboard synced, Ctrl+V forwarded to Android")
                     }
                 }
             )
@@ -1218,6 +1283,25 @@ final class PairingCoordinator: ObservableObject {
             ciphertext: encrypted.ciphertext
         ))
         NSLog("REMOTE_STOP request sent to Android")
+    }
+
+    /// BRIDGEY KVM KEYBOARD V1 (switch shortcut): Command+K while the Screen Share window is key asks
+    /// Android to toggle its active keyboard to/from "Bridgey KVM Keyboard" - see
+    /// PairingCoordinator.receiveSwitchKeyboard / KvmKeyboardSwitcher.kt for what happens on the phone.
+    /// No feature-negotiation gate (unlike Remote Screen Share): a peer that doesn't understand this
+    /// command kind just ignores it, same fallback every other unrecognized `kind` already gets.
+    private func sendSwitchKeyboard() {
+        guard let current = session, case .connected = state else { return }
+        guard let plaintext = try? JSONEncoder().encode(SwitchKeyboardPayload(version: 1)),
+              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
+        current.send(PairingMessage(
+            kind: "kvm.switchKeyboard",
+            sessionId: current.id,
+            messageId: UUID().uuidString.lowercased(),
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext
+        ))
+        NSLog("KVM switchKeyboard request sent to Android")
     }
 
     func showFileDropWindow() {
@@ -1544,12 +1628,18 @@ final class PairingCoordinator: ObservableObject {
                 clipboardSendID = nil
                 clipboardStatus = "Delivered"
                 NSLog("PLUGIN clipboard acknowledged")
+                let ackCompletion = clipboardCompletion
+                clipboardCompletion = nil
+                ackCompletion?(true)
             case "clipboard.rejected":
                 guard message.messageId == clipboardSendID else { return }
                 clipboardTimeoutWorkItem?.cancel()
                 clipboardTimeoutWorkItem = nil
                 clipboardSendID = nil
                 clipboardStatus = "Clipboard is turned off on Android"
+                let rejectedCompletion = clipboardCompletion
+                clipboardCompletion = nil
+                rejectedCompletion?(false)
             case "find.start":
                 try receiveFindCommand(message, in: current, start: true)
             case "find.stop":
@@ -2091,8 +2181,20 @@ final class PairingCoordinator: ObservableObject {
         content.title = payload.callType == nil ? payload.applicationName : remoteCallStatusTitle(payload.callType)
         content.subtitle = payload.title
         content.body = payload.callType == nil ? payload.text : remoteCallDetail(payload.text, type: payload.callType)
-        content.sound = .default
         content.categoryIdentifier = notificationCategoryIdentifier(for: payload, deviceID: deviceID)
+        // BRIDGEY NOTIFICATION++ PHASE 2: lets macOS's own native Notification Center grouping
+        // collapse repeated notifications for the same Android logical identity (e.g. the same
+        // WhatsApp conversation) under one thread, instead of appearing as unrelated entries.
+        let identifier = remoteNotificationRequestIdentifier(deviceID: deviceID, notificationID: payload.notificationId)
+        content.threadIdentifier = identifier
+        let audible = shouldPlayNotificationSound(
+            hasSound: payload.hasSound,
+            timestamp: payload.timestamp,
+            lastPlayedTimestamp: lastNotificationSoundTimestamp[identifier]
+        )
+        content.sound = audible ? .default : nil
+        if lastNotificationSoundTimestamp.count > 500 { lastNotificationSoundTimestamp.removeAll() }
+        lastNotificationSoundTimestamp[identifier] = max(lastNotificationSoundTimestamp[identifier] ?? 0, payload.timestamp)
         if let attachment = notificationIconAttachment(for: payload) {
             content.attachments = [attachment]
         }
@@ -2102,7 +2204,7 @@ final class PairingCoordinator: ObservableObject {
             "androidDeviceId": deviceID,
         ]
         let request = UNNotificationRequest(
-            identifier: remoteNotificationRequestIdentifier(deviceID: deviceID, notificationID: payload.notificationId),
+            identifier: identifier,
             content: content,
             trigger: nil
         )
@@ -2218,7 +2320,8 @@ final class PairingCoordinator: ObservableObject {
         _ notificationID: String,
         deviceID: String,
         actionToken: String,
-        replyText: String?
+        replyText: String?,
+        route: String? = nil
     ) {
         guard case let .connected(connectedDeviceID, _) = state,
               connectedDeviceID == deviceID,
@@ -2229,10 +2332,12 @@ final class PairingCoordinator: ObservableObject {
               notificationID.count <= 512,
               actionToken.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
               (replyText?.count ?? 0) <= 4_096,
+              isValidAudioRoute(route),
               let plaintext = try? JSONEncoder().encode(NotificationActionCommandPayload(
                 notificationId: notificationID,
                 actionToken: actionToken,
-                replyText: replyText
+                replyText: replyText,
+                route: route
               )),
               let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
         current.send(PairingMessage(

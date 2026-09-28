@@ -29,6 +29,13 @@ dependencyResolutionManagement {
                 includeGroupByRegex("com\\.google\\..*")
             }
         }
+        // BRIDGEY SMB POC (feasibility spike, see SmbPocServer.kt) - the only maintained Android-
+        // friendly build of org.filesys/jfileserver is buttercookie42's fork, published via JitPack
+        // rather than Maven Central. DELETE this block if the SMB POC is removed.
+        maven("https://jitpack.io") {
+            name = "JitPackSmbPoc"
+            content { includeGroup("com.github.buttercookie42") }
+        }
     }
 }
 

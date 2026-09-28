@@ -81,11 +81,29 @@ private struct CallOverlayView: View {
                     } else {
                         HStack(spacing: 10) {
                             ForEach(orderedCallActions(call.actions).prefix(2)) { action in
-                                Button(action.title) {
-                                    pairing.performRemoteCallAction(action)
+                                // BRIDGEY CALL CONTINUITY: only the Answer action ever gets a route
+                                // picker, and only when Android actually reported routes for this
+                                // call (never shown for Decline/Hang Up, never invented when empty).
+                                if action.title.localizedCaseInsensitiveContains("answer"), !call.availableAudioRoutes.isEmpty {
+                                    Menu {
+                                        ForEach(call.availableAudioRoutes, id: \.self) { route in
+                                            Button(audioRouteLabel(route, bluetoothName: call.bluetoothRouteName)) {
+                                                pairing.performRemoteCallAction(action, route: route)
+                                            }
+                                        }
+                                    } label: {
+                                        Text("\(action.title) \u{25BE}")
+                                    }
+                                    .menuStyle(.borderlessButton)
+                                    .buttonStyle(CallActionButtonStyle(color: callActionColor(action.title)))
+                                    .frame(maxWidth: .infinity)
+                                } else {
+                                    Button(action.title) {
+                                        pairing.performRemoteCallAction(action)
+                                    }
+                                    .buttonStyle(CallActionButtonStyle(color: callActionColor(action.title)))
+                                    .frame(maxWidth: .infinity)
                                 }
-                                .buttonStyle(CallActionButtonStyle(color: callActionColor(action.title)))
-                                .frame(maxWidth: .infinity)
                             }
                         }
                     }
@@ -103,6 +121,16 @@ private struct CallOverlayView: View {
 
     private func callActionColor(_ title: String) -> Color {
         title.localizedCaseInsensitiveContains("answer") ? .green : .red
+    }
+}
+
+// BRIDGEY CALL CONTINUITY: presentation only - never invents a device name Android didn't report.
+func audioRouteLabel(_ route: String, bluetoothName: String?) -> String {
+    switch route {
+    case "EARPIECE": return "📱 Phone"
+    case "SPEAKER": return "🔊 Speaker"
+    case "BLUETOOTH": return bluetoothName.map { "🎧 \($0)" } ?? "🎧 Bluetooth"
+    default: return route
     }
 }
 

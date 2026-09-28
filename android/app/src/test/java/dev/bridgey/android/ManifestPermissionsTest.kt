@@ -16,6 +16,9 @@ class ManifestPermissionsTest {
         assertEquals(
             setOf(
                 "android.permission.INTERNET",
+                "android.permission.ACCESS_NETWORK_STATE",
+                "android.permission.WAKE_LOCK",
+                "android.permission.WRITE_SECURE_SETTINGS",
                 "android.permission.CHANGE_WIFI_MULTICAST_STATE",
                 "android.permission.POST_NOTIFICATIONS",
                 "android.permission.FOREGROUND_SERVICE",
@@ -30,6 +33,7 @@ class ManifestPermissionsTest {
                 "android.permission.RECEIVE_BOOT_COMPLETED",
                 "android.permission.SYSTEM_ALERT_WINDOW",
                 "android.permission.ACCESS_NOTIFICATION_POLICY",
+                "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
             ),
             declared,
         )

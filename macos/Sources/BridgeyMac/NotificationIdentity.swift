@@ -16,6 +16,23 @@ func remoteNotificationCategoryIdentifier(deviceID: String, notificationID: Stri
     return "bridgey.android.actions.\(digest)"
 }
 
+/**
+ * BRIDGEY NOTIFICATION++ SOUND POLISH: `UNUserNotificationCenter.add()` re-alerts (sound + banner)
+ * every time it's called with the same identifier, even when the call is just a resync-on-reconnect
+ * or a duplicate/replayed post of content the user has already seen - real-device evidence showed
+ * WhatsApp rapid-fire the same message post 3x within the same second, and Bridgey's own
+ * resyncActiveNotifications() re-posts every active notification on every reconnect. Comparing
+ * against the highest Android `postTime` (`timestamp`) already delivered for this logical identity
+ * - reusing the existing timestamp field already on the wire, no new field needed for this part -
+ * distinguishes "genuinely new content" (timestamp advanced) from "the same content again"
+ * (timestamp unchanged), so replays/resyncs stay silent while a real new message still sounds.
+ */
+func shouldPlayNotificationSound(hasSound: Bool?, timestamp: Int64, lastPlayedTimestamp: Int64?) -> Bool {
+    guard hasSound ?? true else { return false }
+    guard let lastPlayedTimestamp else { return true }
+    return timestamp > lastPlayedTimestamp
+}
+
 let maximumRemoteNotificationIconBytes = 20 * 1024
 
 func remoteNotificationIconData(_ encoded: String?) -> Data? {

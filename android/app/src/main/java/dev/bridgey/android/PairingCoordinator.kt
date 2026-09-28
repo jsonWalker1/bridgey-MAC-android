@@ -4,11 +4,15 @@ import android.content.Context
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.OpenableColumns
 import android.provider.MediaStore
 import android.os.SystemClock
@@ -174,6 +178,68 @@ class PairingCoordinator(
     private var reconnectAttempt = 0
     private var reconnectJob: Job? = null
 
+    // Continuity Core reliability: without these, the CPU can suspend and the Wi-Fi radio can
+    // enter power-save mode while the phone is screen-off/idle, both silently delaying the
+    // heartbeat read-timeout well past its coded 30s/90s threshold (confirmed live during the
+    // Continuity Core audit: a real session took 136s to detect instead of the coded 30s). Scoped
+    // strictly to Connected via the state collector below so idle/disconnected periods cost
+    // nothing - mirrors ScreenCaptureManager's existing wake-lock convention.
+    private val powerManager = appContext.getSystemService(PowerManager::class.java)
+    private val wifiManager = appContext.getSystemService(WifiManager::class.java)
+    private val connectivityManager = appContext.getSystemService(ConnectivityManager::class.java)
+    private var connectionWakeLock: PowerManager.WakeLock? = null
+    private var connectionWifiLock: WifiManager.WifiLock? = null
+    private var networkCallbackRegistered = false
+    private var lastNetworkLossHandledElapsedMs = 0L
+
+    // Neither platform previously reacted to a network change for the *control* connection - only
+    // Android's mDNS discovery layer did (NsdDiscoveryService's own NetworkCallback, scoped to
+    // restarting discovery). This lets a genuine "the network is gone" signal close a likely-dead
+    // session immediately instead of waiting out the full heartbeat timeout. Debounced the same way
+    // NsdDiscoveryService.restartNsd() debounces its own NetworkCallback, for the same reason: avoid
+    // reacting to bursts of transient callback churn. Reacts only to onLost (not the noisier
+    // onCapabilitiesChanged) and only closes the socket - the existing read-loop exit/cleanup path
+    // and reconnect backoff handle everything else unchanged.
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onLost(network: Network) {
+            val now = SystemClock.elapsedRealtime()
+            if (!shouldActOnNetworkLoss(lastNetworkLossHandledElapsedMs, now)) return
+            lastNetworkLossHandledElapsedMs = now
+            if (mutableState.value !is PairingState.Connected) return
+            android.util.Log.w("Bridgey", "CONNECTION network lost (ConnectivityManager.onLost) - closing session early")
+            session?.close()
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun acquireConnectionLocksIfNeeded() {
+        if (connectionWakeLock == null) {
+            runCatching {
+                powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Bridgey:Connection")?.apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            }.onSuccess { connectionWakeLock = it }
+                .onFailure { android.util.Log.w("Bridgey", "CONNECTION wake lock acquire failed: ${it.message}") }
+        }
+        if (connectionWifiLock == null) {
+            runCatching {
+                wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Bridgey:Connection")?.apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            }.onSuccess { connectionWifiLock = it }
+                .onFailure { android.util.Log.w("Bridgey", "CONNECTION wifi lock acquire failed: ${it.message}") }
+        }
+    }
+
+    private fun releaseConnectionLocksIfNeeded() {
+        connectionWakeLock?.let { lock -> runCatching { if (lock.isHeld) lock.release() } }
+        connectionWakeLock = null
+        connectionWifiLock?.let { lock -> runCatching { if (lock.isHeld) lock.release() } }
+        connectionWifiLock = null
+    }
+
     init {
         mediaRemote.start()
         scope.launch {
@@ -186,11 +252,21 @@ class PairingCoordinator(
                 sendFeatureState()
             }
         }
+        scope.launch {
+            mutableState.collect { state ->
+                if (state is PairingState.Connected) acquireConnectionLocksIfNeeded() else releaseConnectionLocksIfNeeded()
+            }
+        }
     }
 
     fun start() {
         if (acceptJob != null) return
         diagnostics.record("transport", "listener_started")
+        if (!networkCallbackRegistered) {
+            runCatching { connectivityManager?.registerDefaultNetworkCallback(networkCallback) }
+                .onSuccess { networkCallbackRegistered = true }
+                .onFailure { android.util.Log.w("Bridgey", "CONNECTION could not register network callback: ${it.message}") }
+        }
         acceptJob = scope.launch {
             runCatching {
                 ServerSocket(port).also { server = it }.use { listener ->
@@ -232,8 +308,13 @@ class PairingCoordinator(
         reconnectAttempt = 0
         val current = session
         session = null
-        current?.send(Message(kind = "pairing.cancel", sessionId = current.id))
-        current?.close()
+        // send() does a blocking socket write - callers include a Compose UI click handler, so this
+        // must not run on the caller's thread (throws NetworkOnMainThreadException, silently caught
+        // and logged inside send(), which meant pairing.cancel was never actually delivered).
+        scope.launch {
+            current?.send(Message(kind = "pairing.cancel", sessionId = current.id))
+            current?.close()
+        }
         stopPhoneRinging()
         mutableMacRinging.value = false
         mutableRemoteBattery.value = null
@@ -329,9 +410,16 @@ class PairingCoordinator(
             }
             val messageId = UUID.randomUUID().toString()
             pendingClipboardSends[messageId] = onResult
+            // BRIDGEY CONNECTIVITY CRASH FIX (2026-09-25): see sendBattery's identical guard for why -
+            // same TOCTOU race, same latent whole-process-crashing force-unwrap.
+            val pairingKey = current.pairingKey ?: run {
+                mutableClipboardStatus.value = "Not connected — clipboard was not sent"
+                onResult(ClipboardSendResult.NOT_CONNECTED)
+                return@launch
+            }
             val richContent = RichClipboardContent.create(text, html)
             val plaintext = richContent?.encode() ?: text.toByteArray(Charsets.UTF_8)
-            val encrypted = Crypto.encrypt(current.pairingKey!!, plaintext)
+            val encrypted = Crypto.encrypt(pairingKey, plaintext)
             val message = Message(
                 kind = if (richContent == null) "clipboard.update" else "clipboard.rich",
                 sessionId = current.id,
@@ -370,12 +458,21 @@ class PairingCoordinator(
         if (mutableState.value !is PairingState.Connected) return
         scope.launch {
             if (session !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
+            // BRIDGEY CONNECTIVITY CRASH FIX (2026-09-25): pairingKey can go null on this SAME session
+            // object between the check above and here (e.g. a disconnect racing this coroutine's
+            // dispatch) even though `session !== connectedSession` still holds - force-unwrapping it
+            // crashed the whole process (NullPointerException in sendBattery, confirmed via
+            // AndroidRuntime FATAL EXCEPTION log), taking down BridgeyConnectionService with it and
+            // breaking ALL connectivity, not just this one battery update. `?: return@launch` degrades
+            // to silently skipping this update instead - exactly what sendQuickPayload/receiveQuickPayload
+            // already do elsewhere in this file.
+            val pairingKey = connectedSession.pairingKey ?: return@launch
             val payload = JSONObject()
                 .put("level", level.coerceIn(0, 100))
                 .put("isCharging", isCharging)
                 .toString()
                 .toByteArray()
-            val encrypted = Crypto.encrypt(connectedSession.pairingKey!!, payload)
+            val encrypted = Crypto.encrypt(pairingKey, payload)
             if (connectedSession.send(
                     Message(
                         kind = "battery.update",
@@ -514,6 +611,27 @@ class PairingCoordinator(
         clearRemoteScreenShareRequest()
     }
 
+    /** BRIDGEY KVM KEYBOARD V1 (switch shortcut): the Mac's Command+K asking this phone to toggle its
+     *  active keyboard to/from Bridgey's KVM Keyboard (see KvmKeyboardSwitcher.kt for the actual
+     *  Settings.Secure write / picker fallback). No feature-negotiation gate (unlike Remote Screen
+     *  Share above) and no reply sent back - fire-and-forget, same decrypt-proves-possession-of-
+     *  pairingKey authentication as every other command. */
+    private fun receiveSwitchKeyboard(current: Session, message: Message) {
+        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        val messageId = message.messageId ?: return
+        if (!current.acceptMessageId(messageId)) return
+        val plaintext = Crypto.decrypt(
+            current.pairingKey!!,
+            message.nonce ?: return fail("Invalid encrypted switch-keyboard request"),
+            message.ciphertext ?: return fail("Invalid encrypted switch-keyboard request"),
+        ) ?: return fail("Invalid encrypted switch-keyboard request")
+        if (runCatching { JSONObject(plaintext.toString(Charsets.UTF_8)).getInt("version") }.getOrNull() != 1) {
+            return fail("Invalid switch-keyboard request")
+        }
+        android.util.Log.i("Bridgey", "KVM switchKeyboard request received from trusted peer=${current.peerName}")
+        KvmKeyboardSwitcher.toggle(appContext)
+    }
+
     /** Called once the pending request has been resolved one way or another - the user acted on the
      *  notification (see MainActivity's EXTRA_REMOTE_START handling), the request went stale, or a
      *  remoteStop arrived. Also cancels the notification via BridgeyConnectionService's collector. */
@@ -566,12 +684,17 @@ class PairingCoordinator(
         actions: List<ForwardedNotificationAction> = emptyList(),
         applicationIcon: String? = null,
         callType: String? = null,
+        hasSound: Boolean = true,
+        availableAudioRoutes: List<String>? = null,
+        bluetoothRouteName: String? = null,
     ) {
         if (!isFeatureAvailable(BridgeyFeature.NOTIFICATIONS)) return
         val connectedSession = session ?: return
         if (mutableState.value !is PairingState.Connected) return
         scope.launch {
             if (session !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
+            // BRIDGEY CONNECTIVITY CRASH FIX (2026-09-25): see sendBattery's identical guard for why.
+            val pairingKey = connectedSession.pairingKey ?: return@launch
             val payload = JSONObject()
                 .put("packageName", packageName.take(256))
                 .put("applicationName", applicationName.take(128))
@@ -579,12 +702,19 @@ class PairingCoordinator(
                 .put("title", title.take(1_024))
                 .put("text", text.take(8_192))
                 .put("timestamp", timestamp)
+                .put("hasSound", hasSound)
                 .apply {
                     if (applicationIcon != null && applicationIcon.length <= MAX_NOTIFICATION_ICON_BASE64_LENGTH) {
                         put("applicationIcon", applicationIcon)
                     }
                     if (callType in setOf("incoming", "ongoing", "screening", "unknown")) {
                         put("callType", callType)
+                    }
+                    if (!availableAudioRoutes.isNullOrEmpty()) {
+                        put("availableAudioRoutes", JSONArray(availableAudioRoutes.take(3)))
+                    }
+                    if (bluetoothRouteName != null) {
+                        put("bluetoothRouteName", bluetoothRouteName.take(64))
                     }
                 }
                 .put("actions", JSONArray().apply {
@@ -597,7 +727,7 @@ class PairingCoordinator(
                 })
                 .toString()
                 .toByteArray()
-            val encrypted = Crypto.encrypt(connectedSession.pairingKey!!, payload)
+            val encrypted = Crypto.encrypt(pairingKey, payload)
             if (connectedSession.send(
                     Message(
                         kind = "notifications.post",
@@ -632,6 +762,8 @@ class PairingCoordinator(
         if (mutableState.value !is PairingState.Connected) return
         scope.launch {
             if (session !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
+            // BRIDGEY CONNECTIVITY CRASH FIX (2026-09-25): see sendBattery's identical guard for why.
+            val pairingKey = connectedSession.pairingKey ?: return@launch
             val payload = JSONObject()
                 .put("version", 1)
                 .put("callId", callId)
@@ -640,7 +772,7 @@ class PairingCoordinator(
                 .put("callerNumber", callerNumber.take(32))
                 .toString()
                 .toByteArray()
-            val encrypted = Crypto.encrypt(connectedSession.pairingKey!!, payload)
+            val encrypted = Crypto.encrypt(pairingKey, payload)
             connectedSession.send(
                 Message(
                     kind = "calls.state",
@@ -660,11 +792,13 @@ class PairingCoordinator(
         if (mutableState.value !is PairingState.Connected) return
         scope.launch {
             if (session !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
+            // BRIDGEY CONNECTIVITY CRASH FIX (2026-09-25): see sendBattery's identical guard for why.
+            val pairingKey = connectedSession.pairingKey ?: return@launch
             val payload = JSONObject()
                 .put("notificationId", notificationId.take(512))
                 .toString()
                 .toByteArray()
-            val encrypted = Crypto.encrypt(connectedSession.pairingKey!!, payload)
+            val encrypted = Crypto.encrypt(pairingKey, payload)
             connectedSession.send(
                 Message(
                     kind = kind,
@@ -822,7 +956,15 @@ class PairingCoordinator(
                 .put("sha256", hash)
                 .apply { if (assetKey != null) put("assetKey", assetKey) }
                 .toString().toByteArray()
-            val offer = Crypto.encrypt(connectedSession.pairingKey!!, offerPayload)
+            // BRIDGEY CONNECTIVITY CRASH FIX (2026-09-25): see sendBattery's identical guard for why -
+            // unlike the chunk-send/completion encrypts further below (already inside a runCatching
+            // that turns a failure into a clean "transfer failed" outcome), this one was unguarded and
+            // could crash the whole process exactly like sendBattery did.
+            val pairingKey = connectedSession.pairingKey ?: run {
+                updateFileTransfer(transferId, metadata.first, "Connection lost — file was not sent", false)
+                return@launch
+            }
+            val offer = Crypto.encrypt(pairingKey, offerPayload)
             val accepted = CompletableDeferred<Boolean>()
             pendingFileAccepts[transferId] = accepted
             if (!connectedSession.send(Message(
@@ -1214,6 +1356,7 @@ class PairingCoordinator(
             "find.stopped" -> receiveFindAcknowledgement(current, message, started = false)
             "screenshare.remoteStart" -> receiveRemoteScreenShareStart(current, message)
             "screenshare.remoteStop" -> receiveRemoteScreenShareStop(current, message)
+            "kvm.switchKeyboard" -> receiveSwitchKeyboard(current, message)
             "ping.request" -> receivePing(current, message)
             "ping.ack" -> {
                 if (session !== current || message.sessionId != current.id || mutableState.value !is PairingState.Connected) return
@@ -1321,13 +1464,17 @@ class PairingCoordinator(
             ?: return fail("Invalid call action")
         val callId = payload.optString("callId")
         val action = payload.optString("action")
-        if (runCatching { UUID.fromString(callId) }.isFailure || action !in setOf("answer", "decline", "hangup")) {
+        val route = payload.optString("route").takeIf { payload.has("route") }
+        if (runCatching { UUID.fromString(callId) }.isFailure ||
+            action !in setOf("answer", "decline", "hangup") ||
+            !isValidAudioRoute(route)
+        ) {
             return fail("Invalid call action")
         }
         // There is no per-call tracking without InCallService (see sendCallState's doc comment),
         // so this always acts on whatever call is currently ringing or active rather than
         // looking up this specific callId.
-        val accepted = BridgeyNotificationListenerService.performCallAction(action)
+        val accepted = BridgeyNotificationListenerService.performCallAction(action, route)
         val ackPayload = JSONObject()
             .put("version", 1)
             .put("callId", callId)
@@ -1433,10 +1580,11 @@ class PairingCoordinator(
         val notificationId = payload.optString("notificationId")
         val actionToken = payload.optString("actionToken")
         val replyText = payload.optString("replyText").takeIf { payload.has("replyText") }
-        if (notificationId.isBlank() || notificationId.length > 512 ||
-            !actionToken.matches(Regex("[0-9a-f]{64}")) ||
-            (replyText?.length ?: 0) > 4_096) return fail("Invalid notification action")
-        BridgeyNotificationListenerService.perform(notificationId, actionToken, replyText)
+        val route = payload.optString("route").takeIf { payload.has("route") }
+        if (!isValidNotificationActionPayload(notificationId, actionToken, replyText) || !isValidAudioRoute(route)) {
+            return fail("Invalid notification action")
+        }
+        BridgeyNotificationListenerService.perform(notificationId, actionToken, replyText, route)
         diagnostics.record("notification", if (replyText == null) "action_requested" else "reply_requested")
     }
 
@@ -1682,6 +1830,10 @@ class PairingCoordinator(
             diagnostics.record("pairing", "connected")
             sendFeatureState()
             mediaRemote.sendFreshState()
+            // BRIDGEY NOTIFICATION++ POC: same "resync fresh state on reconnect" pattern as
+            // mediaRemote.sendFreshState() above - see BridgeyNotificationListenerService's
+            // resyncActiveNotifications() doc comment.
+            BridgeyNotificationListenerService.resyncOnReconnect()
             android.util.Log.i("Bridgey", "PAIRING verified peer=${current.peerName}")
         }
     }

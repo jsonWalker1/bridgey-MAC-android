@@ -41,4 +41,21 @@ final class PhoneURLHandler: NSObject, NSApplicationDelegate {
     func application(_: NSApplication, open urls: [URL]) {
         urls.forEach { router.receive($0.absoluteString) }
     }
+
+    // Single-instance enforcement: two BridgeyMac processes (e.g. one launched from Xcode/an old
+    // build output, one from /Applications) both listening on the same pairing port and both
+    // dialing the phone independently caused real, confusing double-connection behavior in
+    // practice - not a hypothetical. applicationWillFinishLaunching runs as early as the app
+    // delegate lifecycle allows, before the rest of app startup (Pairing/discovery) does
+    // meaningful work, to minimize the window where a duplicate launch could still bind the port.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return }
+        let myPid = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .filter { $0.processIdentifier != myPid }
+        guard let existing = others.first else { return }
+        NSLog("Bridgey: another instance (pid %d) is already running - activating it and quitting this one", existing.processIdentifier)
+        existing.activate()
+        NSApp.terminate(nil)
+    }
 }

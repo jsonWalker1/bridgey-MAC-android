@@ -112,6 +112,17 @@ class NsdDiscoveryService(
                 networkCallback,
             )
         }.onFailure { Log.w(TAG, "DISCOVERY could not register network callback: ${it.message}") }
+        // Seeds the restartNsd() debounce window as of the registration this beginNsd() call is
+        // about to make. registerNetworkCallback delivers an immediate onAvailable for a network
+        // that's already up (the common case: Wi-Fi already connected at cold start), racing this
+        // same beginNsd() on another thread. Without this, that immediate callback wins the race
+        // and unregisters the listeners this call is still in the middle of registering (NsdManager
+        // marks a listener "in use" synchronously on registerService/discoverServices, well before
+        // its onServiceRegistered/onDiscoveryStarted confirmation) - registering the replacement
+        // then throws "already in use" (caught below), and the net result is BOTH the original and
+        // the replacement registration end up torn down: mDNS goes completely dark until some other
+        // network event happens to trigger another restartNsd().
+        lastRestartElapsedMs = SystemClock.elapsedRealtime()
         beginNsd()
     }
 
@@ -153,8 +164,19 @@ class NsdDiscoveryService(
             setAttribute("version", PROTOCOL_VERSION.toString())
             setAttribute("platform", "android")
         }
-        nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, registrationListener)
-        nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
+        // registerService/discoverServices reuse the same listener instances restartNsd() just
+        // asked NsdManager to unregister/stop - that teardown is async (confirmed only via
+        // onServiceUnregistered/onStopDiscoveryFailed), so NsdManager can still consider a listener
+        // "in use" here and throw IllegalArgumentException. Observed in practice: registerNetworkCallback
+        // fires onAvailable immediately for an already-connected Wi-Fi network, so restartNsd() runs
+        // within milliseconds of start()'s own beginNsd() on every cold start with Wi-Fi already up -
+        // this raced and crashed the whole app on every launch once ACCESS_NETWORK_STATE let the
+        // network callback actually register. Safe to swallow: if the old registration is still
+        // technically alive, the service/browse it set up keeps working regardless.
+        runCatching { nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, registrationListener) }
+            .onFailure { Log.w(TAG, "DISCOVERY publish start failed: ${it.message}") }
+        runCatching { nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener) }
+            .onFailure { Log.w(TAG, "DISCOVERY browse start failed: ${it.message}") }
     }
 
     @Synchronized

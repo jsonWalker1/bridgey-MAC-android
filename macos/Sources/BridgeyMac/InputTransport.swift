@@ -7,6 +7,26 @@ import Foundation
 enum PointerAction: Int { case down = 0, up = 1, move = 2, scroll = 3 }
 enum KeyAction: Int { case down = 0, up = 1 }
 
+/// BRIDGEY KVM KEYBOARD V1 (protocol extension - see InputEventCodec's doc comment for the wire byte
+/// this occupies). Bitmask, not an enum: a real key event can carry any combination simultaneously
+/// (e.g. Ctrl+Shift+Z). Declaration must match Kotlin's KeyModifier object exactly (same bit
+/// positions are the wire value), mirroring how GestureAction's ordinals are a frozen cross-platform
+/// contract elsewhere in this file.
+enum KeyModifier {
+    static let shift: UInt8 = 1 << 0
+    static let control: UInt8 = 1 << 1
+    static let alt: UInt8 = 1 << 2
+    static let meta: UInt8 = 1 << 3
+}
+
+/// BRIDGEY KVM TOUCHPAD GESTURES V1: a fully resolved semantic action - never coordinates, velocity,
+/// duration, or raw touch points (see KvmGestureRecognizer.swift for where a swipe is recognized and
+/// reduced down to just this). `.forward` deliberately has no Android-side action (there is no
+/// system-wide "forward" concept in AccessibilityService's GLOBAL_ACTION_* API, confirmed against the
+/// actual android.jar - not guessed) - it is still sent, so Android can log/report it as unsupported
+/// rather than the gesture being silently swallowed on the Mac side.
+enum GestureAction: Int { case back = 0, forward = 1, home = 2, notifications = 3, recents = 4 }
+
 /// KVM Mouse V2, phase 1 (protocol extension only - see BRIDGEY_KVM_STATE.md / the Mouse V2 design
 /// doc for why this frozen-since-M1 file is being extended rather than left alone). No mouse-button
 /// semantic existed anywhere in Mouse v1 - dispatchGesture is touch-only, and left-click was the only
@@ -21,8 +41,13 @@ enum InputEvent: Equatable {
     /// "unused for this action" fields just take their zero/left defaults at construction. See
     /// InputEventCodec's doc comment for the exact per-action wire layout.
     case pointer(action: PointerAction, x: Float, y: Float, button: PointerButton = .left, scrollDx: Float = 0, scrollDy: Float = 0)
-    case key(keyCode: Int32, action: KeyAction)
+    /// BRIDGEY KVM KEYBOARD V1: `modifiers` is a `KeyModifier` bitmask, defaulted so every pre-existing
+    /// call site (and test) that only ever passed `keyCode`/`action` keeps compiling unchanged.
+    case key(keyCode: Int32, action: KeyAction, modifiers: UInt8 = 0)
     case text(String)
+    /// BRIDGEY KVM TOUCHPAD GESTURES V1: a fully resolved semantic action only - see GestureAction's
+    /// own doc comment for why no coordinates/velocity/duration/raw touch data are carried.
+    case gesture(action: GestureAction)
     // Controller (gaming, section 12) intentionally not modeled yet - not part of M1.
 }
 
@@ -30,8 +55,9 @@ enum InputEvent: Equatable {
 /// POINTER (down/up/move): [1B action][4B x Float32 BE][4B y Float32 BE][1B button]      -- 10 bytes
 /// POINTER (scroll):       [1B action][4B x Float32 BE][4B y Float32 BE][4B scrollDx][4B scrollDy]
 ///                                                                          Float32 BE   -- 17 bytes
-/// KEY:     [4B keyCode BE][1B action]
+/// KEY:     [4B keyCode BE][1B action][1B modifiers]                                       -- 6 bytes
 /// TEXT:    UTF-8 bytes directly
+/// GESTURE: [1B action]                                                                     -- 1 byte
 ///
 /// KVM Mouse V2 phase 1 backward compatibility: the original Mouse v1 payload was exactly 9 bytes
 /// ([1B action][4B x][4B y], no button/scroll tail at all). `decode` below still accepts that legacy
@@ -42,6 +68,11 @@ enum InputEvent: Equatable {
 /// already tolerant of a payload longer than 9 bytes (`>=`, never `==`), so appending fields is
 /// forward-compatible by construction, and reading them optionally, gated on payload length, is
 /// backward-compatible with any peer still sending the plain 9-byte v1 shape.
+///
+/// BRIDGEY KVM KEYBOARD V1 backward compatibility: the original KEY payload was exactly 5 bytes (no
+/// modifiers byte at all). `decode` still accepts that legacy 5-byte shape, defaulting modifiers to 0
+/// (no modifiers held) - exactly the same `>=` floor + optional-trailing-byte pattern as POINTER's
+/// button/scroll extension above.
 enum InputEventCodec {
     static func encode(_ event: InputEvent) -> (type: Int, payload: Data) {
         switch event {
@@ -57,13 +88,16 @@ enum InputEventCodec {
                 buffer.append(UInt8(button.rawValue))
             }
             return (InputFrameType.pointer, buffer)
-        case let .key(keyCode, action):
-            var buffer = Data(capacity: 5)
+        case let .key(keyCode, action, modifiers):
+            var buffer = Data(capacity: 6)
             buffer.appendBigEndian(UInt32(bitPattern: keyCode))
             buffer.append(UInt8(action.rawValue))
+            buffer.append(modifiers)
             return (InputFrameType.key, buffer)
         case let .text(text):
             return (InputFrameType.text, Data(text.utf8))
+        case let .gesture(action):
+            return (InputFrameType.gesture, Data([UInt8(action.rawValue)]))
         }
     }
 
@@ -93,9 +127,14 @@ enum InputEventCodec {
             var offset = payload.startIndex
             let keyCode = Int32(bitPattern: payload.readBigEndianUInt32(at: &offset))
             guard let action = KeyAction(rawValue: Int(payload[offset])) else { return nil }
-            return .key(keyCode: keyCode, action: action)
+            offset += 1
+            let modifiers: UInt8 = payload.count >= 6 ? payload[offset] : 0
+            return .key(keyCode: keyCode, action: action, modifiers: modifiers)
         case InputFrameType.text:
             return .text(String(decoding: payload, as: UTF8.self))
+        case InputFrameType.gesture:
+            guard payload.count >= 1, let action = GestureAction(rawValue: Int(payload[payload.startIndex])) else { return nil }
+            return .gesture(action: action)
         default:
             return nil
         }

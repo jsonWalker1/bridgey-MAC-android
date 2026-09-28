@@ -24,7 +24,9 @@ enum InputFrameType {
     static let key = 17
     static let text = 18
     // 19 = CONTROLLER, reserved, unused in M1.
-    static let all: Set<Int> = [pointer, key, text]
+    /// BRIDGEY KVM TOUCHPAD GESTURES V1.
+    static let gesture = 20
+    static let all: Set<Int> = [pointer, key, text, gesture]
 }
 
 struct FrameHeader {

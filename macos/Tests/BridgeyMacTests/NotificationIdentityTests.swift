@@ -40,4 +40,32 @@ final class NotificationIdentityTests: XCTestCase {
         XCTAssertNotEqual(first, remoteNotificationIconFileName(packageName: "org.example", data: Data([2])))
         XCTAssertTrue(first.hasSuffix(".png"))
     }
+
+    // BRIDGEY NOTIFICATION++ SOUND POLISH
+
+    func testAudibleNotificationWithNoPriorHistoryPlaysSound() {
+        XCTAssertTrue(shouldPlayNotificationSound(hasSound: true, timestamp: 1000, lastPlayedTimestamp: nil))
+    }
+
+    func testSilentNotificationNeverPlaysSoundRegardlessOfHistory() {
+        XCTAssertFalse(shouldPlayNotificationSound(hasSound: false, timestamp: 1000, lastPlayedTimestamp: nil))
+        XCTAssertFalse(shouldPlayNotificationSound(hasSound: false, timestamp: 2000, lastPlayedTimestamp: 1000))
+    }
+
+    func testMissingHasSoundFieldDefaultsToAudibleForBackwardCompatibility() {
+        XCTAssertTrue(shouldPlayNotificationSound(hasSound: nil, timestamp: 1000, lastPlayedTimestamp: nil))
+    }
+
+    func testReplayOfTheSameTimestampDoesNotReplaySound() {
+        // Covers both resync-on-reconnect and rapid duplicate posts of the same message.
+        XCTAssertFalse(shouldPlayNotificationSound(hasSound: true, timestamp: 1000, lastPlayedTimestamp: 1000))
+    }
+
+    func testGenuinelyNewerMessageInAnAlreadyDeliveredConversationStillPlaysSound() {
+        XCTAssertTrue(shouldPlayNotificationSound(hasSound: true, timestamp: 2000, lastPlayedTimestamp: 1000))
+    }
+
+    func testOutOfOrderOrStaleTimestampDoesNotReplaySound() {
+        XCTAssertFalse(shouldPlayNotificationSound(hasSound: true, timestamp: 999, lastPlayedTimestamp: 1000))
+    }
 }

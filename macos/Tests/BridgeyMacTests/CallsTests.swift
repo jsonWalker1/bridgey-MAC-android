@@ -107,4 +107,42 @@ final class CallsTests: XCTestCase {
         XCTAssertEqual(telecomCall.source, .telecom)
         XCTAssertEqual(notificationCall.source, .notification)
     }
+
+    // MARK: - Call Continuity: audio route selection
+
+    func testNilRouteIsValidMeaningNoRouteChangeRequested() {
+        XCTAssertTrue(isValidAudioRoute(nil))
+    }
+
+    func testKnownRoutesAreValid() {
+        XCTAssertTrue(isValidAudioRoute("EARPIECE"))
+        XCTAssertTrue(isValidAudioRoute("SPEAKER"))
+        XCTAssertTrue(isValidAudioRoute("BLUETOOTH"))
+    }
+
+    func testUnknownOrMalformedRouteIsRejected() {
+        XCTAssertFalse(isValidAudioRoute("earpiece"))
+        XCTAssertFalse(isValidAudioRoute("GALAXY_BUDS"))
+        XCTAssertFalse(isValidAudioRoute(""))
+    }
+
+    func testAudioRouteLabelsUseAGenericBluetoothLabelWhenNoDeviceNameIsReported() {
+        XCTAssertEqual(audioRouteLabel("EARPIECE", bluetoothName: nil), "📱 Phone")
+        XCTAssertEqual(audioRouteLabel("SPEAKER", bluetoothName: nil), "🔊 Speaker")
+        XCTAssertEqual(audioRouteLabel("BLUETOOTH", bluetoothName: nil), "🎧 Bluetooth")
+    }
+
+    func testAudioRouteLabelUsesTheReportedBluetoothDeviceNameWhenAvailable() {
+        XCTAssertEqual(audioRouteLabel("BLUETOOTH", bluetoothName: "Galaxy Buds"), "🎧 Galaxy Buds")
+    }
+
+    func testRemoteCallStatusDefaultsToNoAudioRoutesForBackwardCompatibility() {
+        let call = RemoteCallStatus(
+            notificationID: "call-id", deviceID: "device", applicationName: "Phone",
+            caller: "+15550100", detail: "", type: "incoming",
+            actions: telecomCallActions(for: "ringing"), source: .telecom
+        )
+        XCTAssertEqual(call.availableAudioRoutes, [])
+        XCTAssertNil(call.bluetoothRouteName)
+    }
 }

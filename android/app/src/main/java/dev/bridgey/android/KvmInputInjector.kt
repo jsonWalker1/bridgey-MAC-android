@@ -92,6 +92,7 @@ internal class KvmInputInjector(private val context: Context, videoChannel: Vide
             is InputEvent.Pointer -> handlePointer(event)
             is InputEvent.Key -> handleKey(event)
             is InputEvent.Text -> handleText(event)
+            is InputEvent.Gesture -> handleGesture(event)
         }
     }
 
@@ -101,7 +102,18 @@ internal class KvmInputInjector(private val context: Context, videoChannel: Vide
             Log.w(TAG, "KEY event received but Bridgey's KVM Keyboard is not the active input method")
             return
         }
-        mainHandler.post { service.injectKey(key.keyCode, key.action) }
+        mainHandler.post { service.injectKey(key.keyCode, key.action, key.modifiers) }
+    }
+
+    /** BRIDGEY KVM TOUCHPAD GESTURES V1. */
+    private fun handleGesture(gesture: InputEvent.Gesture) {
+        val service = BridgeyAccessibilityService.instance
+        if (service == null) {
+            Log.w(TAG, "GESTURE ${gesture.action} received but Bridgey's Accessibility Service is not " +
+                "enabled - enable it in Settings > Accessibility to allow input injection")
+            return
+        }
+        mainHandler.post { service.handleGesture(gesture.action) }
     }
 
     private fun handleText(text: InputEvent.Text) {

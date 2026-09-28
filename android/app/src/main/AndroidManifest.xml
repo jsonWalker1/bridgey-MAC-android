@@ -1,7 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Lets DiscoveryController register a ConnectivityManager network callback so it can restart
+         mDNS discovery immediately when Wi-Fi reconnects, instead of waiting on the plain reconnect
+         backoff. Without this, registerNetworkCallback throws SecurityException, is caught and only
+         logged ("could not register network callback"), and that recovery path silently never runs. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- BRIDGEY VIDEO REGRESSION WAKELOCK EXPERIMENT (2026-09-24): lets ScreenCaptureManager hold a
+         SCREEN_DIM_WAKE_LOCK for the duration of an active Screen Share session, testing the
+         hypothesis that the phone's screen timing out/locking during an idle session destabilizes
+         the pairing TCP connection. Normal (non-dangerous) permission, no runtime prompt. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- BRIDGEY KVM KEYBOARD V1 (switch shortcut): lets KvmKeyboardSwitcher write
+         Settings.Secure.DEFAULT_INPUT_METHOD directly (the same mechanism `adb shell ime set` uses) so
+         the Mac's Command+K shortcut can toggle the active keyboard with no manual Settings trip. A
+         signature/system permission - not grantable through the normal install flow or app Settings
+         UI - the user grants it once via `adb shell pm grant dev.bridgey.android
+         android.permission.WRITE_SECURE_SETTINGS`. Without it granted, KvmKeyboardSwitcher falls back
+         to the standard system keyboard picker (one tap) instead of failing silently. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
@@ -21,6 +41,11 @@
          requestRemoteScreenShare) actually bypass DND for the Remote Start notification channel -
          the same standard mechanism alarm/call apps use, not a hidden or forced bypass. -->
     <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+    <!-- BRIDGEY SMB POC (feasibility spike only, see SmbPocServer.kt) - lets SmbPocService run as a
+         foreground service so the embedded SMB server survives backgrounding, same requirement as
+         BridgeyConnectionService/ScreenCaptureService elsewhere in this app. DELETE alongside the
+         Smb*.kt files and the <activity>/<service> entries below to remove the POC entirely. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-feature android:name="android.hardware.telephony" android:required="false" />
     <!-- Part 3 KVM: BIND_ACCESSIBILITY_SERVICE needs no <uses-permission> declaration here (it is
          declared on the <service> below); the service only becomes active once the user explicitly
@@ -139,6 +164,18 @@
         <!-- Part 3 KVM POC #2 keyboard-injection test. Requires the user to explicitly enable and
              switch to this keyboard under Settings > System > Languages & input > Manage keyboards -
              the same standard mechanism any third-party keyboard app uses. -->
+        <!-- BRIDGEY SMB POC (feasibility spike only, see SmbPocServer.kt's doc comment). Launch via
+             `adb shell am start -n dev.bridgey.android/.SmbPocActivity` - never linked from any
+             production UI. Delete this activity + the service below + the three Smb*.kt files to
+             remove the POC entirely. -->
+        <activity
+            android:name=".SmbPocActivity"
+            android:exported="true"
+            android:label="Bridgey SMB POC" />
+        <service
+            android:name=".SmbPocService"
+            android:exported="true"
+            android:foregroundServiceType="dataSync" />
         <service
             android:name=".BridgeyInputMethodService"
             android:exported="false"
