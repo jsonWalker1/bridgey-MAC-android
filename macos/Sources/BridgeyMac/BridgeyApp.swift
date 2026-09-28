@@ -1,4 +1,5 @@
 import AppKit
+import Foundation
 import SwiftUI
 
 @main
@@ -52,12 +53,16 @@ private struct BridgeyPanel: View {
     @ObservedObject var pairing: PairingCoordinator
     @ObservedObject var settings: BridgeySettings
     let onOpenSettings: () -> Void
+    @State private var showingDeviceDetails = false
 
     var body: some View {
         MenuBarPanelSurface {
             panelContent
         }
         .onAppear { pairing.refreshNotificationAuthorization() }
+        .onChange(of: isConnected) { connected in
+            if !connected { showingDeviceDetails = false }
+        }
     }
 
     private var panelContent: some View {
@@ -81,7 +86,8 @@ private struct BridgeyPanel: View {
                 welcomeCard
             } else {
                 switch pairing.state {
-                case let .connected(_, name): connectedCard(name: name)
+                case let .connected(_, name):
+                    if showingDeviceDetails { deviceDetailsView(name: name) } else { connectedCard(name: name) }
                 case let .connecting(name): statusCard(title: "Connecting to \(name)", detail: "Establishing a secure session…", progress: true)
                 case let .verification(name, code): verificationCard(name: name, code: code)
                 case let .failed(message): failureCard(message)
@@ -149,8 +155,26 @@ private struct BridgeyPanel: View {
                             Text("Waiting for battery status…").font(.caption).foregroundStyle(.secondary)
                         }
                     }
+                    if pairing.isFeatureAvailable(.telemetry) {
+                        if let storage = pairing.remoteStorage {
+                            let freeBytes = max(storage.totalBytes - storage.usedBytes, 0)
+                            Label(
+                                "\(formattedByteCount(freeBytes)) free",
+                                systemImage: "internaldrive"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        } else {
+                            Text("Waiting for storage status…").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                 }
                 Spacer()
+                Button { showingDeviceDetails = true } label: {
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Device details")
                 Button { pairing.dismiss() } label: { Image(systemName: "xmark.circle.fill") }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
@@ -320,6 +344,41 @@ private struct BridgeyPanel: View {
         .background(.background.opacity(0.8), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .accessibilityLabel(title)
         .accessibilityHint("Runs the \(title.lowercased()) action for the connected device")
+    }
+
+    @ViewBuilder
+    private func deviceDetailsView(name: String) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Button { showingDeviceDetails = false } label: {
+                    Image(systemName: "chevron.left").font(.caption)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                Text(name).font(.headline).lineLimit(1)
+                Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Storage").font(.subheadline.weight(.semibold))
+                if !pairing.isFeatureAvailable(.telemetry) {
+                    Text("Not available").font(.caption).foregroundStyle(.secondary)
+                } else if let storage = pairing.remoteStorage {
+                    ProgressView(value: Double(storage.usedBytes), total: Double(max(storage.totalBytes, 1)))
+                    Text("\(formattedByteCount(storage.usedBytes)) used of \(formattedByteCount(storage.totalBytes))")
+                        .font(.caption)
+                    Text("\(formattedByteCount(max(storage.totalBytes - storage.usedBytes, 0))) available")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Waiting for storage status…").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func formattedByteCount(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
     @ViewBuilder

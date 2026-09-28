@@ -98,6 +98,8 @@ data class TrustedDevice(val id: String, val name: String)
 
 data class RemoteBatteryStatus(val level: Int, val isCharging: Boolean)
 
+data class RemoteStorageStatus(val usedBytes: Long, val totalBytes: Long)
+
 class PairingCoordinator(
     context: Context,
     private val localDeviceId: String,
@@ -151,6 +153,9 @@ class PairingCoordinator(
     val macRinging: StateFlow<Boolean> = mutableMacRinging.asStateFlow()
     private val mutableRemoteBattery = MutableStateFlow<RemoteBatteryStatus?>(null)
     val remoteBattery: StateFlow<RemoteBatteryStatus?> = mutableRemoteBattery.asStateFlow()
+    private val mutableRemoteStorage = MutableStateFlow<RemoteStorageStatus?>(null)
+    val remoteStorage: StateFlow<RemoteStorageStatus?> = mutableRemoteStorage.asStateFlow()
+    private var lastSentStorage: LocalStorageStatus? = null
     private val mutablePingStatus = MutableStateFlow<String?>(null)
     val pingStatus: StateFlow<String?> = mutablePingStatus.asStateFlow()
     private var pendingPingId: String? = null
@@ -246,15 +251,26 @@ class PairingCoordinator(
             settings.state.collect {
                 if (!featureEnabled(BridgeyFeature.CLIPBOARD)) mutableClipboardStatus.value = null
                 if (!featureEnabled(BridgeyFeature.BATTERY)) mutableRemoteBattery.value = null
+                if (!featureEnabled(BridgeyFeature.TELEMETRY)) mutableRemoteStorage.value = null
                 if (!featureEnabled(BridgeyFeature.PING)) clearPingStatus()
                 quickActions.policyChanged()
                 mediaRemote.policyChanged()
                 sendFeatureState()
+                publishLocalStorage(force = true)
             }
         }
         scope.launch {
             mutableState.collect { state ->
                 if (state is PairingState.Connected) acquireConnectionLocksIfNeeded() else releaseConnectionLocksIfNeeded()
+            }
+        }
+        // Storage changes slowly (unlike battery, there's no OS broadcast to react to), so this is
+        // a plain low-frequency poll rather than a new per-session job - it simply no-ops via
+        // publishLocalStorage's own connected/feature/change-detection guards while disconnected.
+        scope.launch {
+            while (true) {
+                delay(STORAGE_TELEMETRY_INTERVAL_MILLIS)
+                publishLocalStorage()
             }
         }
     }
@@ -318,6 +334,8 @@ class PairingCoordinator(
         stopPhoneRinging()
         mutableMacRinging.value = false
         mutableRemoteBattery.value = null
+        mutableRemoteStorage.value = null
+        lastSentStorage = null
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
@@ -336,6 +354,8 @@ class PairingCoordinator(
         stopPhoneRinging()
         mutableMacRinging.value = false
         mutableRemoteBattery.value = null
+        mutableRemoteStorage.value = null
+        lastSentStorage = null
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
@@ -484,6 +504,47 @@ class PairingCoordinator(
                 )
             ) {
                 android.util.Log.i("Bridgey", "PLUGIN battery sent level=$level charging=$isCharging")
+            }
+        }
+    }
+
+    /** Mirrors [sendBattery]'s shape, but self-contained (no OS broadcast triggers storage checks)
+     *  and change-gated by [STORAGE_CHANGE_THRESHOLD_BYTES] rather than exact equality, since raw
+     *  byte counts churn constantly from routine cache/temp-file activity. */
+    fun publishLocalStorage(force: Boolean = false) {
+        if (!isFeatureAvailable(BridgeyFeature.TELEMETRY)) return
+        val connectedSession = session ?: return
+        if (mutableState.value !is PairingState.Connected) return
+        val status = currentAndroidStorageStatus(appContext) ?: return
+        val previous = lastSentStorage
+        if (!force && previous != null &&
+            status.totalBytes == previous.totalBytes &&
+            kotlin.math.abs(status.usedBytes - previous.usedBytes) < STORAGE_CHANGE_THRESHOLD_BYTES
+        ) {
+            return
+        }
+        scope.launch {
+            if (session !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
+            val pairingKey = connectedSession.pairingKey ?: return@launch
+            val payload = JSONObject()
+                .put("version", 1)
+                .put("storageUsedBytes", status.usedBytes)
+                .put("storageTotalBytes", status.totalBytes)
+                .toString()
+                .toByteArray()
+            val encrypted = Crypto.encrypt(pairingKey, payload)
+            if (connectedSession.send(
+                    Message(
+                        kind = "telemetry.update",
+                        sessionId = connectedSession.id,
+                        messageId = UUID.randomUUID().toString(),
+                        nonce = encrypted.nonce,
+                        ciphertext = encrypted.ciphertext,
+                    ),
+                )
+            ) {
+                lastSentStorage = status
+                android.util.Log.i("Bridgey", "PLUGIN storage sent usedBytes=${status.usedBytes} totalBytes=${status.totalBytes}")
             }
         }
     }
@@ -1173,6 +1234,8 @@ class PairingCoordinator(
         current.initiatedLocally = initiatedLocally
         session = current
         mutableRemoteBattery.value = null
+        mutableRemoteStorage.value = null
+        lastSentStorage = null
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
@@ -1241,6 +1304,8 @@ class PairingCoordinator(
             stopPhoneRinging()
             mutableMacRinging.value = false
             mutableRemoteBattery.value = null
+            mutableRemoteStorage.value = null
+            lastSentStorage = null
             clearPingStatus()
             quickActions.reset()
             mediaRemote.reset()
@@ -1367,6 +1432,7 @@ class PairingCoordinator(
                 }
             }
             "battery.update" -> receiveBattery(current, message)
+            "telemetry.update" -> receiveStorageTelemetry(current, message)
             "files.accept" -> message.transferId?.let { pendingFileAccepts.remove(it)?.complete(true) }
             "files.complete.ack" -> message.transferId?.let { pendingFileCompletions.remove(it)?.complete(true) }
             "files.offer" -> {
@@ -1830,6 +1896,7 @@ class PairingCoordinator(
             diagnostics.record("pairing", "connected")
             sendFeatureState()
             mediaRemote.sendFreshState()
+            publishLocalStorage(force = true)
             // BRIDGEY NOTIFICATION++ POC: same "resync fresh state on reconnect" pattern as
             // mediaRemote.sendFreshState() above - see BridgeyNotificationListenerService's
             // resyncActiveNotifications() doc comment.
@@ -1888,6 +1955,7 @@ class PairingCoordinator(
         mediaRemote.policyChanged()
         if (received[BridgeyFeature.CLIPBOARD] == false) mutableClipboardStatus.value = null
         if (received[BridgeyFeature.BATTERY] == false) mutableRemoteBattery.value = null
+        if (received[BridgeyFeature.TELEMETRY] == false) mutableRemoteStorage.value = null
         if (received[BridgeyFeature.PING] == false) clearPingStatus()
         if (received[BridgeyFeature.FIND_DEVICE] == false) {
             stopPhoneRinging()
@@ -1913,12 +1981,33 @@ class PairingCoordinator(
         android.util.Log.i("Bridgey", "PLUGIN battery received level=$level")
     }
 
+    private fun receiveStorageTelemetry(current: Session, message: Message) {
+        if (!featureEnabled(BridgeyFeature.TELEMETRY, current)) return
+        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        val messageId = message.messageId ?: return
+        if (!current.acceptMessageId(messageId)) return
+        val plaintext = Crypto.decrypt(
+            current.pairingKey!!,
+            message.nonce ?: return fail("Invalid encrypted storage status"),
+            message.ciphertext ?: return fail("Invalid encrypted storage status"),
+        ) ?: return fail("Invalid encrypted storage status")
+        val payload = runCatching { JSONObject(plaintext.toString(Charsets.UTF_8)) }.getOrNull()
+            ?: return fail("Invalid storage status")
+        val usedBytes = payload.optLong("storageUsedBytes", -1)
+        val totalBytes = payload.optLong("storageTotalBytes", -1)
+        if (usedBytes < 0 || totalBytes <= 0 || usedBytes > totalBytes) return fail("Invalid storage status")
+        mutableRemoteStorage.value = RemoteStorageStatus(usedBytes, totalBytes)
+        android.util.Log.i("Bridgey", "PLUGIN storage received usedBytes=$usedBytes totalBytes=$totalBytes")
+    }
+
     private fun fail(message: String) {
         android.util.Log.w("Bridgey", "PAIRING failed: $message (state was ${mutableState.value})")
         session?.close()
         session = null
         cancelIncomingFiles()
         mutableRemoteBattery.value = null
+        mutableRemoteStorage.value = null
+        lastSentStorage = null
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
@@ -1982,6 +2071,8 @@ class PairingCoordinator(
         const val MAX_FILE_SIZE = 10L * 1024 * 1024 * 1024
         const val MAX_NOTIFICATION_ICON_BASE64_LENGTH = 28 * 1024
         const val HEARTBEAT_INTERVAL_MILLIS = 10_000L
+        const val STORAGE_TELEMETRY_INTERVAL_MILLIS = 60_000L
+        const val STORAGE_CHANGE_THRESHOLD_BYTES = 100L * 1024 * 1024
     }
 
     private class Session(private val socket: Socket) {

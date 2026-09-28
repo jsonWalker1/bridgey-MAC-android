@@ -30,6 +30,7 @@ class BridgeySettingsTest {
         assertFalse(featureEnabledByLegacyPeer(BridgeyFeature.CALLS))
         assertFalse(featureEnabledByLegacyPeer(BridgeyFeature.PING))
         assertFalse(featureEnabledByLegacyPeer(BridgeyFeature.REMOTE_SCREEN_SHARE))
+        assertFalse(featureEnabledByLegacyPeer(BridgeyFeature.TELEMETRY))
         assertTrue(featureEnabledByLegacyPeer(BridgeyFeature.BATTERY))
     }
 }

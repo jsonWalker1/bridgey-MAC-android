@@ -21,6 +21,11 @@ struct RemoteBatteryStatus: Equatable {
     let isCharging: Bool
 }
 
+struct RemoteStorageStatus: Equatable {
+    let usedBytes: Int64
+    let totalBytes: Int64
+}
+
 // RemoteCallAction / RemoteCallStatus / CallRequestPayload live in Calls.swift.
 
 struct FileTransferRow: Identifiable, Equatable {
@@ -56,6 +61,12 @@ struct TrustedDeviceInfo: Identifiable, Equatable {
 private struct BatteryPayload: Codable {
     let level: Int
     let isCharging: Bool
+}
+
+private struct StoragePayload: Codable {
+    let version: Int
+    let storageUsedBytes: Int64
+    let storageTotalBytes: Int64
 }
 
 struct RemoteNotificationPayload: Codable {
@@ -167,6 +178,7 @@ final class PairingCoordinator: ObservableObject {
     @Published private(set) var trustedDeviceIDs: Set<String>
     @Published private(set) var clipboardStatus: String? = nil
     @Published private(set) var remoteBattery: RemoteBatteryStatus? = nil
+    @Published private(set) var remoteStorage: RemoteStorageStatus? = nil
     @Published private(set) var notificationsAuthorized = false
     @Published private(set) var notificationPermissionDetermined = false
     @Published private(set) var fileTransferStatus: String? = nil
@@ -258,6 +270,7 @@ final class PairingCoordinator: ObservableObject {
     private var cancelledTransferIDs = Set<String>()
     private var findDeviceSound: NSSound?
     private var lastSentBattery: LocalBatteryStatus?
+    private var lastSentStorage: LocalStorageStatus?
     private let diagnostics = BridgeyDiagnostics()
     private let notificationHistoryStore: NotificationHistoryStore
 
@@ -344,6 +357,7 @@ final class PairingCoordinator: ObservableObject {
                 DispatchQueue.main.async {
                     guard let self else { return }
                     if !self.featureEnabled(.battery) { self.remoteBattery = nil }
+                    if !self.featureEnabled(.telemetry) { self.remoteStorage = nil }
                     if !self.featureEnabled(.ping) { self.clearPingStatus() }
                     if !self.isFeatureAvailable(.links) { self.quickActions.reset() }
                     self.mediaController.reset()
@@ -364,6 +378,7 @@ final class PairingCoordinator: ObservableObject {
                     self.sendFeatureState()
                     self.mediaController.refresh()
                     self.publishLocalBattery(force: true)
+                    self.publishLocalStorage(force: true)
                 }
             }
     }
@@ -439,6 +454,7 @@ final class PairingCoordinator: ObservableObject {
         session?.close()
         session = current
         remoteBattery = nil
+        remoteStorage = nil
         clearPingStatus()
         quickActions.reset()
         mediaController.reset()
@@ -446,6 +462,7 @@ final class PairingCoordinator: ObservableObject {
         videoChannel.reset()
         screenStreamDecoder.reset()
         lastSentBattery = nil
+        lastSentStorage = nil
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
         clearRemoteCall()
@@ -509,6 +526,7 @@ final class PairingCoordinator: ObservableObject {
         videoChannel.reset()
         screenStreamDecoder.reset()
         lastSentBattery = nil
+        lastSentStorage = nil
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
         state = .idle
@@ -526,6 +544,7 @@ final class PairingCoordinator: ObservableObject {
         stopMacSound()
         androidRinging = false
         remoteBattery = nil
+        remoteStorage = nil
         clearRemoteCall()
         clearPendingCall()
         clearCallStatus()
@@ -537,6 +556,7 @@ final class PairingCoordinator: ObservableObject {
         videoChannel.reset()
         screenStreamDecoder.reset()
         lastSentBattery = nil
+        lastSentStorage = nil
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
         state = .idle
@@ -932,6 +952,39 @@ final class PairingCoordinator: ObservableObject {
             ciphertext: encrypted.ciphertext
         ))
         NSLog("PLUGIN battery sent level=%d charging=%@", status.level, String(status.isCharging))
+    }
+
+    /// 100 MiB dead-band, matching Android's `STORAGE_CHANGE_THRESHOLD_BYTES` - raw byte counts
+    /// churn constantly from routine cache/log activity, so exact-equality (as battery uses) would
+    /// resend on every heartbeat tick instead of only on a real, meaningful change.
+    private static let storageChangeThresholdBytes: Int64 = 100 * 1024 * 1024
+
+    private func shouldResendStorage(_ status: LocalStorageStatus, previous: LocalStorageStatus?) -> Bool {
+        guard let previous else { return true }
+        return status.totalBytes != previous.totalBytes ||
+            abs(status.usedBytes - previous.usedBytes) >= Self.storageChangeThresholdBytes
+    }
+
+    private func publishLocalStorage(force: Bool = false) {
+        guard isFeatureAvailable(.telemetry),
+              let current = session, case .connected = state,
+              let status = currentMacStorageStatus(),
+              force || shouldResendStorage(status, previous: lastSentStorage),
+              let plaintext = try? JSONEncoder().encode(StoragePayload(
+                version: 1,
+                storageUsedBytes: status.usedBytes,
+                storageTotalBytes: status.totalBytes
+              )),
+              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
+        lastSentStorage = status
+        current.send(PairingMessage(
+            kind: "telemetry.update",
+            sessionId: current.id,
+            messageId: UUID().uuidString.lowercased(),
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext
+        ))
+        NSLog("PLUGIN storage sent usedBytes=%lld totalBytes=%lld", status.usedBytes, status.totalBytes)
     }
 
     func findAndroid() {
@@ -1372,6 +1425,7 @@ final class PairingCoordinator: ObservableObject {
         current.initiatedLocally = false
         session = current
         remoteBattery = nil
+        remoteStorage = nil
         clearPingStatus()
         quickActions.reset()
         mediaController.reset()
@@ -1379,6 +1433,7 @@ final class PairingCoordinator: ObservableObject {
         videoChannel.reset()
         screenStreamDecoder.reset()
         lastSentBattery = nil
+        lastSentStorage = nil
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
         clearRemoteCall()
@@ -1412,6 +1467,7 @@ final class PairingCoordinator: ObservableObject {
             if case .connected = self.state { wasConnected = true } else { wasConnected = false }
             self.session = nil
             self.remoteBattery = nil
+            self.remoteStorage = nil
             self.clearPingStatus()
             self.quickActions.reset()
             self.mediaController.reset()
@@ -1419,6 +1475,7 @@ final class PairingCoordinator: ObservableObject {
             self.videoChannel.reset()
             self.screenStreamDecoder.reset()
             self.lastSentBattery = nil
+            self.lastSentStorage = nil
             self.clearRemoteCall()
             self.remoteFeatures = defaultRemoteFeatureState()
             self.remoteFeatureStateReceived = false
@@ -1560,6 +1617,7 @@ final class PairingCoordinator: ObservableObject {
                 screenStreamDecoder.reset()
                 mediaController.refresh()
                 if remoteFeatures[.battery] == false { remoteBattery = nil }
+                if remoteFeatures[.telemetry] == false { remoteStorage = nil }
                 if remoteFeatures[.ping] == false { clearPingStatus() }
                 if remoteFeatures[.clipboard] == false { clearClipboardSendStatus() }
                 if remoteFeatures[.notifications] == false { clearRemoteCall() }
@@ -1574,6 +1632,7 @@ final class PairingCoordinator: ObservableObject {
                 }
                 flushPendingCallIfPossible()
                 publishLocalBattery(force: true)
+                publishLocalStorage(force: true)
             case "screenshare.remoteStartResult":
                 NSLog("REMOTE_START result from Android: %@", message.status ?? "unknown")
             case "ping.request":
@@ -1663,6 +1722,23 @@ final class PairingCoordinator: ObservableObject {
                 }
                 remoteBattery = RemoteBatteryStatus(level: payload.level, isCharging: payload.isCharging)
                 NSLog("PLUGIN battery received level=%d charging=%@", payload.level, String(payload.isCharging))
+            case "telemetry.update":
+                guard featureEnabled(.telemetry, current: current) else { return }
+                guard case .connected = state,
+                      message.sessionId == current.id,
+                      let messageID = message.messageId,
+                      current.acceptMessageID(messageID),
+                      let nonce = message.nonce,
+                      let ciphertext = message.ciphertext,
+                      let plaintext = try? decrypt(nonce: nonce, ciphertext: ciphertext, key: current.pairingKey!),
+                      let payload = try? JSONDecoder().decode(StoragePayload.self, from: plaintext),
+                      payload.storageTotalBytes > 0,
+                      payload.storageUsedBytes >= 0,
+                      payload.storageUsedBytes <= payload.storageTotalBytes else {
+                    throw PairingError.invalidMessage
+                }
+                remoteStorage = RemoteStorageStatus(usedBytes: payload.storageUsedBytes, totalBytes: payload.storageTotalBytes)
+                NSLog("PLUGIN storage received usedBytes=%lld totalBytes=%lld", payload.storageUsedBytes, payload.storageTotalBytes)
             case "notifications.post":
                 guard featureEnabled(.notifications, current: current) else { return }
                 guard case .connected = state,
@@ -1996,6 +2072,7 @@ final class PairingCoordinator: ObservableObject {
             }
             sendFeatureState()
             publishLocalBattery(force: true)
+            publishLocalStorage(force: true)
             scheduleHeartbeat(for: current)
             NSLog("PAIRING verified peer=%@", current.peerName)
         }
@@ -2169,6 +2246,7 @@ final class PairingCoordinator: ObservableObject {
                 messageId: UUID().uuidString.lowercased()
             ))
             self.publishLocalBattery()
+            self.publishLocalStorage()
             self.mediaController.refresh()
             self.scheduleHeartbeat(for: current)
         }

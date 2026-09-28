@@ -3,6 +3,7 @@ package dev.bridgey.android
 import android.Manifest
 import android.app.NotificationManager
 import android.content.ClipData
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
@@ -30,7 +31,12 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import android.text.format.Formatter
+import androidx.compose.foundation.clickable
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -461,6 +467,7 @@ private fun BridgeyApp(
     val phoneRinging by pairing.phoneRinging.collectAsStateWithLifecycle()
     val macRinging by pairing.macRinging.collectAsStateWithLifecycle()
     val remoteBattery by pairing.remoteBattery.collectAsStateWithLifecycle()
+    val remoteStorage by pairing.remoteStorage.collectAsStateWithLifecycle()
     val pingStatus by pairing.pingStatus.collectAsStateWithLifecycle()
     val trustedDevices by pairing.trustedDevices.collectAsStateWithLifecycle()
     val remoteFeatures by pairing.remoteFeatures.collectAsStateWithLifecycle()
@@ -547,6 +554,7 @@ private fun BridgeyApp(
                 phoneRinging = phoneRinging,
                 macRinging = macRinging,
                 remoteBattery = remoteBattery,
+                remoteStorage = remoteStorage,
                 pingStatus = pingStatus,
                 enabledFeatures = BridgeyFeature.entries.associateWith { feature ->
                     settings.isEnabled(feature, (pairingState as? PairingState.Connected)?.deviceId) &&
@@ -1022,6 +1030,7 @@ private fun DeviceScreen(
     phoneRinging: Boolean,
     macRinging: Boolean,
     remoteBattery: RemoteBatteryStatus?,
+    remoteStorage: RemoteStorageStatus?,
     pingStatus: String?,
     enabledFeatures: Map<BridgeyFeature, Boolean>,
     pairing: PairingCoordinator,
@@ -1052,6 +1061,8 @@ private fun DeviceScreen(
                     phoneRinging = phoneRinging,
                     macRinging = macRinging,
                     remoteBattery = remoteBattery,
+                    remoteStorage = remoteStorage,
+                    telemetryEnabled = enabledFeatures[BridgeyFeature.TELEMETRY] != false,
                     pingStatus = pingStatus,
                     clipboardEnabled = enabledFeatures[BridgeyFeature.CLIPBOARD] != false,
                     filesEnabled = enabledFeatures[BridgeyFeature.FILES] != false,
@@ -1160,6 +1171,7 @@ private fun DeviceScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ConnectedDeviceCard(
     name: String,
@@ -1167,6 +1179,8 @@ private fun ConnectedDeviceCard(
     phoneRinging: Boolean,
     macRinging: Boolean,
     remoteBattery: RemoteBatteryStatus?,
+    remoteStorage: RemoteStorageStatus?,
+    telemetryEnabled: Boolean,
     pingStatus: String?,
     clipboardEnabled: Boolean,
     filesEnabled: Boolean,
@@ -1178,13 +1192,19 @@ private fun ConnectedDeviceCard(
     onStopRing: () -> Unit,
     onPing: () -> Unit,
 ) {
+    var showingStorageDetails by remember { mutableStateOf(false) }
+    val context = LocalContext.current
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
         shape = RoundedCornerShape(28.dp),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.clickable { showingStorageDetails = true },
+            ) {
                 Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.primary, modifier = Modifier.size(52.dp)) {
                     Box(contentAlignment = Alignment.Center) { Text("⌘", color = MaterialTheme.colorScheme.onPrimary, style = MaterialTheme.typography.headlineSmall) }
                 }
@@ -1201,7 +1221,24 @@ private fun ConnectedDeviceCard(
                             color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f),
                         )
                     }
+                    if (telemetryEnabled) {
+                        if (remoteStorage != null) {
+                            val freeBytes = (remoteStorage.totalBytes - remoteStorage.usedBytes).coerceAtLeast(0)
+                            Text(
+                                "▣ ${formattedByteCount(context, freeBytes)} free",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f),
+                            )
+                        } else {
+                            Text(
+                                "Waiting for storage status…",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f),
+                            )
+                        }
+                    }
                 }
+                Text("›", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f))
             }
             if (clipboardEnabled || filesEnabled) Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 if (clipboardEnabled) QuickAction("Clipboard", "Copy", Modifier.weight(1f), onClipboard)
@@ -1227,7 +1264,36 @@ private fun ConnectedDeviceCard(
             pingStatus?.let { Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f)) }
         }
     }
+    if (showingStorageDetails) {
+        ModalBottomSheet(onDismissRequest = { showingStorageDetails = false }) {
+            Column(Modifier.padding(horizontal = 20.dp, vertical = 8.dp).padding(bottom = 24.dp)) {
+                Text("Storage", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(12.dp))
+                when {
+                    !telemetryEnabled -> Text("Not available", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    remoteStorage != null -> {
+                        val used = remoteStorage.usedBytes.toFloat()
+                        val total = remoteStorage.totalBytes.coerceAtLeast(1).toFloat()
+                        LinearProgressIndicator(progress = { (used / total).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "${formattedByteCount(context, remoteStorage.usedBytes)} used of ${formattedByteCount(context, remoteStorage.totalBytes)}",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Text(
+                            "${formattedByteCount(context, (remoteStorage.totalBytes - remoteStorage.usedBytes).coerceAtLeast(0))} available",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    else -> Text("Waiting for storage status…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+    }
 }
+
+private fun formattedByteCount(context: Context, bytes: Long): String = Formatter.formatShortFileSize(context, bytes)
 
 @Composable
 private fun QuickAction(title: String, subtitle: String, modifier: Modifier, action: () -> Unit) {

@@ -93,10 +93,11 @@ optional details. Error text must not disclose secrets.
 The current native clients also exchange an authenticated, encrypted
 `features.update` message after pairing and whenever local policy changes. Its
 version 1 payload contains a complete boolean map for `clipboard`, `files`,
-`notifications`, `battery`, `find_device`, `ping`, `calls`, `links`, and `media`. A UI action is
+`notifications`, `battery`, `find_device`, `ping`, `calls`, `links`, `media`, and (0.7+) `telemetry`.
+A UI action is
 available only when both peers report the corresponding feature as enabled. Clients
 predating this message are treated as enabling the original v1 features for
-compatibility; the later `calls`, `ping`, `links`, and `media` features are disabled unless a peer
+compatibility; the later `calls`, `ping`, `links`, `media`, and `telemetry` features are disabled unless a peer
 advertises them explicitly.
 
 ## Pairing flow
@@ -230,6 +231,37 @@ while the heartbeat is active:
 `level` is an integer from 0 through 100. Receivers reject out-of-range or
 malformed values. Battery updates contain no device identifier because the
 authenticated session already binds them to the paired sender.
+
+### Device telemetry (`telemetry.update`) — storage slice only
+
+Gated by the separate `telemetry` feature (not `battery`). Either peer sends
+`telemetry.update` once a secure session is established and again whenever its
+storage usage changes by a meaningful amount (Android checks on the existing
+storage-poll cadence; macOS checks on the existing ten-second heartbeat tick,
+the same cadence `battery.update` already uses). Android reads its primary
+internal storage via `StatFs`; macOS reads its data volume via
+`URLResourceValues`. This is the first message in a small telemetry family —
+RAM is expected to reuse the same `telemetry` feature flag and message kind
+family in a later change; CPU utilization is explicitly out of scope for now
+and, per product decision, may never be sent as a reliable cross-platform
+metric.
+
+```json
+{
+  "version": 1,
+  "storageUsedBytes": 512000000000,
+  "storageTotalBytes": 1000000000000
+}
+```
+
+`storageUsedBytes`/`storageTotalBytes` are non-negative integers in bytes.
+`storageTotalBytes` must be greater than zero and `storageUsedBytes` must not
+exceed it; receivers reject malformed or out-of-range values the same way
+`battery.update` does (closing the session, matching this transport's existing
+per-message validation convention). Available/free space is intentionally not
+sent on the wire — it is a UI-layer computation (`total - used`) — to keep this
+first telemetry payload minimal. Telemetry updates contain no device
+identifier, for the same reason battery updates don't.
 
 ### Clipboard (`clipboard.v1`)
 

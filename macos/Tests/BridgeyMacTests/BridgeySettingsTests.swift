@@ -25,6 +25,7 @@ final class BridgeySettingsTests: XCTestCase {
         XCTAssertFalse(featureEnabledByLegacyPeer(.ping))
         XCTAssertFalse(featureEnabledByLegacyPeer(.photoSync))
         XCTAssertFalse(featureEnabledByLegacyPeer(.remoteScreenShare))
+        XCTAssertFalse(featureEnabledByLegacyPeer(.telemetry))
         XCTAssertTrue(featureEnabledByLegacyPeer(.battery))
     }
 
