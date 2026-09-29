@@ -1184,6 +1184,8 @@ class PairingCoordinator(
         stopPhoneRinging()
         mutableMacRinging.value = false
         mutableRemoteBattery.value = null
+        mutableRemoteStorage.value = null
+        lastSentStorage = null
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
