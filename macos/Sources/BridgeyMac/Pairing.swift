@@ -26,6 +26,11 @@ struct RemoteStorageStatus: Equatable {
     let totalBytes: Int64
 }
 
+struct RemoteMemoryStatus: Equatable {
+    let usedBytes: Int64
+    let totalBytes: Int64
+}
+
 // RemoteCallAction / RemoteCallStatus / CallRequestPayload live in Calls.swift.
 
 struct FileTransferRow: Identifiable, Equatable {
@@ -63,10 +68,26 @@ private struct BatteryPayload: Codable {
     let isCharging: Bool
 }
 
-private struct StoragePayload: Codable {
+private struct TelemetryPayload: Codable {
     let version: Int
-    let storageUsedBytes: Int64
-    let storageTotalBytes: Int64
+    let storageUsedBytes: Int64?
+    let storageTotalBytes: Int64?
+    let memoryUsedBytes: Int64?
+    let memoryTotalBytes: Int64?
+
+    init(
+        version: Int,
+        storageUsedBytes: Int64? = nil,
+        storageTotalBytes: Int64? = nil,
+        memoryUsedBytes: Int64? = nil,
+        memoryTotalBytes: Int64? = nil
+    ) {
+        self.version = version
+        self.storageUsedBytes = storageUsedBytes
+        self.storageTotalBytes = storageTotalBytes
+        self.memoryUsedBytes = memoryUsedBytes
+        self.memoryTotalBytes = memoryTotalBytes
+    }
 }
 
 struct RemoteNotificationPayload: Codable {
@@ -179,6 +200,7 @@ final class PairingCoordinator: ObservableObject {
     @Published private(set) var clipboardStatus: String? = nil
     @Published private(set) var remoteBattery: RemoteBatteryStatus? = nil
     @Published private(set) var remoteStorage: RemoteStorageStatus? = nil
+    @Published private(set) var remoteMemory: RemoteMemoryStatus? = nil
     @Published private(set) var notificationsAuthorized = false
     @Published private(set) var notificationPermissionDetermined = false
     @Published private(set) var fileTransferStatus: String? = nil
@@ -271,6 +293,7 @@ final class PairingCoordinator: ObservableObject {
     private var findDeviceSound: NSSound?
     private var lastSentBattery: LocalBatteryStatus?
     private var lastSentStorage: LocalStorageStatus?
+    private var lastSentMemory: LocalMemoryStatus?
     private let diagnostics = BridgeyDiagnostics()
     private let notificationHistoryStore: NotificationHistoryStore
 
@@ -357,7 +380,10 @@ final class PairingCoordinator: ObservableObject {
                 DispatchQueue.main.async {
                     guard let self else { return }
                     if !self.featureEnabled(.battery) { self.remoteBattery = nil }
-                    if !self.featureEnabled(.telemetry) { self.remoteStorage = nil }
+                    if !self.featureEnabled(.telemetry) {
+                        self.remoteStorage = nil
+                        self.resetRemoteMemoryState()
+                    }
                     if !self.featureEnabled(.ping) { self.clearPingStatus() }
                     if !self.isFeatureAvailable(.links) { self.quickActions.reset() }
                     self.mediaController.reset()
@@ -379,6 +405,7 @@ final class PairingCoordinator: ObservableObject {
                     self.mediaController.refresh()
                     self.publishLocalBattery(force: true)
                     self.publishLocalStorage(force: true)
+                    self.publishLocalMemory(force: true)
                 }
             }
     }
@@ -455,6 +482,7 @@ final class PairingCoordinator: ObservableObject {
         session = current
         remoteBattery = nil
         remoteStorage = nil
+        resetRemoteMemoryState()
         clearPingStatus()
         quickActions.reset()
         mediaController.reset()
@@ -527,6 +555,7 @@ final class PairingCoordinator: ObservableObject {
         screenStreamDecoder.reset()
         lastSentBattery = nil
         lastSentStorage = nil
+        resetRemoteMemoryState()
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
         state = .idle
@@ -557,6 +586,7 @@ final class PairingCoordinator: ObservableObject {
         screenStreamDecoder.reset()
         lastSentBattery = nil
         lastSentStorage = nil
+        resetRemoteMemoryState()
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
         state = .idle
@@ -970,7 +1000,7 @@ final class PairingCoordinator: ObservableObject {
               let current = session, case .connected = state,
               let status = currentMacStorageStatus(),
               force || shouldResendStorage(status, previous: lastSentStorage),
-              let plaintext = try? JSONEncoder().encode(StoragePayload(
+              let plaintext = try? JSONEncoder().encode(TelemetryPayload(
                 version: 1,
                 storageUsedBytes: status.usedBytes,
                 storageTotalBytes: status.totalBytes
@@ -985,6 +1015,43 @@ final class PairingCoordinator: ObservableObject {
             ciphertext: encrypted.ciphertext
         ))
         NSLog("PLUGIN storage sent usedBytes=%lld totalBytes=%lld", status.usedBytes, status.totalBytes)
+    }
+
+    private func resetRemoteMemoryState() {
+        remoteMemory = nil
+        lastSentMemory = nil
+    }
+
+    private static let memoryChangeThresholdBytes: Int64 = 100 * 1024 * 1024
+
+    private func shouldResendMemory(_ status: LocalMemoryStatus, previous: LocalMemoryStatus?) -> Bool {
+        guard let previous else { return true }
+        return status.totalBytes != previous.totalBytes ||
+            abs(status.usedBytes - previous.usedBytes) >= Self.memoryChangeThresholdBytes
+    }
+
+    /// Mirrors [publishLocalStorage]'s shape and cadence exactly - same background heartbeat call
+    /// site, same dead-band principle - just a second independent metric on the same message kind.
+    private func publishLocalMemory(force: Bool = false) {
+        guard isFeatureAvailable(.telemetry),
+              let current = session, case .connected = state,
+              let status = currentMacMemoryStatus(),
+              force || shouldResendMemory(status, previous: lastSentMemory),
+              let plaintext = try? JSONEncoder().encode(TelemetryPayload(
+                version: 1,
+                memoryUsedBytes: status.usedBytes,
+                memoryTotalBytes: status.totalBytes
+              )),
+              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
+        lastSentMemory = status
+        current.send(PairingMessage(
+            kind: "telemetry.update",
+            sessionId: current.id,
+            messageId: UUID().uuidString.lowercased(),
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext
+        ))
+        NSLog("PLUGIN memory sent usedBytes=%lld totalBytes=%lld", status.usedBytes, status.totalBytes)
     }
 
     func findAndroid() {
@@ -1426,6 +1493,7 @@ final class PairingCoordinator: ObservableObject {
         session = current
         remoteBattery = nil
         remoteStorage = nil
+        resetRemoteMemoryState()
         clearPingStatus()
         quickActions.reset()
         mediaController.reset()
@@ -1476,6 +1544,7 @@ final class PairingCoordinator: ObservableObject {
             self.screenStreamDecoder.reset()
             self.lastSentBattery = nil
             self.lastSentStorage = nil
+            self.resetRemoteMemoryState()
             self.clearRemoteCall()
             self.remoteFeatures = defaultRemoteFeatureState()
             self.remoteFeatureStateReceived = false
@@ -1617,7 +1686,10 @@ final class PairingCoordinator: ObservableObject {
                 screenStreamDecoder.reset()
                 mediaController.refresh()
                 if remoteFeatures[.battery] == false { remoteBattery = nil }
-                if remoteFeatures[.telemetry] == false { remoteStorage = nil }
+                if remoteFeatures[.telemetry] == false {
+                    remoteStorage = nil
+                    remoteMemory = nil
+                }
                 if remoteFeatures[.ping] == false { clearPingStatus() }
                 if remoteFeatures[.clipboard] == false { clearClipboardSendStatus() }
                 if remoteFeatures[.notifications] == false { clearRemoteCall() }
@@ -1633,6 +1705,7 @@ final class PairingCoordinator: ObservableObject {
                 flushPendingCallIfPossible()
                 publishLocalBattery(force: true)
                 publishLocalStorage(force: true)
+                publishLocalMemory(force: true)
             case "screenshare.remoteStartResult":
                 NSLog("REMOTE_START result from Android: %@", message.status ?? "unknown")
             case "ping.request":
@@ -1731,14 +1804,19 @@ final class PairingCoordinator: ObservableObject {
                       let nonce = message.nonce,
                       let ciphertext = message.ciphertext,
                       let plaintext = try? decrypt(nonce: nonce, ciphertext: ciphertext, key: current.pairingKey!),
-                      let payload = try? JSONDecoder().decode(StoragePayload.self, from: plaintext),
-                      payload.storageTotalBytes > 0,
-                      payload.storageUsedBytes >= 0,
-                      payload.storageUsedBytes <= payload.storageTotalBytes else {
+                      let payload = try? JSONDecoder().decode(TelemetryPayload.self, from: plaintext) else {
                     throw PairingError.invalidMessage
                 }
-                remoteStorage = RemoteStorageStatus(usedBytes: payload.storageUsedBytes, totalBytes: payload.storageTotalBytes)
-                NSLog("PLUGIN storage received usedBytes=%lld totalBytes=%lld", payload.storageUsedBytes, payload.storageTotalBytes)
+                if let used = payload.storageUsedBytes, let total = payload.storageTotalBytes {
+                    guard total > 0, used >= 0, used <= total else { throw PairingError.invalidMessage }
+                    remoteStorage = RemoteStorageStatus(usedBytes: used, totalBytes: total)
+                    NSLog("PLUGIN storage received usedBytes=%lld totalBytes=%lld", used, total)
+                }
+                if let used = payload.memoryUsedBytes, let total = payload.memoryTotalBytes {
+                    guard total > 0, used >= 0, used <= total else { throw PairingError.invalidMessage }
+                    remoteMemory = RemoteMemoryStatus(usedBytes: used, totalBytes: total)
+                    NSLog("PLUGIN memory received usedBytes=%lld totalBytes=%lld", used, total)
+                }
             case "notifications.post":
                 guard featureEnabled(.notifications, current: current) else { return }
                 guard case .connected = state,
@@ -2073,6 +2151,7 @@ final class PairingCoordinator: ObservableObject {
             sendFeatureState()
             publishLocalBattery(force: true)
             publishLocalStorage(force: true)
+            publishLocalMemory(force: true)
             scheduleHeartbeat(for: current)
             NSLog("PAIRING verified peer=%@", current.peerName)
         }
@@ -2247,6 +2326,7 @@ final class PairingCoordinator: ObservableObject {
             ))
             self.publishLocalBattery()
             self.publishLocalStorage()
+            self.publishLocalMemory()
             self.mediaController.refresh()
             self.scheduleHeartbeat(for: current)
         }

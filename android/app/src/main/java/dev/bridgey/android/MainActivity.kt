@@ -468,6 +468,7 @@ private fun BridgeyApp(
     val macRinging by pairing.macRinging.collectAsStateWithLifecycle()
     val remoteBattery by pairing.remoteBattery.collectAsStateWithLifecycle()
     val remoteStorage by pairing.remoteStorage.collectAsStateWithLifecycle()
+    val remoteMemory by pairing.remoteMemory.collectAsStateWithLifecycle()
     val pingStatus by pairing.pingStatus.collectAsStateWithLifecycle()
     val trustedDevices by pairing.trustedDevices.collectAsStateWithLifecycle()
     val remoteFeatures by pairing.remoteFeatures.collectAsStateWithLifecycle()
@@ -555,6 +556,7 @@ private fun BridgeyApp(
                 macRinging = macRinging,
                 remoteBattery = remoteBattery,
                 remoteStorage = remoteStorage,
+                remoteMemory = remoteMemory,
                 pingStatus = pingStatus,
                 enabledFeatures = BridgeyFeature.entries.associateWith { feature ->
                     settings.isEnabled(feature, (pairingState as? PairingState.Connected)?.deviceId) &&
@@ -1031,6 +1033,7 @@ private fun DeviceScreen(
     macRinging: Boolean,
     remoteBattery: RemoteBatteryStatus?,
     remoteStorage: RemoteStorageStatus?,
+    remoteMemory: RemoteMemoryStatus?,
     pingStatus: String?,
     enabledFeatures: Map<BridgeyFeature, Boolean>,
     pairing: PairingCoordinator,
@@ -1062,6 +1065,7 @@ private fun DeviceScreen(
                     macRinging = macRinging,
                     remoteBattery = remoteBattery,
                     remoteStorage = remoteStorage,
+                    remoteMemory = remoteMemory,
                     telemetryEnabled = enabledFeatures[BridgeyFeature.TELEMETRY] != false,
                     pingStatus = pingStatus,
                     clipboardEnabled = enabledFeatures[BridgeyFeature.CLIPBOARD] != false,
@@ -1180,6 +1184,7 @@ private fun ConnectedDeviceCard(
     macRinging: Boolean,
     remoteBattery: RemoteBatteryStatus?,
     remoteStorage: RemoteStorageStatus?,
+    remoteMemory: RemoteMemoryStatus?,
     telemetryEnabled: Boolean,
     pingStatus: String?,
     clipboardEnabled: Boolean,
@@ -1236,6 +1241,14 @@ private fun ConnectedDeviceCard(
                                 color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f),
                             )
                         }
+                        if (remoteMemory != null) {
+                            val freeBytes = (remoteMemory.totalBytes - remoteMemory.usedBytes).coerceAtLeast(0)
+                            Text(
+                                "🧠 ${formattedByteCount(context, freeBytes)} free",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f),
+                            )
+                        }
                     }
                 }
                 Text("›", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f))
@@ -1287,6 +1300,28 @@ private fun ConnectedDeviceCard(
                         )
                     }
                     else -> Text("Waiting for storage status…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Spacer(Modifier.height(20.dp))
+                Text("Memory", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(12.dp))
+                when {
+                    !telemetryEnabled -> Text("Not available", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    remoteMemory != null -> {
+                        val used = remoteMemory.usedBytes.toFloat()
+                        val total = remoteMemory.totalBytes.coerceAtLeast(1).toFloat()
+                        LinearProgressIndicator(progress = { (used / total).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "${formattedByteCount(context, remoteMemory.usedBytes)} used of ${formattedByteCount(context, remoteMemory.totalBytes)}",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Text(
+                            "${formattedByteCount(context, (remoteMemory.totalBytes - remoteMemory.usedBytes).coerceAtLeast(0))} free",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    else -> Text("Waiting for memory status…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }

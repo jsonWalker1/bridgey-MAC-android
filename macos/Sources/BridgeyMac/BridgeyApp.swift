@@ -167,6 +167,12 @@ private struct BridgeyPanel: View {
                         } else {
                             Text("Waiting for storage status…").font(.caption).foregroundStyle(.secondary)
                         }
+                        if let memory = pairing.remoteMemory {
+                            let freeBytes = max(memory.totalBytes - memory.usedBytes, 0)
+                            Text("🧠 \(formattedByteCount(freeBytes)) free")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
                 Spacer()
@@ -372,6 +378,22 @@ private struct BridgeyPanel: View {
                         .foregroundStyle(.secondary)
                 } else {
                     Text("Waiting for storage status…").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Memory").font(.subheadline.weight(.semibold))
+                if !pairing.isFeatureAvailable(.telemetry) {
+                    Text("Not available").font(.caption).foregroundStyle(.secondary)
+                } else if let memory = pairing.remoteMemory {
+                    ProgressView(value: Double(memory.usedBytes), total: Double(max(memory.totalBytes, 1)))
+                    Text("\(formattedByteCount(memory.usedBytes)) used of \(formattedByteCount(memory.totalBytes))")
+                        .font(.caption)
+                    Text("\(formattedByteCount(max(memory.totalBytes - memory.usedBytes, 0))) free")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Waiting for memory status…").font(.caption).foregroundStyle(.secondary)
                 }
             }
         }

@@ -84,6 +84,31 @@ as part of unrelated Bridgey work — that project lives outside this
 repository (`~/projekty/localAI`) and changes to it are out of scope
 here unless explicitly requested.
 
+### Workflow: use it proactively, not just when asked
+
+Before starting non-trivial feature work in this repo:
+
+1. **Health-check first.** Send one cheap `delegate_to_coworker` call
+   before relying on it for a whole task. If it's unreachable, say so
+   immediately and fall back to direct `Read`/`Grep` — don't discover the
+   outage mid-task after several failed calls have already burned turns.
+2. **Delegate subsystem mapping before reading source yourself.** For any
+   feature touching an existing subsystem (e.g. "extend telemetry",
+   "modify pairing lifecycle"), open with a `delegate_to_coworker` call
+   (`explain_architecture` or `find_related_files`) asking it to map the
+   exact functions/line ranges/message flow you'll need — then read only
+   those specific ranges yourself. Don't manually grep-and-read your way
+   through a whole file when this would answer it in one call.
+3. **Use `review_code` as a cheap post-edit sanity pass** after a batch of
+   related edits (e.g. "did every lifecycle-reset site get the new field
+   added"), before you consider the change done. It's a first-pass check,
+   not a substitute for your own review of anything that actually matters
+   (security, correctness of the core logic, concurrency).
+
+Its output is still a smaller model's first-pass draft — always verify
+before acting on a claim that matters. This workflow makes it the default
+first move for research/mapping, not an afterthought.
+
 ---
 
 ## Constraints on this team setup
