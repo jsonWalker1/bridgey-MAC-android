@@ -41,6 +41,17 @@ final class NotificationIdentityTests: XCTestCase {
         XCTAssertTrue(first.hasSuffix(".png"))
     }
 
+    /// UNUserNotificationCenter moves an attachment file on add(), so concurrent posts of the same
+    /// app's icon must never share one file ("Failed to move attachment file into data store").
+    func testEveryPostGetsItsOwnIconAttachmentFileName() {
+        let shared = remoteNotificationIconFileName(packageName: "org.example", data: Data([1]))
+        let a = remoteNotificationIconFileName(packageName: "org.example", data: Data([1]), uniqueSuffix: UUID().uuidString)
+        let b = remoteNotificationIconFileName(packageName: "org.example", data: Data([1]), uniqueSuffix: UUID().uuidString)
+        XCTAssertNotEqual(a, b)
+        XCTAssertTrue(a.hasPrefix(String(shared.dropLast(4))))
+        XCTAssertTrue(a.hasSuffix(".png") && b.hasSuffix(".png"))
+    }
+
     // BRIDGEY NOTIFICATION++ SOUND POLISH
 
     func testAudibleNotificationWithNoPriorHistoryPlaysSound() {

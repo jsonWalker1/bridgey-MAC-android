@@ -59,6 +59,20 @@ moved since. Everything below was added here:
   `CONTROL_INCALL_EXPERIENCE`, a `signature|privileged` permission no
   sideloaded app can hold — documented in `docs/architecture.md` and kept as
   a tested-but-currently-unused wire format for a future default-dialer path.
+- **Notification++ state sync** — notifications are now synchronized as
+  state, not only as events. What is gone from the phone disappears from the
+  Mac, including after a Clear All with dozens of notifications, a network
+  drop, a phone or Mac restart, or Bridgey being restarted in the
+  background: Android sends an authoritative `notifications.sync` snapshot at
+  every lifecycle boundary and re-posts current notifications silently (no
+  banner storm on reconnect). WhatsApp messages keep collapsing into one Mac
+  notification per conversation. In the other direction, dismissing one
+  notification on the Mac dismisses it on the phone as before, and the native
+  macOS Notification Center "Clear" of the Bridgey stack now also clears the
+  matching phone notifications (`notifications.dismissMany`), with no extra UI.
+  Turning notification forwarding off clears the mirrored notifications.
+  Hardware-validated on a Samsung Galaxy S23 Ultra + MacBook; see
+  `BRIDGEY_NOTIFICATIONS_STATE.md`.
 - Android now restarts its connection service automatically after a device
   reboot (`BootCompletedReceiver.kt`), if Bridgey was already enabled.
 

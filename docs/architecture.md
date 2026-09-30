@@ -120,6 +120,25 @@ with a 1 second base and 60 second cap, and resets after 30 seconds of stability
   and authenticated action tokens invoke the platform Answer, Decline, and
   Hang Up operations. Without it, Bridgey forwards only actions supplied by
   the phone application.
+- **Notification state (Notification++):** Android's active notification set
+  is the source of truth; macOS mirrors it as state, not just as a stream of
+  events. `notifications.post`/`.remove`/`.dismiss`/`.action` stay the fast
+  path. `notifications.sync` is the authoritative repair path: on every
+  connect/reconnect, listener re-bind, feature re-enable and once after an
+  Android Clear All, Android re-posts its eligible notifications silently
+  (`resync: true`) and sends the complete ID set, and macOS removes any
+  delivered notification of that device that is not in it. One pure
+  eligibility/identity function decides what is forwarded for posts, re-bind
+  and snapshots alike; a logical notification (a WhatsApp conversation, keyed
+  by `shortcutId`) may be backed by several Android notifications and lives
+  until the last one is gone. macOS reports no event when the user clears the
+  whole Bridgey stack in Notification Center, so macOS infers that from its
+  delivered list (N > 0 to 0 on two consecutive heartbeat checks, never within
+  60 seconds of a session start, post or permission change, and never counting
+  removals Bridgey made itself) and sends `notifications.dismissMany`. macOS
+  keeps at most 100 delivered notifications per app and silently evicts the
+  oldest; that never empties the list, so it is never mistaken for a clear.
+  Details, measurements and limits: `BRIDGEY_NOTIFICATIONS_STATE.md`.
 - **Incoming calls, rejected approach (0.7):** a 0.7 prototype tried making a
   non-UI companion `InCallService` (`IN_CALL_SERVICE_UI=false`) the primary
   incoming-call signal, so Bridgey would get real Telecom `Call` state,

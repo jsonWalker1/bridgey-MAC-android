@@ -28,6 +28,9 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
     private val pendingCallPosts = mutableMapOf<String, Runnable>()
     private val forwardedNotificationIds = mutableSetOf<String>()
     private val remoteDismissTracker = RemoteDismissTracker()
+    // elapsedRealtime of the last notifications.post actually sent per logical id - lets a macOS
+    // Clear All skip content the Mac cannot have seen yet (see dismissFromMacClearAll).
+    private val lastForwardedAtMillis = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private val callsController = CallsController(
         context = this,
         isCallIntegrationEnabled = { (application as BridgeyApplication).settings.state.value.directCallsEnabled },
@@ -48,14 +51,18 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
     override fun onListenerConnected() {
         super.onListenerConnected()
         activeService = java.lang.ref.WeakReference(this)
-        activeNotifications.orEmpty()
-            .filterNot { it.packageName == packageName }
-            .forEach { forwardedNotifications.record(notificationToken(it.key), it.key, it.packageName) }
         callsController.updateTelephonyCallback(callStateListener)
         android.util.Log.i("Bridgey", "PLUGIN notification listener connected")
+        // BRIDGEY NOTIFICATION++ RECONCILIATION: the registry and forwarded set are in-memory, so
+        // after any (re)bind they are rebuilt from the real active set with the same identity the
+        // post path uses - never raw sbn.key (audit L2/L3). If pairing reached Connected before this
+        // bind, its resync request found no listener; reconciling here unconditionally covers that
+        // ordering too (every send below is a safe no-op while disconnected).
+        reconcile(repost = true, reason = "listener_bound")
     }
 
     override fun onListenerDisconnected() {
+        mainHandler.removeCallbacks(cancelAllReconciliation)
         callsController.unregisterTelephonyCallback()
         if (activeService?.get() === this) activeService = null
         super.onListenerDisconnected()
@@ -66,40 +73,76 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
         if (sbn.packageName != packageName) logNotificationDiagnostics("POST", sbn)
         val bridgey = application as BridgeyApplication
         if (!bridgey.isPrimaryUser || !bridgey.isBridgeyEnabled || sbn.packageName == packageName) return
+        forward(sbn, rankingMap, resync = false)
+    }
 
+    /** Builds the pure eligibility input for [eligibleNotificationId] from a live notification. */
+    private fun eligibilityInput(sbn: StatusBarNotification, rankingMap: RankingMap?): NotificationEligibilityInput {
         val notification = sbn.notification
-        if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
-        val isCall = notification.category == Notification.CATEGORY_CALL
-        if (shouldIgnoreOngoingNotification(notification.flags, notification.category)) return
-        if (notification.visibility == Notification.VISIBILITY_SECRET) return
-
         val ranking = Ranking()
-        val hasRanking = rankingMap.getRanking(sbn.key, ranking)
-        if (hasRanking && ranking.importance <= NotificationManager.IMPORTANCE_MIN) return
-        val hasSound = notificationIsAudible(
-            channelImportance = ranking.channel?.importance?.takeIf { hasRanking },
-            channelHasSound = ranking.channel?.sound != null,
+        val hasRanking = rankingMap?.getRanking(sbn.key, ranking) == true
+        return NotificationEligibilityInput(
+            systemKey = sbn.key,
+            packageName = sbn.packageName,
+            flags = notification.flags,
+            category = notification.category,
+            visibility = notification.visibility,
+            rankingImportance = if (hasRanking) ranking.importance else null,
+            title = notification.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty(),
+            text = notification.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty(),
+            shortcutId = notification.shortcutId,
         )
+    }
 
-        val title = notification.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
-        val text = notification.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty()
-        if (title.isEmpty() && text.isEmpty()) return
+    private fun eligibleNotificationId(input: NotificationEligibilityInput): String? {
+        val bridgey = application as BridgeyApplication
+        return eligibleNotificationId(
+            input,
+            ownPackageName = packageName,
+            isApplicationEnabled = bridgey.settings::isNotificationApplicationEnabled,
+            isIdleCall = { callsController.currentTelephonyCallType() == "idle" },
+        )
+    }
 
+    /**
+     * The single post path, shared by real posts, reconnect resync and reconciliation. Returns the
+     * logical notificationId when [sbn] is eligible (and was recorded/forwarded), or `null` when it
+     * is not - in which case this system key no longer backs any Mac notification, so it is
+     * forgotten exactly like a removal (covers a previously forwarded notification that became
+     * ineligible, e.g. a call once telephony is idle).
+     */
+    private fun forward(sbn: StatusBarNotification, rankingMap: RankingMap?, resync: Boolean): String? {
+        val bridgey = application as BridgeyApplication
+        val input = eligibilityInput(sbn, rankingMap)
         val applicationName = runCatching {
             val info = packageManager.getApplicationInfo(sbn.packageName, 0)
             packageManager.getApplicationLabel(info).toString()
         }.getOrDefault(sbn.packageName)
-        bridgey.settings.observeNotificationApplication(sbn.packageName, applicationName)
-        if (!bridgey.settings.isNotificationApplicationEnabled(sbn.packageName)) return
-        val applicationIcon = applicationIcon(sbn.packageName)
-
-        val telephonyCallType = if (isCall) callsController.currentTelephonyCallType() else null
-        if (telephonyCallType == "idle") {
-            removeForwardedCall(sbn.key)
-            return
+        // The per-app filter list must keep offering apps the user disabled, so apps are observed
+        // before the app filter applies - exactly where the pre-extraction code observed them.
+        if (eligibleNotificationId(input, packageName, isApplicationEnabled = { true }) != null) {
+            bridgey.settings.observeNotificationApplication(sbn.packageName, applicationName)
         }
-        val notificationId = notificationToken(notificationIdentitySeed(sbn.packageName, notification.shortcutId, sbn.key))
-        forwardedNotifications.record(notificationId, sbn.key, sbn.packageName)
+        val notificationId = eligibleNotificationId(input)
+        if (notificationId == null) {
+            forgetSystemKey(sbn.key)
+            return null
+        }
+
+        val notification = sbn.notification
+        val isCall = notification.category == Notification.CATEGORY_CALL
+        val ranking = Ranking()
+        val hasRanking = rankingMap?.getRanking(sbn.key, ranking) == true
+        val hasSound = notificationIsAudible(
+            channelImportance = ranking.channel?.importance?.takeIf { hasRanking },
+            channelHasSound = ranking.channel?.sound != null,
+        )
+        val title = input.title
+        val text = input.text
+        val applicationIcon = applicationIcon(sbn.packageName)
+        val telephonyCallType = if (isCall) callsController.currentTelephonyCallType() else null
+
+        forwardedNotifications.record(notificationId, sbn.key, sbn.packageName)?.let(::sendRemovedIfForwarded)
         pendingCallPosts.remove(notificationId)?.let(mainHandler::removeCallbacks)
         val callType = if (isCall) resolvedNotificationCallType(notification, telephonyCallType) else null
         val audioRoutes = if (isCall && callType == "incoming") callsController.availableAudioRoutes() else null
@@ -108,9 +151,9 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
             notificationId,
             notificationActionCandidates(notification, callType, callsController.canControlSystemCalls()),
         )
-        val forward = Runnable {
+        val send = Runnable {
             pendingCallPosts.remove(notificationId)
-            if (forwardedNotifications.systemKey(notificationId) != sbn.key) return@Runnable
+            if (!forwardedNotifications.contains(notificationId, sbn.key)) return@Runnable
             bridgey.pairing.sendNotification(
                 packageName = sbn.packageName,
                 applicationName = applicationName,
@@ -124,24 +167,59 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
                 hasSound = hasSound,
                 availableAudioRoutes = audioRoutes,
                 bluetoothRouteName = bluetoothRouteName,
+                resync = resync,
             )
-            forwardedNotificationIds += notificationId
-            while (forwardedNotificationIds.size > MAX_TRACKED_FORWARDED_NOTIFICATIONS) {
-                forwardedNotificationIds.remove(forwardedNotificationIds.first())
+            markForwarded(notificationId)
+            val now = android.os.SystemClock.elapsedRealtime()
+            lastForwardedAtMillis[notificationId] = now
+            if (lastForwardedAtMillis.size > MAX_TRACKED_FORWARDED_NOTIFICATIONS) {
+                lastForwardedAtMillis.entries.removeIf { now - it.value >= MAC_CLEAR_ALL_FRESHNESS_MILLIS }
             }
         }
         if (shouldDelayCallPost(callType)) {
-            pendingCallPosts[notificationId] = forward
-            mainHandler.postDelayed(forward, CALL_POST_SETTLE_DELAY_MS)
+            pendingCallPosts[notificationId] = send
+            mainHandler.postDelayed(send, CALL_POST_SETTLE_DELAY_MS)
         } else {
-            forward.run()
+            send.run()
+        }
+        return notificationId
+    }
+
+    private fun markForwarded(notificationId: String) {
+        forwardedNotificationIds.remove(notificationId)
+        forwardedNotificationIds += notificationId
+        while (forwardedNotificationIds.size > MAX_TRACKED_FORWARDED_NOTIFICATIONS) {
+            forwardedNotificationIds.remove(forwardedNotificationIds.first())
         }
     }
 
-    override fun onNotificationRemoved(sbn: StatusBarNotification) {
-        super.onNotificationRemoved(sbn)
+    // minSdk 26: the system always calls this 3-argument overload (its default implementation is what
+    // would fan out to the 1-argument one), so all removal handling lives here.
+    override fun onNotificationRemoved(sbn: StatusBarNotification, rankingMap: RankingMap, reason: Int) {
         if (sbn.packageName != packageName) logNotificationDiagnostics("REMOVE", sbn)
-        val notificationId = forwardedNotifications.removeSystemKey(sbn.key) ?: return
+        forgetSystemKey(sbn.key)
+        // BRIDGEY NOTIFICATION++ RECONCILIATION: Clear All still sends every individual remove above
+        // for immediate UX; one debounced authoritative sync then repairs anything those events
+        // could not (audit section 6). Re-armed per callback, so a 30-item Clear All = one sync.
+        if (reason == REASON_CANCEL_ALL) {
+            mainHandler.removeCallbacks(cancelAllReconciliation)
+            mainHandler.postDelayed(cancelAllReconciliation, CANCEL_ALL_SYNC_DEBOUNCE_MS)
+        }
+    }
+
+    private val cancelAllReconciliation = Runnable { reconcile(repost = false, reason = "cancel_all") }
+
+    /**
+     * Drops [systemKey] from the registry. Only when it was the LAST key backing its logical
+     * notification (e.g. the last live WhatsApp notification of a conversation) does the Mac copy go.
+     */
+    private fun forgetSystemKey(systemKey: String) {
+        val notificationId = forwardedNotifications.removeSystemKey(systemKey) ?: return
+        sendRemovedIfForwarded(notificationId)
+    }
+
+    /** [notificationId] no longer has any live Android system key behind it. */
+    private fun sendRemovedIfForwarded(notificationId: String) {
         pendingCallPosts.remove(notificationId)?.let(mainHandler::removeCallbacks)
         removeActions(notificationId)
         if (!forwardedNotificationIds.remove(notificationId)) return
@@ -152,6 +230,50 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
         val bridgey = application as BridgeyApplication
         if (!bridgey.isPrimaryUser || !bridgey.isBridgeyEnabled) return
         bridgey.pairing.sendNotificationRemoved(notificationId)
+    }
+
+    /**
+     * BRIDGEY NOTIFICATION++ RECONCILIATION: rebuilds all in-memory bookkeeping from the real
+     * active notification set (the source of truth), optionally re-posts every eligible notification
+     * as a silent `resync`, then sends the authoritative `notifications.sync` so the Mac removes
+     * whatever Android no longer has. Every send is a safe no-op while disconnected or while
+     * notification forwarding is unavailable. Runs on the main thread, like every listener callback.
+     */
+    private fun reconcile(repost: Boolean, reason: String) {
+        val bridgey = application as BridgeyApplication
+        if (!bridgey.isPrimaryUser || !bridgey.isBridgeyEnabled) return
+        // getActiveNotifications() returns null (or throws) while the listener is not bound. That
+        // means "unknown", never "empty": an empty snapshot would make the Mac remove everything.
+        // Not bound (yet) is harmless to skip - onListenerConnected reconciles once it binds.
+        val active = runCatching { activeNotifications?.toList() }.getOrNull() ?: run {
+            android.util.Log.w("Bridgey", "PLUGIN notification reconcile skipped reason=$reason: listener not bound")
+            return
+        }
+        val ranking = currentRanking
+        val previouslyForwarded = forwardedNotificationIds.toSet()
+        forwardedNotifications.clear()
+        forwardedNotificationIds.clear()
+        val snapshot = linkedSetOf<String>()
+        active.filterNot { it.packageName == packageName }.forEach { sbn ->
+            val notificationId = if (repost) {
+                forward(sbn, ranking, resync = true)
+            } else {
+                eligibleNotificationId(eligibilityInput(sbn, ranking))?.also { id ->
+                    forwardedNotifications.record(id, sbn.key, sbn.packageName)
+                    markForwarded(id)
+                }
+            }
+            if (notificationId != null) snapshot += notificationId
+        }
+        (previouslyForwarded - snapshot).forEach { staleId ->
+            pendingCallPosts.remove(staleId)?.let(mainHandler::removeCallbacks)
+            removeActions(staleId)
+        }
+        bridgey.pairing.sendNotificationSync(snapshot.toList())
+        android.util.Log.i(
+            "Bridgey",
+            "PLUGIN notification reconcile reason=$reason repost=$repost active=${active.size} synced=${snapshot.size}",
+        )
     }
 
     // BRIDGEY NOTIFICATION++ POC PHASE 2 (TEMPORARY): logs every field that could plausibly identify
@@ -197,33 +319,27 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
         }.onFailure { android.util.Log.w("Bridgey", "NOTIF_DIAG failed", it) }
     }
 
-    private fun dismissForwardedNotification(notificationId: String): Boolean {
-        val systemKey = forwardedNotifications.systemKey(notificationId) ?: return false
-        remoteDismissTracker.markPending(notificationId)
-        android.os.Handler(android.os.Looper.getMainLooper()).post { cancelNotification(systemKey) }
-        return true
+    /**
+     * BRIDGEY NOTIFICATION++ macOS CLEAR ALL: one id of a `notifications.dismissMany`. Mac only sends
+     * it after at least 60 s without any post, so an id forwarded within that window carries content
+     * the Mac cannot have seen when it evaluated the clear (e.g. a new message in the same
+     * conversation) and is kept. Otherwise it is exactly a single Mac dismiss.
+     */
+    private fun dismissFromMacClearAll(notificationId: String): MacClearAllDismissOutcome {
+        if (isTooRecentForMacClearAll(lastForwardedAtMillis[notificationId], android.os.SystemClock.elapsedRealtime())) {
+            return MacClearAllDismissOutcome.TOO_RECENT
+        }
+        return if (dismissForwardedNotification(notificationId)) MacClearAllDismissOutcome.DISMISSED else MacClearAllDismissOutcome.UNKNOWN
     }
 
-    /**
-     * BRIDGEY NOTIFICATION++ POC: re-forwards every currently active, eligible notification through
-     * the exact same [onNotificationPosted] path used for a real new post/update - called once
-     * Bridgey's pairing session (re)reaches Connected (see PairingCoordinator.completeIfConfirmed's
-     * mediaRemote.sendFreshState() for the identical existing pattern for media state). This is what
-     * makes a notification that arrived while the Mac was disconnected show up once it reconnects,
-     * instead of being silently lost forever (the previous behavior: onNotificationPosted's own
-     * sendNotification call already no-ops safely while disconnected, but nothing ever retried it).
-     *
-     * Deliberately reuses [onNotificationPosted] rather than a new resync-specific code path: the
-     * Mac side's UNNotificationRequest identifier is stable per notificationId (see
-     * remoteNotificationRequestIdentifier), so UNUserNotificationCenter.add() with that same
-     * identifier safely replaces an already-delivered banner instead of duplicating it - resyncing
-     * a notification the Mac already has is a safe no-visual-op, not a duplicate-creation risk.
-     */
-    private fun resyncActiveNotifications() {
-        val ranking = currentRanking
-        activeNotifications.orEmpty()
-            .filterNot { it.packageName == packageName }
-            .forEach { onNotificationPosted(it, ranking) }
+    /** A Mac dismiss cancels EVERY live Android notification behind the logical notification, so
+     *  a multi-notification conversation cannot survive on the phone after its Mac copy is gone. */
+    private fun dismissForwardedNotification(notificationId: String): Boolean {
+        val systemKeys = forwardedNotifications.systemKeys(notificationId)
+        if (systemKeys.isEmpty()) return false
+        remoteDismissTracker.markPending(notificationId)
+        mainHandler.post { systemKeys.forEach { cancelNotification(it) } }
+        return true
     }
 
     @Synchronized
@@ -357,23 +473,10 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
     private fun removeActiveForwardedCalls() {
         activeNotifications.orEmpty()
             .filter { it.packageName != packageName && it.notification.category == Notification.CATEGORY_CALL }
-            .forEach { removeForwardedCall(it.key) }
+            .forEach { forgetSystemKey(it.key) }
         // BRIDGEY CALL CONTINUITY: never leave the device stuck in speakerphone/Bluetooth-SCO
         // mode once the call actually ends.
         callsController.resetAudioRoute()
-    }
-
-    private fun removeForwardedCall(systemKey: String) {
-        val notificationId = forwardedNotifications.removeSystemKey(systemKey) ?: return
-        pendingCallPosts.remove(notificationId)?.let(mainHandler::removeCallbacks)
-        removeActions(notificationId)
-        val bridgey = application as BridgeyApplication
-        if (
-            forwardedNotificationIds.remove(notificationId) &&
-            bridgey.isPrimaryUser && bridgey.isBridgeyEnabled
-        ) {
-            bridgey.pairing.sendNotificationRemoved(notificationId)
-        }
     }
 
     companion object {
@@ -385,6 +488,10 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
             return service.dismissForwardedNotification(notificationId)
         }
 
+        /** `notifications.dismissMany` (macOS Clear All). `UNKNOWN` when the listener is not bound. */
+        fun dismissFromMacClearAll(notificationId: String): MacClearAllDismissOutcome =
+            activeService?.get()?.dismissFromMacClearAll(notificationId) ?: MacClearAllDismissOutcome.UNKNOWN
+
         fun perform(notificationId: String, actionToken: String, replyText: String?, route: String? = null): Boolean {
             val service = activeService?.get() ?: return false
             return service.performAction(notificationId, actionToken, replyText, route)
@@ -394,10 +501,18 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
             activeService?.get()?.applyApplicationFilter(packageName, enabled)
         }
 
-        /** BRIDGEY NOTIFICATION++ POC: called from PairingCoordinator once the pairing session
-         *  (re)reaches Connected - see [resyncActiveNotifications]'s doc comment. */
-        fun resyncOnReconnect() {
-            activeService?.get()?.mainHandler?.post { activeService?.get()?.resyncActiveNotifications() }
+        /**
+         * BRIDGEY NOTIFICATION++ RECONCILIATION: called from PairingCoordinator whenever notification
+         * forwarding becomes available on a connected session (connect, reconnect, feature re-enabled
+         * on either peer). Re-posts every eligible notification as a silent `resync` (the Mac's
+         * request identifier is stable per notificationId, so this replaces rather than duplicates)
+         * followed by the authoritative `notifications.sync`. If the listener is not bound yet,
+         * nothing is lost: [onListenerConnected] always reconciles once it binds.
+         */
+        fun requestReconciliation() {
+            activeService?.get()?.let { service ->
+                service.mainHandler.post { service.reconcile(repost = true, reason = "session") }
+            }
         }
 
         fun callPermissionsChanged() {
@@ -437,6 +552,7 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
         private const val MAX_CACHED_ICONS = 128
         private const val MAX_TRACKED_FORWARDED_NOTIFICATIONS = 512
         private const val CALL_POST_SETTLE_DELAY_MS = 450L
+        private const val CANCEL_ALL_SYNC_DEBOUNCE_MS = 500L
         private val ICON_SIZES = listOf(64, 48, 32)
     }
 }
@@ -454,36 +570,150 @@ private data class StoredNotificationAction(
     val systemCallAction: SystemCallAction?,
 )
 
+/**
+ * BRIDGEY NOTIFICATION++ RECONCILIATION: logical notificationId -> every live Android system key
+ * behind it. With conversation identity (see [notificationIdentitySeed]) several Android
+ * notifications can share one logical id; the logical notification - and its Mac copy - stays live
+ * while at least one key remains. Every operation is idempotent.
+ */
 internal class ForwardedNotificationRegistry(private val limit: Int = 512) {
-    private data class Entry(val systemKey: String, val packageName: String)
+    private class Entry(val packageName: String) {
+        val systemKeys = linkedSetOf<String>()
+    }
     private val entriesByNotificationId = linkedMapOf<String, Entry>()
+    private val notificationIdBySystemKey = mutableMapOf<String, String>()
 
+    /**
+     * Records [systemKey] as backing [notificationId]. Returns another notificationId only when this
+     * key previously backed it and was its LAST key (the key moved to a new logical identity), so
+     * the caller can remove that orphaned logical notification; otherwise `null`.
+     */
     @Synchronized
-    fun record(notificationId: String, systemKey: String, packageName: String) {
-        entriesByNotificationId.remove(notificationId)
-        entriesByNotificationId[notificationId] = Entry(systemKey, packageName)
+    fun record(notificationId: String, systemKey: String, packageName: String): String? {
+        val previousId = notificationIdBySystemKey[systemKey]
+        val orphaned = if (previousId != null && previousId != notificationId) detach(previousId, systemKey) else null
+        val entry = entriesByNotificationId.remove(notificationId) ?: Entry(packageName)
+        entry.systemKeys += systemKey
+        entriesByNotificationId[notificationId] = entry
+        notificationIdBySystemKey[systemKey] = notificationId
         while (entriesByNotificationId.size > limit) {
-            entriesByNotificationId.remove(entriesByNotificationId.keys.first())
+            val evictedId = entriesByNotificationId.keys.first()
+            entriesByNotificationId.remove(evictedId)?.systemKeys?.forEach(notificationIdBySystemKey::remove)
         }
+        return orphaned
     }
 
     @Synchronized
-    fun systemKey(notificationId: String): String? = entriesByNotificationId[notificationId]?.systemKey
+    fun contains(notificationId: String, systemKey: String): Boolean =
+        entriesByNotificationId[notificationId]?.systemKeys?.contains(systemKey) == true
 
     @Synchronized
+    fun systemKeys(notificationId: String): Set<String> = entriesByNotificationId[notificationId]?.systemKeys?.toSet().orEmpty()
+
+    /** Returns the notificationId only when [systemKey] was its last live key; `null` otherwise
+     *  (unknown key, repeated removal, or other keys still backing the logical notification). */
+    @Synchronized
     fun removeSystemKey(systemKey: String): String? {
-        val notificationId = entriesByNotificationId.entries.firstOrNull { it.value.systemKey == systemKey }?.key ?: return null
-        entriesByNotificationId.remove(notificationId)
-        return notificationId
+        val notificationId = notificationIdBySystemKey[systemKey] ?: return null
+        return detach(notificationId, systemKey)
     }
 
     @Synchronized
     fun removePackage(packageName: String): List<String> {
         val notificationIds = entriesByNotificationId.filterValues { it.packageName == packageName }.keys.toList()
-        notificationIds.forEach(entriesByNotificationId::remove)
+        notificationIds.forEach { id -> entriesByNotificationId.remove(id)?.systemKeys?.forEach(notificationIdBySystemKey::remove) }
         return notificationIds
     }
+
+    @Synchronized
+    fun clear() {
+        entriesByNotificationId.clear()
+        notificationIdBySystemKey.clear()
+    }
+
+    private fun detach(notificationId: String, systemKey: String): String? {
+        notificationIdBySystemKey.remove(systemKey)
+        val entry = entriesByNotificationId[notificationId] ?: return null
+        if (!entry.systemKeys.remove(systemKey)) return null
+        if (entry.systemKeys.isNotEmpty()) return null
+        entriesByNotificationId.remove(notificationId)
+        return notificationId
+    }
 }
+
+/**
+ * BRIDGEY NOTIFICATION++ RECONCILIATION: the Android-side facts [eligibleNotificationId] needs,
+ * extracted from a StatusBarNotification + its Ranking so the rules are testable on the JVM.
+ * [rankingImportance] is `null` when no ranking was available for the notification.
+ */
+internal data class NotificationEligibilityInput(
+    val systemKey: String,
+    val packageName: String,
+    val flags: Int,
+    val category: String?,
+    val visibility: Int,
+    val rankingImportance: Int?,
+    val title: String,
+    val text: String,
+    val shortcutId: String?,
+)
+
+/**
+ * The ONE definition of "this Android notification is mirrored to the Mac, as this logical id".
+ * Used by the live post path, listener re-bind, the reconciliation snapshot and resync alike, so
+ * those can never disagree about identity (the audit's L3 bug was exactly such a disagreement).
+ * Rules are unchanged from the pre-reconciliation onNotificationPosted: Bridgey's own package,
+ * group summaries, ongoing non-call notifications, secret visibility, IMPORTANCE_MIN or lower,
+ * empty title+text, per-app filter, and call notifications while telephony is idle are excluded.
+ */
+internal fun eligibleNotificationId(
+    input: NotificationEligibilityInput,
+    ownPackageName: String,
+    isApplicationEnabled: (String) -> Boolean,
+    isIdleCall: () -> Boolean = { false },
+): String? {
+    if (input.packageName == ownPackageName) return null
+    if (input.flags and Notification.FLAG_GROUP_SUMMARY != 0) return null
+    if (shouldIgnoreOngoingNotification(input.flags, input.category)) return null
+    if (input.visibility == Notification.VISIBILITY_SECRET) return null
+    if (input.rankingImportance != null && input.rankingImportance <= NotificationManager.IMPORTANCE_MIN) return null
+    if (input.title.isEmpty() && input.text.isEmpty()) return null
+    if (!isApplicationEnabled(input.packageName)) return null
+    if (input.category == Notification.CATEGORY_CALL && isIdleCall()) return null
+    return notificationToken(notificationIdentitySeed(input.packageName, input.shortcutId, input.systemKey))
+}
+
+/**
+ * Splits a reconciliation snapshot into `notifications.sync` parts of at most [maxPerPart] ids.
+ * Always at least one (possibly empty) part: an empty snapshot is itself the message "Android has
+ * no eligible notifications" (e.g. after Clear All).
+ */
+internal fun notificationSyncParts(notificationIds: List<String>, maxPerPart: Int = MAX_NOTIFICATION_SYNC_IDS_PER_PART): List<List<String>> =
+    if (notificationIds.isEmpty()) listOf(emptyList()) else notificationIds.chunked(maxPerPart)
+
+internal const val MAX_NOTIFICATION_SYNC_IDS_PER_PART = 256
+
+enum class MacClearAllDismissOutcome { DISMISSED, UNKNOWN, TOO_RECENT }
+
+/** Mac evaluates a Clear All only after this long without any post; see dismissFromMacClearAll. */
+internal const val MAC_CLEAR_ALL_FRESHNESS_MILLIS = 60_000L
+
+internal fun isTooRecentForMacClearAll(lastForwardedAtMillis: Long?, nowMillis: Long): Boolean =
+    lastForwardedAtMillis != null && nowMillis - lastForwardedAtMillis < MAC_CLEAR_ALL_FRESHNESS_MILLIS
+
+/**
+ * Validates a decrypted `notifications.dismissMany` payload (docs/protocol.md): version 1, reason
+ * `mac_clear_all`, 1-256 ids of 64 lowercase hex characters. `null` = invalid message.
+ */
+internal fun parseNotificationDismissManyPayload(json: String): List<String>? = runCatching {
+    val payload = org.json.JSONObject(json)
+    if (payload.optInt("version") != 1 || payload.optString("reason") != "mac_clear_all") return null
+    val array = payload.getJSONArray("notificationIds")
+    val ids = (0 until array.length()).map { array.getString(it) }
+    ids.takeIf { it.size in 1..MAX_NOTIFICATION_DISMISS_MANY_IDS && it.all { id -> id.matches(Regex("[0-9a-f]{64}")) } }
+}.getOrNull()
+
+internal const val MAX_NOTIFICATION_DISMISS_MANY_IDS = 256
 
 /**
  * BRIDGEY NOTIFICATION++ POC: tracks notificationIds whose removal was just requested BY MAC (via

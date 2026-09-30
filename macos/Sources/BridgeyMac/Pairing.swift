@@ -128,6 +128,9 @@ struct RemoteNotificationPayload: Codable {
     let hasSound: Bool?
     let availableAudioRoutes: [String]?
     let bluetoothRouteName: String?
+    /// BRIDGEY NOTIFICATION++ RECONCILIATION: `true` = a re-post of an existing notification
+    /// (reconnect/reconciliation) - replace it silently, no banner and no sound.
+    let resync: Bool?
 }
 
 struct RemoteNotificationActionPayload: Codable {
@@ -198,7 +201,12 @@ private final class NotificationPresenter: NSObject, UNUserNotificationCenterDel
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler([.banner, .sound])
+        // A reconciliation re-post only refreshes Notification Center; it must never re-alert.
+        if notification.request.content.userInfo["resync"] as? Bool == true {
+            completionHandler([.list])
+        } else {
+            completionHandler([.banner, .sound])
+        }
     }
 
     func userNotificationCenter(
@@ -303,6 +311,11 @@ final class PairingCoordinator: ObservableObject {
     // notification identity - see shouldPlayNotificationSound's doc comment for why this is keyed
     // by timestamp rather than a simple "already posted" flag.
     private var lastNotificationSoundTimestamp: [String: Int64] = [:]
+    private let notificationSyncAssembler = NotificationSyncAssembler()
+    // When each Bridgey request identifier was last (re)posted - lets a sync skip a notification
+    // posted AFTER the snapshot was applied (getDeliveredNotifications is asynchronous, so such a
+    // newer post could otherwise show up in the delivered list and be removed by an older snapshot).
+    private var notificationPostedAt: [String: Date] = [:]
     private var incomingFiles: [String: IncomingFileTransfer] = [:]
     private var incomingSyncAssets: [String: (assetKey: String, isVideo: Bool)] = [:]
     private var outgoingFiles: [String: OutgoingFileTransfer] = [:]
@@ -348,6 +361,8 @@ final class PairingCoordinator: ObservableObject {
         trustedDeviceIDs = trustRegistry.deviceIDs
         notificationPresenter.onDismiss = { [weak self] notificationID, deviceID in
             Task { @MainActor [weak self] in
+                // Already forwarded as notifications.dismiss - never include it in a Clear All.
+                self?.clearAllDetector.noteExplainedRemoval([remoteNotificationRequestIdentifier(deviceID: deviceID, notificationID: notificationID)], at: Date())
                 self?.dismissAndroidNotification(notificationID, deviceID: deviceID)
             }
         }
@@ -428,6 +443,12 @@ final class PairingCoordinator: ObservableObject {
                     self.screenStreamDecoder.reset()
                     if !self.featureEnabled(.clipboard) { self.clearClipboardSendStatus() }
                     if !self.featureEnabled(.notifications) { self.clearRemoteCall() }
+                    // BRIDGEY NOTIFICATION++ RECONCILIATION: forwarding off (globally or for one
+                    // device) = nothing mirrored from that device may stay in Notification Center.
+                    // Re-enabling needs nothing here: Android reconciles on the features.update.
+                    self.removeAllRemoteNotifications(reason: "feature_off") { [weak self] deviceID in
+                        self?.settings.isEnabled(.notifications, for: deviceID) == false
+                    }
                     if !self.featureEnabled(.calls) {
                         self.clearPendingCall()
                         self.clearCallStatus()
@@ -1854,7 +1875,11 @@ final class PairingCoordinator: ObservableObject {
                 if remoteFeatures[.temperature] == false { remoteTemperature = nil }
                 if remoteFeatures[.ping] == false { clearPingStatus() }
                 if remoteFeatures[.clipboard] == false { clearClipboardSendStatus() }
-                if remoteFeatures[.notifications] == false { clearRemoteCall() }
+                if remoteFeatures[.notifications] == false {
+                    clearRemoteCall()
+                    let peerID = current.remoteDeviceID
+                    removeAllRemoteNotifications(reason: "peer_feature_off") { $0 == peerID }
+                }
                 if remoteFeatures[.calls] == false { clearCallStatus() }
                 if remoteFeatures[.files] == false && fileTransferActive {
                     cancelFileTransfer()
@@ -2033,6 +2058,23 @@ final class PairingCoordinator: ObservableObject {
                 guard featureEnabled(.notifications, current: current),
                       let reference = try receiveNotificationReference(message, in: current) else { return }
                 removeRemoteNotification(reference.notificationId, deviceID: current.remoteDeviceID)
+            case "notifications.sync":
+                guard featureEnabled(.notifications, current: current) else { return }
+                guard case .connected = state,
+                      message.sessionId == current.id,
+                      let messageID = message.messageId,
+                      current.acceptMessageID(messageID),
+                      let nonce = message.nonce,
+                      let ciphertext = message.ciphertext,
+                      let plaintext = try? decrypt(nonce: nonce, ciphertext: ciphertext, key: current.pairingKey!),
+                      let payload = try? JSONDecoder().decode(NotificationSyncPayload.self, from: plaintext),
+                      isValidNotificationSyncPayload(payload) else {
+                    throw PairingError.invalidMessage
+                }
+                let deviceID = current.remoteDeviceID
+                if let snapshot = notificationSyncAssembler.add(payload, deviceID: deviceID) {
+                    reconcileRemoteNotifications(deviceID: deviceID, snapshot: snapshot)
+                }
             case "calls.started", "calls.confirmation_required", "calls.rejected":
                 guard message.messageId == callRequestID else { return }
                 callTimeoutWorkItem?.cancel()
@@ -2340,6 +2382,8 @@ final class PairingCoordinator: ObservableObject {
                 lastTrustedEndpoint = (host, port, current.peerName)
             }
             sendFeatureState()
+            clearAllDetector.reset() // a new session re-seeds from what is delivered after settling
+            clearAllSettlingStartedAt = Date()
             publishLocalBattery(force: true)
             if localWantsRemoteTelemetryUpdates { sendTelemetrySubscription(subscribe: true) }
             scheduleHeartbeat(for: current)
@@ -2499,6 +2543,88 @@ final class PairingCoordinator: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: timeout)
     }
 
+    // MARK: - BRIDGEY NOTIFICATION++ macOS CLEAR ALL (see NotificationClearAllDetector.swift)
+
+    private var clearAllDetector = NotificationClearAllDetector()
+    /// Start of the current settling window: new session or notification-permission change. Posts
+    /// extend it through notificationPostedAt.
+    private var clearAllSettlingStartedAt = Date.distantPast
+    private var clearAllNotificationsAuthorized: Bool?
+
+    private func checkNotificationClearAll() {
+        guard case let .connected(deviceID, _) = state, let current = session else { return }
+        let forwardingAvailable = isFeatureAvailable(.notifications) && featureEnabled(.notifications, current: current)
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { settings in
+            // Turning Bridgey notifications off in System Settings also empties Notification Center;
+            // that must never look like a user Clear All.
+            let authorized = settings.authorizationStatus == .authorized && settings.notificationCenterSetting == .enabled
+            center.getDeliveredNotifications { delivered in
+                var entries: [String: ClearAllSnapshotEntry] = [:]
+                for notification in delivered {
+                    let userInfo = notification.request.content.userInfo
+                    guard let itemDeviceID = userInfo["androidDeviceId"] as? String,
+                          let notificationID = userInfo["androidNotificationId"] as? String else { continue }
+                    entries[notification.request.identifier] = ClearAllSnapshotEntry(deviceID: itemDeviceID, notificationID: notificationID)
+                }
+                DispatchQueue.main.async { [weak self] in
+                    self?.applyNotificationClearAll(entries, deviceID: deviceID, active: forwardingAvailable, authorized: authorized)
+                }
+            }
+        }
+    }
+
+    private func applyNotificationClearAll(_ current: [String: ClearAllSnapshotEntry], deviceID: String, active: Bool, authorized: Bool) {
+        let now = Date()
+        if clearAllNotificationsAuthorized != authorized {
+            clearAllNotificationsAuthorized = authorized
+            clearAllSettlingStartedAt = now
+        }
+        let lastPost = notificationPostedAt.values.max() ?? .distantPast
+        let settling = now.timeIntervalSince(lastPost) < NotificationClearAllDetector.settlingInterval ||
+            now.timeIntervalSince(clearAllSettlingStartedAt) < NotificationClearAllDetector.settlingInterval
+        let previous = clearAllDetector.snapshot.count
+        let action = clearAllDetector.observe(current: current, active: active && authorized, settling: settling, now: now)
+        switch action {
+        case .inactive, .settling, .update:
+            break
+        case .zeroPending:
+            NSLog("PLUGIN notification clear_all zero_pending previous=%d", previous)
+        case .explained:
+            NSLog("PLUGIN notification clear_all explained_by_bridgey previous=%d", previous)
+        case .dismissMany(let entries):
+            let notificationIDs = entries.filter { $0.deviceID == deviceID }.map(\.notificationID)
+            NSLog("PLUGIN notification clear_all detected previous=%d dismissing=%d", previous, notificationIDs.count)
+            sendNotificationDismissMany(notificationIDs, deviceID: deviceID)
+        }
+    }
+
+    private func sendNotificationDismissMany(_ notificationIDs: [String], deviceID: String) {
+        guard !notificationIDs.isEmpty,
+              case let .connected(connectedDeviceID, _) = state,
+              connectedDeviceID == deviceID,
+              let current = session,
+              current.remoteDeviceID == deviceID,
+              isFeatureAvailable(.notifications),
+              featureEnabled(.notifications, current: current) else { return }
+        for part in notificationDismissManyParts(notificationIDs) {
+            guard let plaintext = try? JSONSerialization.data(withJSONObject: [
+                "version": 1,
+                "reason": "mac_clear_all",
+                "notificationIds": part,
+            ]),
+                  let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { continue }
+            current.send(PairingMessage(
+                kind: "notifications.dismissMany",
+                sessionId: current.id,
+                messageId: UUID().uuidString.lowercased(),
+                nonce: encrypted.nonce,
+                ciphertext: encrypted.ciphertext
+            ))
+        }
+        diagnostics.record(category: "notification", event: "dismiss_many_sent")
+    }
+
     private func scheduleHeartbeat(for current: Session) {
         heartbeatWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self, weak current] in
@@ -2516,6 +2642,7 @@ final class PairingCoordinator: ObservableObject {
             ))
             self.publishLocalBattery()
             self.mediaController.refresh()
+            self.checkNotificationClearAll() // piggybacks on the existing heartbeat, no new timer
             self.scheduleHeartbeat(for: current)
         }
         heartbeatWorkItem = work
@@ -2538,7 +2665,12 @@ final class PairingCoordinator: ObservableObject {
             timestamp: payload.timestamp,
             lastPlayedTimestamp: lastNotificationSoundTimestamp[identifier]
         )
-        content.sound = audible ? .default : nil
+        let resync = payload.resync == true
+        let now = Date()
+        notificationPostedAt = notificationPostedAt.filter { now.timeIntervalSince($0.value) < 120 }
+        notificationPostedAt[identifier] = now
+        content.sound = audible && !resync ? .default : nil
+        if resync { content.interruptionLevel = .passive }
         if lastNotificationSoundTimestamp.count > 500 { lastNotificationSoundTimestamp.removeAll() }
         lastNotificationSoundTimestamp[identifier] = max(lastNotificationSoundTimestamp[identifier] ?? 0, payload.timestamp)
         if let attachment = notificationIconAttachment(for: payload) {
@@ -2548,14 +2680,18 @@ final class PairingCoordinator: ObservableObject {
             "androidPackage": payload.packageName,
             "androidNotificationId": payload.notificationId,
             "androidDeviceId": deviceID,
+            "resync": resync,
         ]
         let request = UNNotificationRequest(
             identifier: identifier,
             content: content,
             trigger: nil
         )
+        let attachmentFile = content.attachments.first?.url
         UNUserNotificationCenter.current().add(request) { error in
             if let error {
+                // On success the system has moved the copy; on failure it is ours to clean up.
+                if let attachmentFile { try? FileManager.default.removeItem(at: attachmentFile) }
                 NSLog("PLUGIN notification delivery failed package=%@ error=%@", payload.packageName, String(describing: error))
             } else {
                 NSLog("PLUGIN notification received package=%@", payload.packageName)
@@ -2588,18 +2724,23 @@ final class PairingCoordinator: ObservableObject {
         let fileManager = FileManager.default
         guard let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
         let directory = caches.appendingPathComponent("Bridgey/NotificationIcons", isDirectory: true)
+        // UNUserNotificationCenter MOVES an attachment's file into its own data store on add(), so a
+        // file shared between posts is gone for every concurrent or later post of the same app
+        // ("Failed to move attachment file into data store") - and a failed add() of a replacement
+        // also drops the notification it was replacing. Every post therefore gets its own copy.
         let file = directory.appendingPathComponent(
-            remoteNotificationIconFileName(packageName: payload.packageName, data: data)
+            remoteNotificationIconFileName(packageName: payload.packageName, data: data, uniqueSuffix: UUID().uuidString)
         )
         do {
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-            if !fileManager.fileExists(atPath: file.path) { try data.write(to: file, options: .atomic) }
+            try data.write(to: file, options: .atomic)
             return try UNNotificationAttachment(
                 identifier: "android-app-icon",
                 url: file,
                 options: [UNNotificationAttachmentOptionsTypeHintKey: UTType.png.identifier]
             )
         } catch {
+            try? fileManager.removeItem(at: file)
             NSLog("PLUGIN notification icon attachment failed package=%@ error=%@", payload.packageName, String(describing: error))
             return nil
         }
@@ -2724,7 +2865,66 @@ final class PairingCoordinator: ObservableObject {
         let center = UNUserNotificationCenter.current()
         center.removeDeliveredNotifications(withIdentifiers: [identifier])
         center.removePendingNotificationRequests(withIdentifiers: [identifier])
+        clearAllDetector.noteExplainedRemoval([identifier], at: Date()) // Bridgey-initiated, not a user Clear All
         diagnostics.record(category: "notification", event: "removed_remotely")
+    }
+
+    /// BRIDGEY NOTIFICATION++ RECONCILIATION: Android's complete eligible set for [deviceID] has
+    /// arrived - remove every delivered notification of that device Android no longer has, and the
+    /// notification-driven call card if its notification is gone. Never creates anything (Android
+    /// re-posts live notifications before the sync) and never touches other devices.
+    private func reconcileRemoteNotifications(deviceID: String, snapshot: Set<String>) {
+        if let call = remoteCall, call.deviceID == deviceID, call.source == .notification,
+           !snapshot.contains(call.notificationID) {
+            removeRemoteNotification(call.notificationID, deviceID: deviceID)
+        }
+        let appliedAt = Date()
+        removeDeliveredRemoteNotifications(reason: "sync") { [weak self] delivered in
+            staleRemoteNotificationIdentifiers(delivered: delivered, deviceID: deviceID, snapshot: snapshot).filter { identifier in
+                guard let postedAt = self?.notificationPostedAt[identifier] else { return true }
+                return postedAt < appliedAt
+            }
+        }
+    }
+
+    /// Reads Notification Center's delivered list, lets [select] choose request identifiers to
+    /// remove (on the main actor), and removes exactly those. Non-Bridgey notifications carry no
+    /// Android userInfo and are never selected by the callers' pure selectors.
+    private func removeDeliveredRemoteNotifications(
+        reason: String,
+        select: @escaping @MainActor ([DeliveredRemoteNotification]) -> [String]
+    ) {
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { delivered in
+            let items = delivered.map { notification in
+                DeliveredRemoteNotification(
+                    requestIdentifier: notification.request.identifier,
+                    androidDeviceID: notification.request.content.userInfo["androidDeviceId"] as? String,
+                    androidNotificationID: notification.request.content.userInfo["androidNotificationId"] as? String
+                )
+            }
+            DispatchQueue.main.async {
+                let identifiers = select(items)
+                if !identifiers.isEmpty {
+                    center.removeDeliveredNotifications(withIdentifiers: identifiers)
+                    self.clearAllDetector.noteExplainedRemoval(identifiers, at: Date()) // Bridgey-initiated, not a user Clear All
+                }
+                NSLog("PLUGIN notification reconcile reason=%@ delivered=%d removed=%d", reason, items.count, identifiers.count)
+            }
+        }
+    }
+
+    /// Notification forwarding is off for the selected devices: clear everything mirrored from them.
+    private func removeAllRemoteNotifications(reason: String, forDevice isAffected: @escaping @MainActor (String) -> Bool) {
+        if let call = remoteCall, call.source == .notification, isAffected(call.deviceID) {
+            removeRemoteNotification(call.notificationID, deviceID: call.deviceID)
+        }
+        removeDeliveredRemoteNotifications(reason: reason) { delivered in
+            delivered.compactMap { item in
+                guard let deviceID = item.androidDeviceID, item.androidNotificationID != nil, isAffected(deviceID) else { return nil }
+                return item.requestIdentifier
+            }
+        }
     }
 
     // clearRemoteCall / callOverlayIdentity are defined in Calls.swift.

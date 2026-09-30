@@ -384,6 +384,90 @@ are the only ongoing notifications forwarded. Call controls reuse the same
 scoped notification action tokens and therefore exist only when the Android
 phone application supplies the corresponding `PendingIntent`.
 
+#### Notification state reconciliation (`notifications.sync`)
+
+`notifications.post`/`.remove`/`.dismiss`/`.action` remain the fast path. They
+are events, and an event lost during a disconnect or an Android listener
+re-bind would otherwise leave a stale macOS notification forever. Android is
+the source of truth: `notifications.sync` (Android → macOS) carries the
+complete set of notification IDs Android currently considers eligible for
+forwarding (computed from `NotificationListenerService.getActiveNotifications()`
+with exactly the same filters and identity as `notifications.post`).
+
+```json
+{"version":1,"syncId":"<uuid>","part":1,"parts":1,"notificationIds":["<64 lowercase hex>"]}
+```
+
+- AES-GCM encrypted and replay-protected like every other notification message.
+- `syncId` is a UUID string (at most 64 characters). `part` is 1-based,
+  `1 ≤ part ≤ parts ≤ 32`. Each part carries at most 256 IDs, so one frame stays
+  well under the 65,536-byte frame limit. Every ID is 64 lowercase hex
+  characters.
+- An empty `notificationIds` list is valid and means "Android currently has no
+  eligible notifications" (for example after Clear All).
+- macOS buffers parts per `syncId` and applies the snapshot only once every part
+  of that `syncId` has arrived. Applying it removes every delivered Bridgey
+  notification that belongs to the sending Android device and whose
+  notification ID is not in the snapshot, and clears the call card if its ID is
+  absent. Notifications of other Android devices are never touched. An
+  incomplete sync removes nothing; applying the same sync twice is harmless.
+- macOS never creates notifications from a sync: Android re-posts every
+  currently eligible notification with `notifications.post` immediately before
+  the sync, on the same ordered connection.
+- A malformed sync (unknown version, bad part numbering, too many IDs, malformed
+  ID) is an invalid message, handled like any other.
+- Android sends a sync on every authenticated connect/reconnect, after its
+  notification listener (re)binds while connected, when notification forwarding
+  becomes available again on both peers, and once (debounced by about 500 ms)
+  after Android reports a `REASON_CANCEL_ALL` removal. There is no periodic sync.
+- Clients that do not recognise `notifications.sync` ignore it.
+
+`notifications.post` may carry an optional boolean `resync`. `true` marks a
+re-post of a notification that already existed (reconnect or reconciliation):
+macOS replaces its delivered notification without a banner or sound. Absent or
+`false` keeps the normal alerting behaviour. Older receivers ignore the field.
+
+#### macOS Clear All (`notifications.dismissMany`)
+
+macOS reports an explicit dismissal of one notification to the app (sent as
+`notifications.dismiss`), but clearing the whole Bridgey stack in Notification
+Center produces no callback at all. macOS infers it from observable state and
+sends one bulk dismissal (macOS → Android):
+
+```json
+{"version":1,"reason":"mac_clear_all","notificationIds":["<64 lowercase hex>"]}
+```
+
+- Encrypted and replay-protected like `notifications.dismiss`. `reason` is
+  currently always `mac_clear_all`. 1–256 IDs per message; a larger set is sent
+  as several independent messages. Any other version, reason, count or ID format
+  is an invalid message.
+- macOS evaluates only on its existing connected-session heartbeat, only while
+  notification forwarding is available on both peers and Bridgey notifications
+  are authorized with Notification Center enabled. It keeps an in-memory
+  snapshot of the Bridgey notifications it has observed as delivered. It never
+  evaluates within 60 seconds of a new session, a notification post, or a change
+  of notification permissions, because the delivered list lags behind posts. A
+  bulk dismissal is sent only when that snapshot was non-empty and the delivered
+  list is empty on two consecutive checks. IDs that Bridgey itself removed
+  (Android removal, sync, feature off) or that the user already dismissed
+  individually are never included. macOS also silently evicts its oldest
+  notifications beyond 100 per app; that never empties the list, so it never
+  triggers this message.
+- Android handles every ID exactly like `notifications.dismiss`, which cancels
+  every Android notification behind it and suppresses the resulting
+  `notifications.remove` echo. Unknown IDs are ignored. An ID that Android
+  forwarded to macOS within the last 60 seconds is skipped: macOS cannot have
+  seen that newer content when it evaluated the clear (for example a new
+  message in the same conversation).
+- Clients that do not recognise `notifications.dismissMany` ignore it; a Clear
+  All on macOS then simply does not reach Android.
+
+When notification forwarding is turned off on either peer, macOS removes every
+delivered notification of that Android device and clears its call card. When
+it is turned on again, Android re-posts its current eligible notifications with
+`resync: true` followed by a sync; no historical notifications are replayed.
+
 ### Find device (`find-device.v1`)
 
 Either connected peer can send an encrypted `find.start` payload containing an

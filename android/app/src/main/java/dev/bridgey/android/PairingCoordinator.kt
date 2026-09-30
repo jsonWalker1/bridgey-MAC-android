@@ -59,6 +59,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.ensureActive
@@ -121,6 +122,17 @@ class PairingCoordinator(
 ) {
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // BRIDGEY NOTIFICATION++ RECONCILIATION: notification messages are sent strictly in the order
+    // they were issued (a plain Dispatchers.IO launch per message can reorder them). A
+    // notifications.sync snapshot must never overtake a post issued after it, or the Mac would
+    // remove a notification that is actually still live on Android.
+    private val notificationSendDispatcher = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "bridgey-notification-send").apply { isDaemon = true }
+    }.asCoroutineDispatcher()
+    // Whether notification forwarding was available on the current connected session the last time
+    // it was evaluated - a false -> true transition (connect, reconnect, re-enable on either peer)
+    // triggers one fresh reconciliation. See refreshNotificationForwardingAvailability().
+    private var notificationForwardingAvailable = false
     val quickActions = QuickActions(appContext, scope, ::isFeatureAvailable, ::sendQuickPayload)
     val mediaRemote = MediaContinuityManager(
         appContext,
@@ -287,6 +299,7 @@ class PairingCoordinator(
                 quickActions.policyChanged()
                 mediaRemote.policyChanged()
                 sendFeatureState()
+                refreshNotificationForwardingAvailability()
                 publishLocalStorage(force = true)
                 publishLocalMemory(force = true)
                 publishLocalTemperature()
@@ -964,11 +977,12 @@ class PairingCoordinator(
         hasSound: Boolean = true,
         availableAudioRoutes: List<String>? = null,
         bluetoothRouteName: String? = null,
+        resync: Boolean = false,
     ) {
         if (!isFeatureAvailable(BridgeyFeature.NOTIFICATIONS)) return
         val connectedSession = session ?: return
         if (mutableState.value !is PairingState.Connected) return
-        scope.launch {
+        scope.launch(notificationSendDispatcher) {
             if (session !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
             // BRIDGEY CONNECTIVITY CRASH FIX (2026-09-25): see sendBattery's identical guard for why.
             val pairingKey = connectedSession.pairingKey ?: return@launch
@@ -993,6 +1007,7 @@ class PairingCoordinator(
                     if (bluetoothRouteName != null) {
                         put("bluetoothRouteName", bluetoothRouteName.take(64))
                     }
+                    if (resync) put("resync", true)
                 }
                 .put("actions", JSONArray().apply {
                     actions.take(4).forEach { action ->
@@ -1022,6 +1037,63 @@ class PairingCoordinator(
 
     fun sendNotificationRemoved(notificationId: String) {
         sendNotificationReference("notifications.remove", notificationId)
+    }
+
+    /**
+     * BRIDGEY NOTIFICATION++ RECONCILIATION: sends the authoritative set of every notificationId
+     * Android currently considers eligible (docs/protocol.md, `notifications.sync`), split into parts
+     * of at most [MAX_NOTIFICATION_SYNC_IDS_PER_PART]. An empty list is sent as one empty part. Goes
+     * through the same ordered notification send queue as posts and removes.
+     */
+    fun sendNotificationSync(notificationIds: List<String>) {
+        if (!isFeatureAvailable(BridgeyFeature.NOTIFICATIONS)) return
+        val connectedSession = session ?: return
+        if (mutableState.value !is PairingState.Connected) return
+        val syncId = UUID.randomUUID().toString()
+        val parts = notificationSyncParts(notificationIds)
+        scope.launch(notificationSendDispatcher) {
+            if (session !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
+            val pairingKey = connectedSession.pairingKey ?: return@launch
+            parts.forEachIndexed { index, ids ->
+                val payload = JSONObject()
+                    .put("version", 1)
+                    .put("syncId", syncId)
+                    .put("part", index + 1)
+                    .put("parts", parts.size)
+                    .put("notificationIds", JSONArray(ids))
+                    .toString()
+                    .toByteArray()
+                val encrypted = Crypto.encrypt(pairingKey, payload)
+                connectedSession.send(
+                    Message(
+                        kind = "notifications.sync",
+                        sessionId = connectedSession.id,
+                        messageId = UUID.randomUUID().toString(),
+                        nonce = encrypted.nonce,
+                        ciphertext = encrypted.ciphertext,
+                    ),
+                )
+            }
+            android.util.Log.i("Bridgey", "PLUGIN notification sync sent ids=${notificationIds.size} parts=${parts.size}")
+        }
+    }
+
+    /**
+     * Re-evaluates whether notification forwarding is usable on the current connected session and,
+     * on a false -> true transition, asks the listener for one fresh reconciliation (silent resync
+     * posts + `notifications.sync`). Called on connect, on every local settings change and on every
+     * received `features.update`, so connect, reconnect and re-enabling the feature on either peer
+     * all reconcile exactly once; nothing is replayed while it stays available.
+     */
+    private fun refreshNotificationForwardingAvailability(sessionStarted: Boolean = false) {
+        val available = mutableState.value is PairingState.Connected && isFeatureAvailable(BridgeyFeature.NOTIFICATIONS)
+        val becameAvailable = synchronized(this) {
+            if (sessionStarted) notificationForwardingAvailable = false
+            val transition = available && !notificationForwardingAvailable
+            notificationForwardingAvailable = available
+            transition
+        }
+        if (becameAvailable) BridgeyNotificationListenerService.requestReconciliation()
     }
 
     /**
@@ -1067,7 +1139,7 @@ class PairingCoordinator(
         if (!isFeatureAvailable(BridgeyFeature.NOTIFICATIONS) || notificationId.isBlank()) return
         val connectedSession = session ?: return
         if (mutableState.value !is PairingState.Connected) return
-        scope.launch {
+        scope.launch(notificationSendDispatcher) {
             if (session !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
             // BRIDGEY CONNECTIVITY CRASH FIX (2026-09-25): see sendBattery's identical guard for why.
             val pairingKey = connectedSession.pairingKey ?: return@launch
@@ -1633,6 +1705,7 @@ class PairingCoordinator(
                 }
             }
             "notifications.dismiss" -> receiveNotificationDismiss(current, message)
+            "notifications.dismissMany" -> receiveNotificationDismissMany(current, message)
             "notifications.action" -> receiveNotificationAction(current, message)
             "calls.request" -> receiveCallRequest(current, message)
             "calls.action" -> receiveCallAction(current, message)
@@ -1702,6 +1775,39 @@ class PairingCoordinator(
             ?: return fail("Invalid notification command")
         BridgeyNotificationListenerService.dismiss(notificationId)
         diagnostics.record("notification", "dismiss_requested")
+    }
+
+    /**
+     * BRIDGEY NOTIFICATION++ macOS CLEAR ALL (`notifications.dismissMany`, docs/protocol.md). The Mac
+     * inferred that the user cleared the whole Bridgey stack in Notification Center (macOS reports no
+     * per-notification callbacks for that). Each id goes through the single-dismiss path, so every
+     * Android key of a logical notification is cancelled and the resulting removals are not echoed
+     * back. Unknown ids are ignored; ids forwarded within the last minute are kept.
+     */
+    private fun receiveNotificationDismissMany(current: Session, message: Message) {
+        if (!settings.isEnabled(BridgeyFeature.NOTIFICATIONS, current.remoteDeviceId)) {
+            sendFeatureState()
+            return
+        }
+        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        val messageId = message.messageId ?: return
+        if (!current.acceptMessageId(messageId)) return
+        val plaintext = Crypto.decrypt(
+            current.pairingKey!!,
+            message.nonce ?: return fail("Invalid encrypted notification command"),
+            message.ciphertext ?: return fail("Invalid encrypted notification command"),
+        ) ?: return fail("Invalid encrypted notification command")
+        val ids = parseNotificationDismissManyPayload(plaintext.toString(Charsets.UTF_8))
+            ?: return fail("Invalid notification command")
+        val outcomes = ids.map(BridgeyNotificationListenerService::dismissFromMacClearAll)
+        android.util.Log.i(
+            "Bridgey",
+            "PLUGIN notification dismissMany received=${ids.size} " +
+                "dismissed=${outcomes.count { it == MacClearAllDismissOutcome.DISMISSED }} " +
+                "unknown=${outcomes.count { it == MacClearAllDismissOutcome.UNKNOWN }} " +
+                "tooRecent=${outcomes.count { it == MacClearAllDismissOutcome.TOO_RECENT }}",
+        )
+        diagnostics.record("notification", "dismiss_many_received")
     }
 
     private fun receiveCallRequest(current: Session, message: Message) {
@@ -2123,10 +2229,10 @@ class PairingCoordinator(
             sendFeatureState()
             mediaRemote.sendFreshState()
             if (localWantsRemoteTelemetryUpdates) sendTelemetrySubscription(subscribe = true)
-            // BRIDGEY NOTIFICATION++ POC: same "resync fresh state on reconnect" pattern as
-            // mediaRemote.sendFreshState() above - see BridgeyNotificationListenerService's
-            // resyncActiveNotifications() doc comment.
-            BridgeyNotificationListenerService.resyncOnReconnect()
+            // BRIDGEY NOTIFICATION++ RECONCILIATION: every new session starts "not yet reconciled";
+            // if forwarding is already available this reconciles now, otherwise the peer's
+            // features.update (receiveFeatureState) triggers it once it enables forwarding.
+            refreshNotificationForwardingAvailability(sessionStarted = true)
             android.util.Log.i("Bridgey", "PAIRING verified peer=${current.peerName}")
         }
     }
@@ -2179,6 +2285,7 @@ class PairingCoordinator(
         mutableRemoteFeatures.value = received
         quickActions.policyChanged()
         mediaRemote.policyChanged()
+        refreshNotificationForwardingAvailability()
         if (received[BridgeyFeature.CLIPBOARD] == false) mutableClipboardStatus.value = null
         if (received[BridgeyFeature.BATTERY] == false) mutableRemoteBattery.value = null
         if (received[BridgeyFeature.STORAGE] == false) mutableRemoteStorage.value = null

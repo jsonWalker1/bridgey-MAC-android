@@ -85,7 +85,7 @@ class ForwardedNotificationRegistryTest {
 
         assertTrue(registry.removeSystemKey("system-one") == "one")
         assertTrue(registry.removeSystemKey("system-one") == null)
-        assertTrue(registry.systemKey("one") == null)
+        assertTrue(registry.systemKeys("one").isEmpty())
     }
 
     @Test fun evictsOldestNotificationAtLimit() {
@@ -94,9 +94,9 @@ class ForwardedNotificationRegistryTest {
         registry.record("two", "system-two", "two.app")
         registry.record("three", "system-three", "three.app")
 
-        assertTrue(registry.systemKey("one") == null)
-        assertTrue(registry.systemKey("two") == "system-two")
-        assertTrue(registry.systemKey("three") == "system-three")
+        assertTrue(registry.systemKeys("one").isEmpty())
+        assertTrue(registry.systemKeys("two") == setOf("system-two"))
+        assertTrue(registry.systemKeys("three") == setOf("system-three"))
     }
 
     @Test fun removesEveryMirroredNotificationForFilteredApplication() {
@@ -106,8 +106,8 @@ class ForwardedNotificationRegistryTest {
         registry.record("three", "system-three", "chat.app")
 
         assertTrue(registry.removePackage("chat.app") == listOf("one", "three"))
-        assertTrue(registry.systemKey("one") == null)
-        assertTrue(registry.systemKey("two") == "system-two")
+        assertTrue(registry.systemKeys("one").isEmpty())
+        assertTrue(registry.systemKeys("two") == setOf("system-two"))
     }
 
     @Test fun createsStableOpaqueNotificationToken() {
