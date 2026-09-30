@@ -68,6 +68,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.bridgey.core.discovery.DiscoveredPeer
 import dev.bridgey.core.discovery.NsdDiscoveryService
@@ -469,12 +470,21 @@ private fun BridgeyApp(
     val remoteBattery by pairing.remoteBattery.collectAsStateWithLifecycle()
     val remoteStorage by pairing.remoteStorage.collectAsStateWithLifecycle()
     val remoteMemory by pairing.remoteMemory.collectAsStateWithLifecycle()
+    val remoteCpu by pairing.remoteCpu.collectAsStateWithLifecycle()
+    val remoteTemperature by pairing.remoteTemperature.collectAsStateWithLifecycle()
     val pingStatus by pairing.pingStatus.collectAsStateWithLifecycle()
     val trustedDevices by pairing.trustedDevices.collectAsStateWithLifecycle()
     val remoteFeatures by pairing.remoteFeatures.collectAsStateWithLifecycle()
     val settingsState by settings.state.collectAsStateWithLifecycle()
     var permissionPrompt by remember { mutableStateOf<PermissionPrompt?>(null) }
     var showingSettings by remember { mutableStateOf(false) }
+
+    // Battery-conscious: telemetry (storage/memory/CPU) is only sampled/sent while this screen is
+    // actually visible - opening the app subscribes, backgrounding it unsubscribes immediately.
+    LifecycleStartEffect(Unit) {
+        pairing.requestRemoteTelemetryUpdates()
+        onStopOrDispose { pairing.stopRequestingRemoteTelemetryUpdates() }
+    }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -557,6 +567,8 @@ private fun BridgeyApp(
                 remoteBattery = remoteBattery,
                 remoteStorage = remoteStorage,
                 remoteMemory = remoteMemory,
+                remoteCpu = remoteCpu,
+                remoteTemperature = remoteTemperature,
                 pingStatus = pingStatus,
                 enabledFeatures = BridgeyFeature.entries.associateWith { feature ->
                     settings.isEnabled(feature, (pairingState as? PairingState.Connected)?.deviceId) &&
@@ -1034,6 +1046,8 @@ private fun DeviceScreen(
     remoteBattery: RemoteBatteryStatus?,
     remoteStorage: RemoteStorageStatus?,
     remoteMemory: RemoteMemoryStatus?,
+    remoteCpu: RemoteCpuStatus?,
+    remoteTemperature: RemoteTemperatureStatus?,
     pingStatus: String?,
     enabledFeatures: Map<BridgeyFeature, Boolean>,
     pairing: PairingCoordinator,
@@ -1066,7 +1080,12 @@ private fun DeviceScreen(
                     remoteBattery = remoteBattery,
                     remoteStorage = remoteStorage,
                     remoteMemory = remoteMemory,
-                    telemetryEnabled = enabledFeatures[BridgeyFeature.TELEMETRY] != false,
+                    remoteCpu = remoteCpu,
+                    remoteTemperature = remoteTemperature,
+                    storageEnabled = enabledFeatures[BridgeyFeature.STORAGE] != false,
+                    memoryEnabled = enabledFeatures[BridgeyFeature.MEMORY] != false,
+                    cpuEnabled = enabledFeatures[BridgeyFeature.CPU] != false,
+                    temperatureEnabled = enabledFeatures[BridgeyFeature.TEMPERATURE] != false,
                     pingStatus = pingStatus,
                     clipboardEnabled = enabledFeatures[BridgeyFeature.CLIPBOARD] != false,
                     filesEnabled = enabledFeatures[BridgeyFeature.FILES] != false,
@@ -1185,7 +1204,12 @@ private fun ConnectedDeviceCard(
     remoteBattery: RemoteBatteryStatus?,
     remoteStorage: RemoteStorageStatus?,
     remoteMemory: RemoteMemoryStatus?,
-    telemetryEnabled: Boolean,
+    remoteCpu: RemoteCpuStatus?,
+    remoteTemperature: RemoteTemperatureStatus?,
+    storageEnabled: Boolean,
+    memoryEnabled: Boolean,
+    cpuEnabled: Boolean,
+    temperatureEnabled: Boolean,
     pingStatus: String?,
     clipboardEnabled: Boolean,
     filesEnabled: Boolean,
@@ -1226,7 +1250,7 @@ private fun ConnectedDeviceCard(
                             color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f),
                         )
                     }
-                    if (telemetryEnabled) {
+                    if (storageEnabled) {
                         if (remoteStorage != null) {
                             val freeBytes = (remoteStorage.totalBytes - remoteStorage.usedBytes).coerceAtLeast(0)
                             Text(
@@ -1241,14 +1265,30 @@ private fun ConnectedDeviceCard(
                                 color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f),
                             )
                         }
-                        if (remoteMemory != null) {
-                            val freeBytes = (remoteMemory.totalBytes - remoteMemory.usedBytes).coerceAtLeast(0)
-                            Text(
-                                "🧠 ${formattedByteCount(context, freeBytes)} free",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f),
-                            )
-                        }
+                    }
+                    if (memoryEnabled && remoteMemory != null) {
+                        val freeBytes = (remoteMemory.totalBytes - remoteMemory.usedBytes).coerceAtLeast(0)
+                        Text(
+                            "🧠 ${formattedByteCount(context, freeBytes)} free",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f),
+                        )
+                    }
+                    if (cpuEnabled && remoteCpu is RemoteCpuStatus.Available) {
+                        Text(
+                            "⚙ ${remoteCpu.percent}% CPU",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f),
+                        )
+                    }
+                    if (temperatureEnabled && remoteTemperature is RemoteTemperatureStatus.Known) {
+                        val (label, _) = thermalDisplayLabel(remoteTemperature.thermalState)
+                        val text = remoteTemperature.celsius?.let { "🌡 $it°C" } ?: "🌡 $label"
+                        Text(
+                            text,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f),
+                        )
                     }
                 }
                 Text("›", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f))
@@ -1280,11 +1320,10 @@ private fun ConnectedDeviceCard(
     if (showingStorageDetails) {
         ModalBottomSheet(onDismissRequest = { showingStorageDetails = false }) {
             Column(Modifier.padding(horizontal = 20.dp, vertical = 8.dp).padding(bottom = 24.dp)) {
-                Text("Storage", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(12.dp))
-                when {
-                    !telemetryEnabled -> Text("Not available", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    remoteStorage != null -> {
+                if (storageEnabled) {
+                    Text("Storage", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(12.dp))
+                    if (remoteStorage != null) {
                         val used = remoteStorage.usedBytes.toFloat()
                         val total = remoteStorage.totalBytes.coerceAtLeast(1).toFloat()
                         LinearProgressIndicator(progress = { (used / total).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
@@ -1298,15 +1337,15 @@ private fun ConnectedDeviceCard(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                    } else {
+                        Text("Waiting for storage status…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    else -> Text("Waiting for storage status…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(20.dp))
                 }
-                Spacer(Modifier.height(20.dp))
-                Text("Memory", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(12.dp))
-                when {
-                    !telemetryEnabled -> Text("Not available", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    remoteMemory != null -> {
+                if (memoryEnabled) {
+                    Text("Memory", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(12.dp))
+                    if (remoteMemory != null) {
                         val used = remoteMemory.usedBytes.toFloat()
                         val total = remoteMemory.totalBytes.coerceAtLeast(1).toFloat()
                         LinearProgressIndicator(progress = { (used / total).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
@@ -1320,8 +1359,53 @@ private fun ConnectedDeviceCard(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                    } else {
+                        Text("Waiting for memory status…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    else -> Text("Waiting for memory status…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(20.dp))
+                }
+                if (cpuEnabled) {
+                    Text("CPU", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(12.dp))
+                    when (remoteCpu) {
+                        is RemoteCpuStatus.Available -> {
+                            LinearProgressIndicator(
+                                progress = { (remoteCpu.percent / 100f).coerceIn(0f, 1f) },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            Text("${remoteCpu.percent}%", style = MaterialTheme.typography.bodyMedium)
+                        }
+                        is RemoteCpuStatus.Unavailable -> Text(
+                            "Not available on this device",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        else -> Text("Waiting for CPU status…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Spacer(Modifier.height(20.dp))
+                }
+                if (temperatureEnabled) {
+                    Text("Temperature", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(12.dp))
+                    when (remoteTemperature) {
+                        is RemoteTemperatureStatus.Known -> {
+                            val (label, _) = thermalDisplayLabel(remoteTemperature.thermalState)
+                            Text(
+                                remoteTemperature.celsius?.let { "🌡 $it°C" } ?: "🌡 $label",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            if (remoteTemperature.celsius != null) {
+                                Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        is RemoteTemperatureStatus.Unavailable -> Text(
+                            "Not available on this device",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        else -> Text("Waiting for temperature status…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
             }
         }

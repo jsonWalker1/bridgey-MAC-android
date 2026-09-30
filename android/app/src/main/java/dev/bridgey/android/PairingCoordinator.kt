@@ -102,6 +102,16 @@ data class RemoteStorageStatus(val usedBytes: Long, val totalBytes: Long)
 
 data class RemoteMemoryStatus(val usedBytes: Long, val totalBytes: Long)
 
+sealed class RemoteCpuStatus {
+    data class Available(val percent: Int) : RemoteCpuStatus()
+    object Unavailable : RemoteCpuStatus()
+}
+
+sealed class RemoteTemperatureStatus {
+    data class Known(val thermalState: String, val celsius: Int?) : RemoteTemperatureStatus()
+    object Unavailable : RemoteTemperatureStatus()
+}
+
 class PairingCoordinator(
     context: Context,
     private val localDeviceId: String,
@@ -161,6 +171,19 @@ class PairingCoordinator(
     private val mutableRemoteMemory = MutableStateFlow<RemoteMemoryStatus?>(null)
     val remoteMemory: StateFlow<RemoteMemoryStatus?> = mutableRemoteMemory.asStateFlow()
     private var lastSentMemory: LocalMemoryStatus? = null
+    private val mutableRemoteCpu = MutableStateFlow<RemoteCpuStatus?>(null)
+    val remoteCpu: StateFlow<RemoteCpuStatus?> = mutableRemoteCpu.asStateFlow()
+    private val mutableRemoteTemperature = MutableStateFlow<RemoteTemperatureStatus?>(null)
+    val remoteTemperature: StateFlow<RemoteTemperatureStatus?> = mutableRemoteTemperature.asStateFlow()
+    private var previousCpuSample: CpuSample? = null
+    // ALL telemetry (storage/memory/cpu) is on-demand only, battery-conscious: nothing is sampled or
+    // sent in the background. Opening the app (main panel) subscribes; backgrounding it unsubscribes.
+    // While subscribed, the peer resends all three every ~3s over the existing telemetry.update kind.
+    private var remoteWantsTelemetryUpdates = false
+    private var telemetrySamplingJob: Job? = null
+    // Whether OUR OWN app is in the foreground wanting the peer's telemetry - survives reconnects
+    // (unlike the two fields above, which are per-session) so completeIfConfirmed() can resubscribe.
+    private var localWantsRemoteTelemetryUpdates = false
     private val mutablePingStatus = MutableStateFlow<String?>(null)
     val pingStatus: StateFlow<String?> = mutablePingStatus.asStateFlow()
     private var pendingPingId: String? = null
@@ -256,31 +279,22 @@ class PairingCoordinator(
             settings.state.collect {
                 if (!featureEnabled(BridgeyFeature.CLIPBOARD)) mutableClipboardStatus.value = null
                 if (!featureEnabled(BridgeyFeature.BATTERY)) mutableRemoteBattery.value = null
-                if (!featureEnabled(BridgeyFeature.TELEMETRY)) {
-                    mutableRemoteStorage.value = null
-                    mutableRemoteMemory.value = null
-                }
+                if (!featureEnabled(BridgeyFeature.STORAGE)) mutableRemoteStorage.value = null
+                if (!featureEnabled(BridgeyFeature.MEMORY)) mutableRemoteMemory.value = null
+                if (!featureEnabled(BridgeyFeature.CPU)) mutableRemoteCpu.value = null
+                if (!featureEnabled(BridgeyFeature.TEMPERATURE)) mutableRemoteTemperature.value = null
                 if (!featureEnabled(BridgeyFeature.PING)) clearPingStatus()
                 quickActions.policyChanged()
                 mediaRemote.policyChanged()
                 sendFeatureState()
                 publishLocalStorage(force = true)
                 publishLocalMemory(force = true)
+                publishLocalTemperature()
             }
         }
         scope.launch {
             mutableState.collect { state ->
                 if (state is PairingState.Connected) acquireConnectionLocksIfNeeded() else releaseConnectionLocksIfNeeded()
-            }
-        }
-        // Storage changes slowly (unlike battery, there's no OS broadcast to react to), so this is
-        // a plain low-frequency poll rather than a new per-session job - it simply no-ops via
-        // publishLocalStorage's own connected/feature/change-detection guards while disconnected.
-        scope.launch {
-            while (true) {
-                delay(STORAGE_TELEMETRY_INTERVAL_MILLIS)
-                publishLocalStorage()
-                publishLocalMemory()
             }
         }
     }
@@ -347,6 +361,7 @@ class PairingCoordinator(
         mutableRemoteStorage.value = null
         lastSentStorage = null
         resetRemoteMemoryState()
+        resetTelemetrySubscriptionState()
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
@@ -368,6 +383,7 @@ class PairingCoordinator(
         mutableRemoteStorage.value = null
         lastSentStorage = null
         resetRemoteMemoryState()
+        resetTelemetrySubscriptionState()
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
@@ -524,7 +540,7 @@ class PairingCoordinator(
      *  and change-gated by [STORAGE_CHANGE_THRESHOLD_BYTES] rather than exact equality, since raw
      *  byte counts churn constantly from routine cache/temp-file activity. */
     fun publishLocalStorage(force: Boolean = false) {
-        if (!isFeatureAvailable(BridgeyFeature.TELEMETRY)) return
+        if (!isFeatureAvailable(BridgeyFeature.STORAGE)) return
         val connectedSession = session ?: return
         if (mutableState.value !is PairingState.Connected) return
         val status = currentAndroidStorageStatus(appContext) ?: return
@@ -566,10 +582,120 @@ class PairingCoordinator(
         lastSentMemory = null
     }
 
+    private fun resetTelemetrySubscriptionState() {
+        mutableRemoteCpu.value = null
+        previousCpuSample = null
+        mutableRemoteTemperature.value = null
+        remoteWantsTelemetryUpdates = false
+        telemetrySamplingJob?.cancel()
+        telemetrySamplingJob = null
+    }
+
+    /** Call when the app becomes visible (foreground). Battery-conscious by design: nothing is
+     *  sampled or sent while backgrounded. Storage/memory/CPU/temperature are all refreshed
+     *  together, every ~3s, only while the peer confirms someone is actually looking - each metric
+     *  independently no-ops in its own publish function if its own Settings toggle is off. */
+    fun requestRemoteTelemetryUpdates() {
+        localWantsRemoteTelemetryUpdates = true
+        sendTelemetrySubscription(subscribe = true)
+    }
+
+    /** Call when the app is backgrounded. */
+    fun stopRequestingRemoteTelemetryUpdates() {
+        localWantsRemoteTelemetryUpdates = false
+        sendTelemetrySubscription(subscribe = false)
+    }
+
+    /** Not gated by any single telemetry feature - this just signals "my panel is open/closed";
+     *  each metric's own publish function independently respects its own Settings toggle. */
+    private fun sendTelemetrySubscription(subscribe: Boolean) {
+        val current = session ?: return
+        if (mutableState.value !is PairingState.Connected) return
+        scope.launch {
+            if (session !== current || mutableState.value !is PairingState.Connected) return@launch
+            current.send(
+                Message(
+                    kind = if (subscribe) "telemetry.subscribe" else "telemetry.unsubscribe",
+                    sessionId = current.id,
+                ),
+            )
+        }
+    }
+
+    /** Peer's app came to the foreground and wants our telemetry - start the on-demand loop that
+     *  resends storage/memory (dead-band gated, as always), CPU, and temperature (always, being
+     *  rates/instant readings) every ~3s. Not gated here by any specific feature - each publish call
+     *  below independently no-ops if its own Settings toggle is off. */
+    private fun receiveTelemetrySubscribe(current: Session, message: Message) {
+        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        previousCpuSample = null
+        remoteWantsTelemetryUpdates = true
+        telemetrySamplingJob?.cancel()
+        telemetrySamplingJob = scope.launch {
+            while (remoteWantsTelemetryUpdates) {
+                publishLocalStorage()
+                publishLocalMemory()
+                publishLocalCpu()
+                publishLocalTemperature()
+                delay(TELEMETRY_SAMPLING_INTERVAL_MILLIS)
+            }
+        }
+    }
+
+    /** Stops the loop only - does NOT clear the last-known storage/memory/CPU/temperature values,
+     *  which stay visible (e.g. on the connected-device card) until the next real disconnect/reconnect. */
+    private fun receiveTelemetryUnsubscribe(current: Session, message: Message) {
+        if (message.sessionId != current.id) return
+        remoteWantsTelemetryUpdates = false
+        previousCpuSample = null
+        telemetrySamplingJob?.cancel()
+        telemetrySamplingJob = null
+    }
+
+    /** Reads one /proc/stat sample and, if a previous sample exists, sends the computed delta as
+     *  `cpuPercent`. The first sample after a (re)subscribe only seeds the baseline - sending
+     *  nothing that tick avoids a flash of "unavailable" before the second tick has a real delta.
+     *  A read/parse failure, or a computation the sample math can't trust (rollover, zero elapsed
+     *  time), sends explicit `cpuUnavailable: true` rather than a fabricated number. */
+    private fun publishLocalCpu() {
+        if (!isFeatureAvailable(BridgeyFeature.CPU)) return
+        val connectedSession = session ?: return
+        if (mutableState.value !is PairingState.Connected) return
+        val sample = readProcStatCpuSample()
+        val previous = previousCpuSample
+        if (sample != null) previousCpuSample = sample
+        val status: CpuStatus? = when {
+            sample == null -> CpuStatus.Unavailable
+            previous == null -> null // first sample this subscription: seed only, send nothing
+            else -> computeCpuPercent(previous, sample)
+        }
+        if (status == null) return
+        scope.launch {
+            if (session !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
+            val pairingKey = connectedSession.pairingKey ?: return@launch
+            val payload = JSONObject().put("version", 1)
+            when (status) {
+                is CpuStatus.Available -> payload.put("cpuPercent", status.percent)
+                CpuStatus.Unavailable -> payload.put("cpuUnavailable", true)
+            }
+            val encrypted = Crypto.encrypt(pairingKey, payload.toString().toByteArray())
+            connectedSession.send(
+                Message(
+                    kind = "telemetry.update",
+                    sessionId = connectedSession.id,
+                    messageId = UUID.randomUUID().toString(),
+                    nonce = encrypted.nonce,
+                    ciphertext = encrypted.ciphertext,
+                ),
+            )
+            android.util.Log.i("Bridgey", "PLUGIN cpu sent $status")
+        }
+    }
+
     /** Mirrors [publishLocalStorage]'s shape and cadence exactly - same background loop, same
      *  dead-band principle - just a second independent metric on the same [Message] kind. */
     fun publishLocalMemory(force: Boolean = false) {
-        if (!isFeatureAvailable(BridgeyFeature.TELEMETRY)) return
+        if (!isFeatureAvailable(BridgeyFeature.MEMORY)) return
         val connectedSession = session ?: return
         if (mutableState.value !is PairingState.Connected) return
         val status = currentAndroidMemoryStatus(appContext) ?: return
@@ -603,6 +729,39 @@ class PairingCoordinator(
                 lastSentMemory = status
                 android.util.Log.i("Bridgey", "PLUGIN memory sent usedBytes=${status.usedBytes} totalBytes=${status.totalBytes}")
             }
+        }
+    }
+
+    /** Thermal state is always sent when known (no dead-band - it rarely changes and is cheap to
+     *  encode); the bonus real Celsius reading (best-effort, device-specific) rides along whenever
+     *  it's available. An explicit unavailable state is sent rather than silence, matching CPU. */
+    private fun publishLocalTemperature() {
+        if (!isFeatureAvailable(BridgeyFeature.TEMPERATURE)) return
+        val connectedSession = session ?: return
+        if (mutableState.value !is PairingState.Connected) return
+        val status = currentAndroidTemperatureStatus(appContext)
+        scope.launch {
+            if (session !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
+            val pairingKey = connectedSession.pairingKey ?: return@launch
+            val payload = JSONObject().put("version", 1)
+            when (status) {
+                is TemperatureStatus.Known -> {
+                    payload.put("thermalState", status.thermalState)
+                    status.celsius?.let { payload.put("temperatureCelsius", it) }
+                }
+                TemperatureStatus.Unavailable -> payload.put("temperatureUnavailable", true)
+            }
+            val encrypted = Crypto.encrypt(pairingKey, payload.toString().toByteArray())
+            connectedSession.send(
+                Message(
+                    kind = "telemetry.update",
+                    sessionId = connectedSession.id,
+                    messageId = UUID.randomUUID().toString(),
+                    nonce = encrypted.nonce,
+                    ciphertext = encrypted.ciphertext,
+                ),
+            )
+            android.util.Log.i("Bridgey", "PLUGIN temperature sent $status")
         }
     }
 
@@ -1244,6 +1403,7 @@ class PairingCoordinator(
         mutableRemoteStorage.value = null
         lastSentStorage = null
         resetRemoteMemoryState()
+        resetTelemetrySubscriptionState()
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
@@ -1297,6 +1457,7 @@ class PairingCoordinator(
         mutableRemoteStorage.value = null
         lastSentStorage = null
         resetRemoteMemoryState()
+        resetTelemetrySubscriptionState()
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
@@ -1368,6 +1529,7 @@ class PairingCoordinator(
             mutableRemoteStorage.value = null
             lastSentStorage = null
             resetRemoteMemoryState()
+            resetTelemetrySubscriptionState()
             clearPingStatus()
             quickActions.reset()
             mediaRemote.reset()
@@ -1495,6 +1657,8 @@ class PairingCoordinator(
             }
             "battery.update" -> receiveBattery(current, message)
             "telemetry.update" -> receiveStorageTelemetry(current, message)
+            "telemetry.subscribe" -> receiveTelemetrySubscribe(current, message)
+            "telemetry.unsubscribe" -> receiveTelemetryUnsubscribe(current, message)
             "files.accept" -> message.transferId?.let { pendingFileAccepts.remove(it)?.complete(true) }
             "files.complete.ack" -> message.transferId?.let { pendingFileCompletions.remove(it)?.complete(true) }
             "files.offer" -> {
@@ -1958,8 +2122,7 @@ class PairingCoordinator(
             diagnostics.record("pairing", "connected")
             sendFeatureState()
             mediaRemote.sendFreshState()
-            publishLocalStorage(force = true)
-            publishLocalMemory(force = true)
+            if (localWantsRemoteTelemetryUpdates) sendTelemetrySubscription(subscribe = true)
             // BRIDGEY NOTIFICATION++ POC: same "resync fresh state on reconnect" pattern as
             // mediaRemote.sendFreshState() above - see BridgeyNotificationListenerService's
             // resyncActiveNotifications() doc comment.
@@ -2018,10 +2181,10 @@ class PairingCoordinator(
         mediaRemote.policyChanged()
         if (received[BridgeyFeature.CLIPBOARD] == false) mutableClipboardStatus.value = null
         if (received[BridgeyFeature.BATTERY] == false) mutableRemoteBattery.value = null
-        if (received[BridgeyFeature.TELEMETRY] == false) {
-            mutableRemoteStorage.value = null
-            mutableRemoteMemory.value = null
-        }
+        if (received[BridgeyFeature.STORAGE] == false) mutableRemoteStorage.value = null
+        if (received[BridgeyFeature.MEMORY] == false) mutableRemoteMemory.value = null
+        if (received[BridgeyFeature.CPU] == false) mutableRemoteCpu.value = null
+        if (received[BridgeyFeature.TEMPERATURE] == false) mutableRemoteTemperature.value = null
         if (received[BridgeyFeature.PING] == false) clearPingStatus()
         if (received[BridgeyFeature.FIND_DEVICE] == false) {
             stopPhoneRinging()
@@ -2047,8 +2210,9 @@ class PairingCoordinator(
         android.util.Log.i("Bridgey", "PLUGIN battery received level=$level")
     }
 
+    /** Not gated by a single telemetry feature at the top - each field block below independently
+     *  checks its own Settings toggle, since Storage/Memory/CPU/Temperature are now independent. */
     private fun receiveStorageTelemetry(current: Session, message: Message) {
-        if (!featureEnabled(BridgeyFeature.TELEMETRY, current)) return
         if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
         val messageId = message.messageId ?: return
         if (!current.acceptMessageId(messageId)) return
@@ -2059,19 +2223,47 @@ class PairingCoordinator(
         ) ?: return fail("Invalid encrypted storage status")
         val payload = runCatching { JSONObject(plaintext.toString(Charsets.UTF_8)) }.getOrNull()
             ?: return fail("Invalid storage status")
-        if (payload.has("storageUsedBytes") || payload.has("storageTotalBytes")) {
+        if (featureEnabled(BridgeyFeature.STORAGE, current) &&
+            (payload.has("storageUsedBytes") || payload.has("storageTotalBytes"))
+        ) {
             val usedBytes = payload.optLong("storageUsedBytes", -1)
             val totalBytes = payload.optLong("storageTotalBytes", -1)
             if (usedBytes < 0 || totalBytes <= 0 || usedBytes > totalBytes) return fail("Invalid storage status")
             mutableRemoteStorage.value = RemoteStorageStatus(usedBytes, totalBytes)
             android.util.Log.i("Bridgey", "PLUGIN storage received usedBytes=$usedBytes totalBytes=$totalBytes")
         }
-        if (payload.has("memoryUsedBytes") || payload.has("memoryTotalBytes")) {
+        if (featureEnabled(BridgeyFeature.MEMORY, current) &&
+            (payload.has("memoryUsedBytes") || payload.has("memoryTotalBytes"))
+        ) {
             val usedBytes = payload.optLong("memoryUsedBytes", -1)
             val totalBytes = payload.optLong("memoryTotalBytes", -1)
             if (usedBytes < 0 || totalBytes <= 0 || usedBytes > totalBytes) return fail("Invalid memory status")
             mutableRemoteMemory.value = RemoteMemoryStatus(usedBytes, totalBytes)
             android.util.Log.i("Bridgey", "PLUGIN memory received usedBytes=$usedBytes totalBytes=$totalBytes")
+        }
+        if (featureEnabled(BridgeyFeature.CPU, current)) {
+            if (payload.has("cpuUnavailable")) {
+                mutableRemoteCpu.value = RemoteCpuStatus.Unavailable
+                android.util.Log.i("Bridgey", "PLUGIN cpu received unavailable")
+            } else if (payload.has("cpuPercent")) {
+                val percent = payload.optInt("cpuPercent", -1)
+                if (percent !in 0..100) return fail("Invalid cpu status")
+                mutableRemoteCpu.value = RemoteCpuStatus.Available(percent)
+                android.util.Log.i("Bridgey", "PLUGIN cpu received percent=$percent")
+            }
+        }
+        if (featureEnabled(BridgeyFeature.TEMPERATURE, current)) {
+            if (payload.has("temperatureUnavailable")) {
+                mutableRemoteTemperature.value = RemoteTemperatureStatus.Unavailable
+                android.util.Log.i("Bridgey", "PLUGIN temperature received unavailable")
+            } else if (payload.has("thermalState")) {
+                val state = payload.optString("thermalState", "")
+                if (state.isEmpty()) return fail("Invalid temperature status")
+                val celsius = if (payload.has("temperatureCelsius")) payload.optInt("temperatureCelsius", Int.MIN_VALUE) else null
+                if (celsius == Int.MIN_VALUE) return fail("Invalid temperature status")
+                mutableRemoteTemperature.value = RemoteTemperatureStatus.Known(state, celsius)
+                android.util.Log.i("Bridgey", "PLUGIN temperature received state=$state celsius=$celsius")
+            }
         }
     }
 
@@ -2084,6 +2276,7 @@ class PairingCoordinator(
         mutableRemoteStorage.value = null
         lastSentStorage = null
         resetRemoteMemoryState()
+        resetTelemetrySubscriptionState()
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
@@ -2147,7 +2340,7 @@ class PairingCoordinator(
         const val MAX_FILE_SIZE = 10L * 1024 * 1024 * 1024
         const val MAX_NOTIFICATION_ICON_BASE64_LENGTH = 28 * 1024
         const val HEARTBEAT_INTERVAL_MILLIS = 10_000L
-        const val STORAGE_TELEMETRY_INTERVAL_MILLIS = 60_000L
+        const val TELEMETRY_SAMPLING_INTERVAL_MILLIS = 3_000L
         const val STORAGE_CHANGE_THRESHOLD_BYTES = 100L * 1024 * 1024
         const val MEMORY_CHANGE_THRESHOLD_BYTES = 100L * 1024 * 1024
     }

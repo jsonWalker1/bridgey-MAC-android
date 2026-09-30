@@ -14,7 +14,10 @@ enum BridgeyFeature: String, CaseIterable, Identifiable {
     case calls
     case photoSync = "photo_sync"
     case remoteScreenShare = "remote_screen_share"
-    case telemetry
+    case storage
+    case memory
+    case cpu
+    case temperature
 
     var id: String { rawValue }
     var title: String {
@@ -30,7 +33,10 @@ enum BridgeyFeature: String, CaseIterable, Identifiable {
         case .calls: "Calls from Mac"
         case .photoSync: "Photo & video sync"
         case .remoteScreenShare: "Remote Start from Trusted Mac"
-        case .telemetry: "Device storage & system info"
+        case .storage: "Storage information"
+        case .memory: "Memory (RAM) information"
+        case .cpu: "CPU usage"
+        case .temperature: "Temperature / thermal status"
         }
     }
 
@@ -40,7 +46,7 @@ enum BridgeyFeature: String, CaseIterable, Identifiable {
 }
 
 func featureEnabledByLegacyPeer(_ feature: BridgeyFeature) -> Bool {
-    ![.calls, .ping, .links, .media, .photoSync, .remoteScreenShare, .telemetry].contains(feature)
+    ![.calls, .ping, .links, .media, .photoSync, .remoteScreenShare, .storage, .memory, .cpu, .temperature].contains(feature)
 }
 
 enum PhotoSyncDestination: String, CaseIterable, Identifiable {

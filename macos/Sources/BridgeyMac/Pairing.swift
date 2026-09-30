@@ -31,6 +31,16 @@ struct RemoteMemoryStatus: Equatable {
     let totalBytes: Int64
 }
 
+enum RemoteCpuStatus: Equatable {
+    case available(Int)
+    case unavailable
+}
+
+enum RemoteTemperatureStatus: Equatable {
+    case known(thermalState: String, celsius: Int?)
+    case unavailable
+}
+
 // RemoteCallAction / RemoteCallStatus / CallRequestPayload live in Calls.swift.
 
 struct FileTransferRow: Identifiable, Equatable {
@@ -70,23 +80,38 @@ private struct BatteryPayload: Codable {
 
 private struct TelemetryPayload: Codable {
     let version: Int
-    let storageUsedBytes: Int64?
-    let storageTotalBytes: Int64?
-    let memoryUsedBytes: Int64?
-    let memoryTotalBytes: Int64?
+    var storageUsedBytes: Int64?
+    var storageTotalBytes: Int64?
+    var memoryUsedBytes: Int64?
+    var memoryTotalBytes: Int64?
+    var cpuPercent: Int?
+    var cpuUnavailable: Bool?
+    var thermalState: String?
+    var temperatureCelsius: Int?
+    var temperatureUnavailable: Bool?
 
     init(
         version: Int,
         storageUsedBytes: Int64? = nil,
         storageTotalBytes: Int64? = nil,
         memoryUsedBytes: Int64? = nil,
-        memoryTotalBytes: Int64? = nil
+        memoryTotalBytes: Int64? = nil,
+        cpuPercent: Int? = nil,
+        cpuUnavailable: Bool? = nil,
+        thermalState: String? = nil,
+        temperatureCelsius: Int? = nil,
+        temperatureUnavailable: Bool? = nil
     ) {
         self.version = version
         self.storageUsedBytes = storageUsedBytes
         self.storageTotalBytes = storageTotalBytes
         self.memoryUsedBytes = memoryUsedBytes
         self.memoryTotalBytes = memoryTotalBytes
+        self.cpuPercent = cpuPercent
+        self.cpuUnavailable = cpuUnavailable
+        self.thermalState = thermalState
+        self.temperatureCelsius = temperatureCelsius
+        self.temperatureUnavailable = temperatureUnavailable
     }
 }
 
@@ -201,6 +226,8 @@ final class PairingCoordinator: ObservableObject {
     @Published private(set) var remoteBattery: RemoteBatteryStatus? = nil
     @Published private(set) var remoteStorage: RemoteStorageStatus? = nil
     @Published private(set) var remoteMemory: RemoteMemoryStatus? = nil
+    @Published private(set) var remoteCpu: RemoteCpuStatus? = nil
+    @Published private(set) var remoteTemperature: RemoteTemperatureStatus? = nil
     @Published private(set) var notificationsAuthorized = false
     @Published private(set) var notificationPermissionDetermined = false
     @Published private(set) var fileTransferStatus: String? = nil
@@ -294,6 +321,15 @@ final class PairingCoordinator: ObservableObject {
     private var lastSentBattery: LocalBatteryStatus?
     private var lastSentStorage: LocalStorageStatus?
     private var lastSentMemory: LocalMemoryStatus?
+    private var previousCpuSample: CpuSample?
+    // ALL telemetry (storage/memory/cpu) is on-demand only, battery-conscious: nothing is sampled or
+    // sent in the background. Opening the panel subscribes; closing it unsubscribes.
+    // While subscribed, the peer resends all three every ~3s over the existing telemetry.update kind.
+    private var remoteWantsTelemetryUpdates = false
+    private var telemetrySamplingWorkItem: DispatchWorkItem?
+    // Whether OUR OWN panel is open wanting the peer's telemetry - survives reconnects (unlike the
+    // two fields above, which are per-session) so completeIfConfirmed() can resubscribe automatically.
+    private var localWantsRemoteTelemetryUpdates = false
     private let diagnostics = BridgeyDiagnostics()
     private let notificationHistoryStore: NotificationHistoryStore
 
@@ -380,10 +416,10 @@ final class PairingCoordinator: ObservableObject {
                 DispatchQueue.main.async {
                     guard let self else { return }
                     if !self.featureEnabled(.battery) { self.remoteBattery = nil }
-                    if !self.featureEnabled(.telemetry) {
-                        self.remoteStorage = nil
-                        self.resetRemoteMemoryState()
-                    }
+                    if !self.featureEnabled(.storage) { self.remoteStorage = nil }
+                    if !self.featureEnabled(.memory) { self.resetRemoteMemoryState() }
+                    if !self.featureEnabled(.cpu) { self.remoteCpu = nil }
+                    if !self.featureEnabled(.temperature) { self.remoteTemperature = nil }
                     if !self.featureEnabled(.ping) { self.clearPingStatus() }
                     if !self.isFeatureAvailable(.links) { self.quickActions.reset() }
                     self.mediaController.reset()
@@ -483,6 +519,7 @@ final class PairingCoordinator: ObservableObject {
         remoteBattery = nil
         remoteStorage = nil
         resetRemoteMemoryState()
+        resetTelemetrySubscriptionState()
         clearPingStatus()
         quickActions.reset()
         mediaController.reset()
@@ -556,6 +593,7 @@ final class PairingCoordinator: ObservableObject {
         lastSentBattery = nil
         lastSentStorage = nil
         resetRemoteMemoryState()
+        resetTelemetrySubscriptionState()
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
         state = .idle
@@ -587,6 +625,7 @@ final class PairingCoordinator: ObservableObject {
         lastSentBattery = nil
         lastSentStorage = nil
         resetRemoteMemoryState()
+        resetTelemetrySubscriptionState()
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
         state = .idle
@@ -996,7 +1035,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func publishLocalStorage(force: Bool = false) {
-        guard isFeatureAvailable(.telemetry),
+        guard isFeatureAvailable(.storage),
               let current = session, case .connected = state,
               let status = currentMacStorageStatus(),
               force || shouldResendStorage(status, previous: lastSentStorage),
@@ -1022,6 +1061,105 @@ final class PairingCoordinator: ObservableObject {
         lastSentMemory = nil
     }
 
+    private func resetTelemetrySubscriptionState() {
+        remoteCpu = nil
+        previousCpuSample = nil
+        remoteTemperature = nil
+        remoteWantsTelemetryUpdates = false
+        telemetrySamplingWorkItem?.cancel()
+        telemetrySamplingWorkItem = nil
+    }
+
+    /// Call when the panel becomes visible. Battery-conscious by design: nothing is sampled or sent
+    /// while closed. Storage/memory/CPU are all refreshed together, every ~3s, only while the peer
+    /// confirms someone is actually looking.
+    func requestRemoteTelemetryUpdates() {
+        localWantsRemoteTelemetryUpdates = true
+        sendTelemetrySubscription(subscribe: true)
+    }
+
+    /// Call when the panel closes.
+    func stopRequestingRemoteTelemetryUpdates() {
+        localWantsRemoteTelemetryUpdates = false
+        sendTelemetrySubscription(subscribe: false)
+    }
+
+    /// Not gated by any single telemetry feature - this just signals "my panel is open/closed";
+    /// each metric's own publish function independently respects its own Settings toggle.
+    private func sendTelemetrySubscription(subscribe: Bool) {
+        guard let current = session, case .connected = state else { return }
+        current.send(PairingMessage(
+            kind: subscribe ? "telemetry.subscribe" : "telemetry.unsubscribe",
+            sessionId: current.id
+        ))
+    }
+
+    /// Peer's panel opened and wants our telemetry - start the on-demand loop that resends
+    /// storage/memory (dead-band gated, as always), CPU, and temperature (always, being rates/
+    /// instant readings) every ~3s. Not gated here by any specific feature - each publish call
+    /// below independently no-ops if its own Settings toggle is off.
+    private func startTelemetrySamplingLoop() {
+        previousCpuSample = nil
+        remoteWantsTelemetryUpdates = true
+        scheduleTelemetrySample()
+    }
+
+    private func scheduleTelemetrySample() {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.remoteWantsTelemetryUpdates else { return }
+            self.publishLocalStorage()
+            self.publishLocalMemory()
+            self.publishLocalCpu()
+            self.publishLocalTemperature()
+            self.scheduleTelemetrySample()
+        }
+        telemetrySamplingWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
+    }
+
+    /// Stops the loop only - does NOT clear the last-known storage/memory/CPU values, which stay
+    /// visible (e.g. on the connected-device card) until the next real disconnect/reconnect.
+    private func stopTelemetrySamplingLoop() {
+        remoteWantsTelemetryUpdates = false
+        previousCpuSample = nil
+        telemetrySamplingWorkItem?.cancel()
+        telemetrySamplingWorkItem = nil
+    }
+
+    /// Reads one CPU sample and, if a previous sample exists, sends the computed delta as
+    /// `cpuPercent`. The first sample after a (re)subscribe only seeds the baseline - sending
+    /// nothing that tick avoids a flash of "unavailable" before the second tick has a real delta.
+    /// A read/computation failure sends explicit `cpuUnavailable: true` rather than a fabricated
+    /// number.
+    private func publishLocalCpu() {
+        guard isFeatureAvailable(.cpu), let current = session, case .connected = state else { return }
+        let sample = currentMacCpuSample()
+        let previous = previousCpuSample
+        let status: CpuStatus?
+        if let sample {
+            previousCpuSample = sample
+            status = previous == nil ? nil : computeCpuPercent(previous: previous, current: sample)
+        } else {
+            status = .unavailable
+        }
+        guard let status else { return } // nil = first sample this subscription: seed only, send nothing
+        var payload = TelemetryPayload(version: 1)
+        switch status {
+        case .available(let percent): payload.cpuPercent = percent
+        case .unavailable: payload.cpuUnavailable = true
+        }
+        guard let plaintext = try? JSONEncoder().encode(payload),
+              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
+        current.send(PairingMessage(
+            kind: "telemetry.update",
+            sessionId: current.id,
+            messageId: UUID().uuidString.lowercased(),
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext
+        ))
+        NSLog("PLUGIN cpu sent %@", String(describing: status))
+    }
+
     private static let memoryChangeThresholdBytes: Int64 = 100 * 1024 * 1024
 
     private func shouldResendMemory(_ status: LocalMemoryStatus, previous: LocalMemoryStatus?) -> Bool {
@@ -1033,7 +1171,7 @@ final class PairingCoordinator: ObservableObject {
     /// Mirrors [publishLocalStorage]'s shape and cadence exactly - same background heartbeat call
     /// site, same dead-band principle - just a second independent metric on the same message kind.
     private func publishLocalMemory(force: Bool = false) {
-        guard isFeatureAvailable(.telemetry),
+        guard isFeatureAvailable(.memory),
               let current = session, case .connected = state,
               let status = currentMacMemoryStatus(),
               force || shouldResendMemory(status, previous: lastSentMemory),
@@ -1052,6 +1190,28 @@ final class PairingCoordinator: ObservableObject {
             ciphertext: encrypted.ciphertext
         ))
         NSLog("PLUGIN memory sent usedBytes=%lld totalBytes=%lld", status.usedBytes, status.totalBytes)
+    }
+
+    /// Thermal state is always sent when known (no dead-band - it rarely changes and is cheap to
+    /// encode). macOS never sends a Celsius value (see MacTemperature.swift for why); an explicit
+    /// unavailable state is sent rather than silence, matching CPU.
+    private func publishLocalTemperature() {
+        guard isFeatureAvailable(.temperature), let current = session, case .connected = state else { return }
+        var payload = TelemetryPayload(version: 1)
+        switch currentMacTemperatureStatus() {
+        case .known(let thermalState): payload.thermalState = thermalState
+        case .unavailable: payload.temperatureUnavailable = true
+        }
+        guard let plaintext = try? JSONEncoder().encode(payload),
+              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
+        current.send(PairingMessage(
+            kind: "telemetry.update",
+            sessionId: current.id,
+            messageId: UUID().uuidString.lowercased(),
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext
+        ))
+        NSLog("PLUGIN temperature sent")
     }
 
     func findAndroid() {
@@ -1494,6 +1654,7 @@ final class PairingCoordinator: ObservableObject {
         remoteBattery = nil
         remoteStorage = nil
         resetRemoteMemoryState()
+        resetTelemetrySubscriptionState()
         clearPingStatus()
         quickActions.reset()
         mediaController.reset()
@@ -1545,6 +1706,7 @@ final class PairingCoordinator: ObservableObject {
             self.lastSentBattery = nil
             self.lastSentStorage = nil
             self.resetRemoteMemoryState()
+            self.resetTelemetrySubscriptionState()
             self.clearRemoteCall()
             self.remoteFeatures = defaultRemoteFeatureState()
             self.remoteFeatureStateReceived = false
@@ -1686,10 +1848,10 @@ final class PairingCoordinator: ObservableObject {
                 screenStreamDecoder.reset()
                 mediaController.refresh()
                 if remoteFeatures[.battery] == false { remoteBattery = nil }
-                if remoteFeatures[.telemetry] == false {
-                    remoteStorage = nil
-                    remoteMemory = nil
-                }
+                if remoteFeatures[.storage] == false { remoteStorage = nil }
+                if remoteFeatures[.memory] == false { remoteMemory = nil }
+                if remoteFeatures[.cpu] == false { remoteCpu = nil }
+                if remoteFeatures[.temperature] == false { remoteTemperature = nil }
                 if remoteFeatures[.ping] == false { clearPingStatus() }
                 if remoteFeatures[.clipboard] == false { clearClipboardSendStatus() }
                 if remoteFeatures[.notifications] == false { clearRemoteCall() }
@@ -1796,7 +1958,8 @@ final class PairingCoordinator: ObservableObject {
                 remoteBattery = RemoteBatteryStatus(level: payload.level, isCharging: payload.isCharging)
                 NSLog("PLUGIN battery received level=%d charging=%@", payload.level, String(payload.isCharging))
             case "telemetry.update":
-                guard featureEnabled(.telemetry, current: current) else { return }
+                // Not gated by a single telemetry feature here - each field block below
+                // independently checks its own Settings toggle.
                 guard case .connected = state,
                       message.sessionId == current.id,
                       let messageID = message.messageId,
@@ -1807,16 +1970,44 @@ final class PairingCoordinator: ObservableObject {
                       let payload = try? JSONDecoder().decode(TelemetryPayload.self, from: plaintext) else {
                     throw PairingError.invalidMessage
                 }
-                if let used = payload.storageUsedBytes, let total = payload.storageTotalBytes {
+                if featureEnabled(.storage, current: current),
+                   let used = payload.storageUsedBytes, let total = payload.storageTotalBytes {
                     guard total > 0, used >= 0, used <= total else { throw PairingError.invalidMessage }
                     remoteStorage = RemoteStorageStatus(usedBytes: used, totalBytes: total)
                     NSLog("PLUGIN storage received usedBytes=%lld totalBytes=%lld", used, total)
                 }
-                if let used = payload.memoryUsedBytes, let total = payload.memoryTotalBytes {
+                if featureEnabled(.memory, current: current),
+                   let used = payload.memoryUsedBytes, let total = payload.memoryTotalBytes {
                     guard total > 0, used >= 0, used <= total else { throw PairingError.invalidMessage }
                     remoteMemory = RemoteMemoryStatus(usedBytes: used, totalBytes: total)
                     NSLog("PLUGIN memory received usedBytes=%lld totalBytes=%lld", used, total)
                 }
+                if featureEnabled(.cpu, current: current) {
+                    if payload.cpuUnavailable == true {
+                        remoteCpu = .unavailable
+                        NSLog("PLUGIN cpu received unavailable")
+                    } else if let percent = payload.cpuPercent {
+                        guard (0...100).contains(percent) else { throw PairingError.invalidMessage }
+                        remoteCpu = .available(percent)
+                        NSLog("PLUGIN cpu received percent=%d", percent)
+                    }
+                }
+                if featureEnabled(.temperature, current: current) {
+                    if payload.temperatureUnavailable == true {
+                        remoteTemperature = .unavailable
+                        NSLog("PLUGIN temperature received unavailable")
+                    } else if let thermalState = payload.thermalState {
+                        remoteTemperature = .known(thermalState: thermalState, celsius: payload.temperatureCelsius)
+                        NSLog("PLUGIN temperature received state=%@ celsius=%@", thermalState, payload.temperatureCelsius.map(String.init) ?? "nil")
+                    }
+                }
+            case "telemetry.subscribe":
+                guard case .connected = state,
+                      message.sessionId == current.id else { return }
+                startTelemetrySamplingLoop()
+            case "telemetry.unsubscribe":
+                guard message.sessionId == current.id else { return }
+                stopTelemetrySamplingLoop()
             case "notifications.post":
                 guard featureEnabled(.notifications, current: current) else { return }
                 guard case .connected = state,
@@ -2150,8 +2341,7 @@ final class PairingCoordinator: ObservableObject {
             }
             sendFeatureState()
             publishLocalBattery(force: true)
-            publishLocalStorage(force: true)
-            publishLocalMemory(force: true)
+            if localWantsRemoteTelemetryUpdates { sendTelemetrySubscription(subscribe: true) }
             scheduleHeartbeat(for: current)
             NSLog("PAIRING verified peer=%@", current.peerName)
         }
@@ -2325,8 +2515,6 @@ final class PairingCoordinator: ObservableObject {
                 messageId: UUID().uuidString.lowercased()
             ))
             self.publishLocalBattery()
-            self.publishLocalStorage()
-            self.publishLocalMemory()
             self.mediaController.refresh()
             self.scheduleHeartbeat(for: current)
         }

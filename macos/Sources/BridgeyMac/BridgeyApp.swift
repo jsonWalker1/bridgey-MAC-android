@@ -59,7 +59,11 @@ private struct BridgeyPanel: View {
         MenuBarPanelSurface {
             panelContent
         }
-        .onAppear { pairing.refreshNotificationAuthorization() }
+        .onAppear {
+            pairing.refreshNotificationAuthorization()
+            pairing.requestRemoteTelemetryUpdates()
+        }
+        .onDisappear { pairing.stopRequestingRemoteTelemetryUpdates() }
         .onChange(of: isConnected) { connected in
             if !connected { showingDeviceDetails = false }
         }
@@ -155,7 +159,7 @@ private struct BridgeyPanel: View {
                             Text("Waiting for battery status…").font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    if pairing.isFeatureAvailable(.telemetry) {
+                    if pairing.isFeatureAvailable(.storage) {
                         if let storage = pairing.remoteStorage {
                             let freeBytes = max(storage.totalBytes - storage.usedBytes, 0)
                             Label(
@@ -167,12 +171,23 @@ private struct BridgeyPanel: View {
                         } else {
                             Text("Waiting for storage status…").font(.caption).foregroundStyle(.secondary)
                         }
-                        if let memory = pairing.remoteMemory {
-                            let freeBytes = max(memory.totalBytes - memory.usedBytes, 0)
-                            Text("🧠 \(formattedByteCount(freeBytes)) free")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
+                    }
+                    if pairing.isFeatureAvailable(.memory), let memory = pairing.remoteMemory {
+                        let freeBytes = max(memory.totalBytes - memory.usedBytes, 0)
+                        Text("🧠 \(formattedByteCount(freeBytes)) free")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if pairing.isFeatureAvailable(.cpu), case .available(let percent) = pairing.remoteCpu {
+                        Text("⚙ \(percent)% CPU")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if pairing.isFeatureAvailable(.temperature), case .known(let thermalState, let celsius) = pairing.remoteTemperature {
+                        let (label, _) = thermalDisplayLabel(thermalState)
+                        Text(celsius.map { "🌡 \($0)°C" } ?? "🌡 \(label)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
                 Spacer()
@@ -365,35 +380,68 @@ private struct BridgeyPanel: View {
                 Spacer()
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Storage").font(.subheadline.weight(.semibold))
-                if !pairing.isFeatureAvailable(.telemetry) {
-                    Text("Not available").font(.caption).foregroundStyle(.secondary)
-                } else if let storage = pairing.remoteStorage {
-                    ProgressView(value: Double(storage.usedBytes), total: Double(max(storage.totalBytes, 1)))
-                    Text("\(formattedByteCount(storage.usedBytes)) used of \(formattedByteCount(storage.totalBytes))")
-                        .font(.caption)
-                    Text("\(formattedByteCount(max(storage.totalBytes - storage.usedBytes, 0))) available")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("Waiting for storage status…").font(.caption).foregroundStyle(.secondary)
+            if pairing.isFeatureAvailable(.storage) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Storage").font(.subheadline.weight(.semibold))
+                    if let storage = pairing.remoteStorage {
+                        ProgressView(value: Double(storage.usedBytes), total: Double(max(storage.totalBytes, 1)))
+                        Text("\(formattedByteCount(storage.usedBytes)) used of \(formattedByteCount(storage.totalBytes))")
+                            .font(.caption)
+                        Text("\(formattedByteCount(max(storage.totalBytes - storage.usedBytes, 0))) available")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Waiting for storage status…").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Memory").font(.subheadline.weight(.semibold))
-                if !pairing.isFeatureAvailable(.telemetry) {
-                    Text("Not available").font(.caption).foregroundStyle(.secondary)
-                } else if let memory = pairing.remoteMemory {
-                    ProgressView(value: Double(memory.usedBytes), total: Double(max(memory.totalBytes, 1)))
-                    Text("\(formattedByteCount(memory.usedBytes)) used of \(formattedByteCount(memory.totalBytes))")
-                        .font(.caption)
-                    Text("\(formattedByteCount(max(memory.totalBytes - memory.usedBytes, 0))) free")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("Waiting for memory status…").font(.caption).foregroundStyle(.secondary)
+            if pairing.isFeatureAvailable(.memory) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Memory").font(.subheadline.weight(.semibold))
+                    if let memory = pairing.remoteMemory {
+                        ProgressView(value: Double(memory.usedBytes), total: Double(max(memory.totalBytes, 1)))
+                        Text("\(formattedByteCount(memory.usedBytes)) used of \(formattedByteCount(memory.totalBytes))")
+                            .font(.caption)
+                        Text("\(formattedByteCount(max(memory.totalBytes - memory.usedBytes, 0))) free")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Waiting for memory status…").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if pairing.isFeatureAvailable(.cpu) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("CPU").font(.subheadline.weight(.semibold))
+                    switch pairing.remoteCpu {
+                    case .available(let percent):
+                        ProgressView(value: Double(percent), total: 100)
+                        Text("\(percent)%").font(.caption)
+                    case .unavailable:
+                        Text("Not available on this device").font(.caption).foregroundStyle(.secondary)
+                    case nil:
+                        Text("Waiting for CPU status…").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if pairing.isFeatureAvailable(.temperature) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Temperature").font(.subheadline.weight(.semibold))
+                    switch pairing.remoteTemperature {
+                    case .known(let thermalState, let celsius):
+                        let (label, _) = thermalDisplayLabel(thermalState)
+                        Text(celsius.map { "🌡 \($0)°C" } ?? "🌡 \(label)").font(.caption)
+                        if celsius != nil {
+                            Text(label).font(.caption).foregroundStyle(.secondary)
+                        }
+                    case .unavailable:
+                        Text("Not available on this device").font(.caption).foregroundStyle(.secondary)
+                    case nil:
+                        Text("Waiting for temperature status…").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
         }

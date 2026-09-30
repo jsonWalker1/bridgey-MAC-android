@@ -25,8 +25,22 @@ final class BridgeySettingsTests: XCTestCase {
         XCTAssertFalse(featureEnabledByLegacyPeer(.ping))
         XCTAssertFalse(featureEnabledByLegacyPeer(.photoSync))
         XCTAssertFalse(featureEnabledByLegacyPeer(.remoteScreenShare))
-        XCTAssertFalse(featureEnabledByLegacyPeer(.telemetry))
+        XCTAssertFalse(featureEnabledByLegacyPeer(.storage))
+        XCTAssertFalse(featureEnabledByLegacyPeer(.memory))
+        XCTAssertFalse(featureEnabledByLegacyPeer(.cpu))
+        XCTAssertFalse(featureEnabledByLegacyPeer(.temperature))
         XCTAssertTrue(featureEnabledByLegacyPeer(.battery))
+    }
+
+    /// Each telemetry metric is its own BridgeyFeature case, so toggling one in the settings map
+    /// structurally cannot affect the others - there is no shared "telemetry" flag left to entangle them.
+    func testTelemetryMetricsAreIndependentEntriesNotOneSharedSwitch() {
+        var allOn = Dictionary(uniqueKeysWithValues: BridgeyFeature.allCases.map { ($0, true) })
+        allOn[.storage] = false
+        XCTAssertFalse(effectiveFeatureEnabled(globalEnabled: allOn[.storage]!, deviceEnabled: nil))
+        XCTAssertTrue(effectiveFeatureEnabled(globalEnabled: allOn[.memory]!, deviceEnabled: nil))
+        XCTAssertTrue(effectiveFeatureEnabled(globalEnabled: allOn[.cpu]!, deviceEnabled: nil))
+        XCTAssertTrue(effectiveFeatureEnabled(globalEnabled: allOn[.temperature]!, deviceEnabled: nil))
     }
 
     /// Advanced Screen Continuity - Remote Start must be opt-in (off by default), unlike Bridgey's

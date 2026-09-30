@@ -18,7 +18,10 @@ enum class BridgeyFeature(val key: String, val title: String) {
     PHOTO_SYNC("photo_sync", "Photo & video sync"),
     REMOTE_SCREEN_SHARE("remote_screen_share", "Remote Start from Trusted Mac"),
     KVM_INPUT("kvm_input", "KVM Input (mouse & keyboard from Mac)"),
-    TELEMETRY("telemetry", "Device storage & system info"),
+    STORAGE("storage", "Storage information"),
+    MEMORY("memory", "Memory (RAM) information"),
+    CPU("cpu", "CPU usage"),
+    TEMPERATURE("temperature", "Temperature / thermal status"),
 }
 
 internal fun featureEnabledByLegacyPeer(feature: BridgeyFeature): Boolean =
@@ -30,7 +33,10 @@ internal fun featureEnabledByLegacyPeer(feature: BridgeyFeature): Boolean =
         BridgeyFeature.PHOTO_SYNC,
         BridgeyFeature.REMOTE_SCREEN_SHARE,
         BridgeyFeature.KVM_INPUT,
-        BridgeyFeature.TELEMETRY,
+        BridgeyFeature.STORAGE,
+        BridgeyFeature.MEMORY,
+        BridgeyFeature.CPU,
+        BridgeyFeature.TEMPERATURE,
     )
 
 /** Features that default to OFF (opt-in) rather than Bridgey's usual default-on convenience

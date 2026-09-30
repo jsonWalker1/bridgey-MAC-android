@@ -1,7 +1,8 @@
 # BRIDGEY — DEVICE TELEMETRY STATE
 
-Status as of 2026-09-29. Read this file + `CLAUDE.md` first; do not re-read the
-full repo. Committed in `7cd621e` (pushed to `origin/main`).
+Status as of 2026-09-30. Read this file + `CLAUDE.md` first; do not re-read the
+full repo. Phase 1/2 committed in `7cd621e` (pushed to `origin/main`). Phase
+3/4 + settings split (§12) is the newest work — see that section first.
 
 ## 1. WHAT THIS FEATURE IS
 
@@ -198,3 +199,103 @@ at the same cadence, with the same dead-band, sent on the same message kind.
   permission available to script the Mac menu-bar click; code path is fully
   symmetric with the verified direction. Also not separately verified: RAM
   behavior across a mid-session disconnect/reconnect.
+
+## 12. PHASE 3 (CPU) + PHASE 4 (TEMPERATURE) + PER-METRIC SETTINGS — 2026-09-30
+
+**Battery-conscious lifecycle reaffirmed and generalized**: ALL telemetry
+(storage/memory/CPU/temperature) is now on-demand only, driven by one shared
+`telemetry.subscribe`/`telemetry.unsubscribe` pair tied to the app being in
+the *foreground* (Android: `LifecycleStartEffect` on the top-level screen)
+or the panel being *open* (macOS: `onAppear`/`onDisappear` on `BridgeyPanel`'s
+body, not just the deeper device-details drill-down). Nothing is sampled or
+sent while backgrounded/closed. While subscribed, one shared ~3s loop calls
+all four publish functions; each is independently gated by its own Settings
+feature, so no per-metric subscription bookkeeping was needed.
+
+- **Settings split**: `BridgeyFeature.TELEMETRY` (one shared toggle) is now
+  four independent cases — `STORAGE`/`MEMORY`/`CPU`/`TEMPERATURE` (Android),
+  `.storage`/`.memory`/`.cpu`/`.temperature` (macOS). This reused the
+  existing generic capability-negotiation/Settings-UI architecture
+  unchanged (`BridgeyFeature.entries`/`.allCases` iteration already renders
+  one toggle row per case and negotiates each independently over the
+  existing `features.update` message) — **zero new protocol or UI
+  plumbing**, confirmed on real hardware: Settings now shows "Storage
+  information" / "Memory (RAM) information" / "CPU usage" / "Temperature /
+  thermal status" as four separate switches, each independently
+  persisted/negotiated.
+- **"Disabled = hidden"**: every telemetry UI section (compact card line +
+  device-details block) is now wrapped in `if (metricEnabled)` rather than
+  showing an "Unavailable" placeholder — confirmed on hardware: turning off
+  "CPU usage" made the ⚙ line vanish from the compact card and the whole CPU
+  block vanish from details, while Storage/Memory/Temperature kept updating
+  live, unaffected. `adb logcat` confirmed CPU sampling/transmission
+  actually stopped (no more `PLUGIN cpu sent/received` lines) while
+  temperature kept flowing normally in the same window.
+- **CPU (Phase 3)** — Android: `/proc/stat` delta between two samples
+  (`AndroidCpu.kt`). Semantics: aggregate all-core utilization, 0-100%,
+  first-sample-seeds-silently, rollover/zero-delta → explicit unavailable.
+  macOS: `host_statistics(HOST_CPU_LOAD_INFO)` (`MacCpu.swift`), same
+  delta-ratio algorithm. `cpuPercent`/`cpuUnavailable` fields on
+  `telemetry.update`.
+- **Temperature (Phase 4)** — researched before writing any code (see
+  `AndroidTemperature.kt`/`MacTemperature.swift` doc comments for the full
+  reasoning): neither platform exposes real Celsius through a normal,
+  permission-free *public* API. Both send `thermalState` (Android:
+  `PowerManager.getCurrentThermalStatus()`, 7 levels, API 29+; macOS:
+  `ProcessInfo.thermalState`, 4 levels) as the reliable, honest baseline.
+  **Android bonus**: real CPU-area °C from raw `/sys/class/thermal` sysfs
+  zones (confirmed empirically readable *without any permission* on this
+  project's Samsung S23 Ultra, Android 16 — NOT a documented/guaranteed API,
+  commonly root-locked on other OEMs/versions) — max across zones whose
+  `type` starts with `cpu` (`cpuss-*`, `cpu-<cluster>-<core>`), sent as
+  `temperatureCelsius` alongside `thermalState`. **macOS deliberately gets no
+  Celsius** — real temperature there requires the private/undocumented SMC,
+  explicitly out of scope without separate approval. A shared
+  `thermalDisplayLabel()` (implemented natively on each platform, same
+  logic) buckets either platform's raw state string into one understandable
+  4-tier label (Normal/Fair/Warm/Serious/Critical) for UI color/text — the
+  real platform-native state is still what's stored/sent, this is display-
+  only.
+- **Real bug found + fixed via live-device testing (not caught by unit
+  tests)**: `currentAndroidCpuTemperatureCelsius()`'s first version wrapped
+  the *entire* zone scan in one try/catch — one specific zone
+  (`thermal_zone75-81`/`89-91` on this device, likely camera/modem sub-zones
+  that go briefly unreadable) threw `EINVAL` on read, which aborted the
+  whole scan via exception propagation and silently discarded every OTHER
+  zone's perfectly good reading, permanently reporting `celsius=null` even
+  though `cpuss-*`/`cpu-*` zones were fine. Fixed by wrapping each zone's
+  read in its own try/catch so one bad zone no longer poisons the rest.
+  Confirmed via `adb logcat` before/after: `celsius=null` → `celsius=50`,
+  `celsius=46` (real, plausible values). **Lesson for next session**: this
+  exact class of bug (per-item exception scoping in a scan/aggregate loop)
+  is easy to write and easy to miss without literally reading live log
+  output — the pure unit tests for `maxCpuTemperatureCelsius()` all passed
+  throughout, since they don't exercise the file-scan/exception-handling
+  layer at all.
+- **Tests**: `AndroidCpuTest.kt` (10), `MacCpuTests.swift` (8),
+  `AndroidTemperatureTest.kt` (9), `MacTemperatureTests.swift` (4, incl. one
+  live-host smoke test), plus settings-independence assertions added to both
+  `BridgeySettingsTest.kt`/`BridgeySettingsTests.swift`. All pure
+  calculation/mapping functions — deliberately no new mock Session/network
+  harness (matches the task's own "don't build a large mock harness"
+  instruction); the settings×lifecycle interaction claims (disabled →
+  not sampled/transmitted/subscribed, re-enable resumes, reconnect respects
+  setting) are verified by the real-device pass below instead. Full suites
+  green: Android `testDebugUnitTest` + `assembleDebug`, macOS `swift test`
+  (250/250) + `swift build`.
+- **Real-device validation (Samsung S23 Ultra ↔ this Mac)**: ✅ connect, ✅
+  compact card shows all 4 metrics (▣ storage, 🧠 memory, ⚙ CPU%, 🌡
+  temperature) live-updating while app foregrounded, ✅ device-details shows
+  all 4 sections with matching values, ✅ Settings shows 4 independent
+  toggles (screenshot), ✅ disabling CPU hides it everywhere immediately and
+  stops its traffic while Storage/Memory/Temperature keep working
+  (screenshot + logcat), ✅ Android's own CPU-unavailable path confirmed
+  live (`/proc/stat` permission denied on this device, exactly as found in
+  Phase 3's own research — sends explicit `cpuUnavailable: true`, never a
+  fake number). **Not verified this pass**: re-enabling CPU after disable
+  (session ended before that step — user chose to toggle it back on
+  manually rather than via further scripted taps); Mac-side temperature
+  display (no Accessibility permission to script the Mac menu-bar open, same
+  known limitation as Phase 2); mid-session disconnect/reconnect specifically
+  for CPU/temperature state.
+- Committed together with this state update — see git log for the exact hash.
