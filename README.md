@@ -286,6 +286,18 @@ cd macos
 open .build/debug/Bridgey.app
 ```
 
+For local builds, `build-app.sh` signs with an "Apple Development"
+certificate when one is in the keychain (free Apple ID: Xcode → Settings →
+Accounts → Manage Certificates → + → Apple Development). Its Team ID keeps
+the app's code identity stable across rebuilds, so macOS stops asking for
+Keychain access to Bridgey's identity key after every update; ad-hoc and
+self-signed builds get a new identity each time. If the certificate shows as
+not valid (`security find-identity -v -p codesigning` reports 0 valid
+identities), import Apple's intermediate
+[AppleWWDRCAG3.cer](https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer)
+into the login keychain. Set `BRIDGEY_ADHOC_SIGNING=1` to force ad-hoc
+signing, or `MACOS_SIGNING_IDENTITY` for a release identity.
+
 The `.app` bundle is required for Notification Center integration. The raw
 SwiftPM executable remains useful for core diagnostics, but macOS does not
 register it as a notification-capable application.
