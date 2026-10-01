@@ -51,31 +51,56 @@ class NsdDiscoveryService(
     // reassociation). NsdManager does not acquire this on the app's behalf.
     private var multicastLock: WifiManager.MulticastLock? = null
 
-    private val registrationListener = object : NsdManager.RegistrationListener {
+    // NSD SELF-HEALING (2026-10-01): every registration/browse cycle uses FRESH listener instances,
+    // tagged with a generation. NsdManager tears down a stopped listener asynchronously and refuses
+    // to reuse an instance until then ("listener already in use"); reusing the same two listeners
+    // across a restart made the new registration fail while the old one was still being torn
+    // down, leaving the phone neither published nor browsing until the app restarted (reproduced
+    // live on a Wi-Fi off/on: "browse start failed: listener already in use" followed 14 ms later
+    // by "browsing stopped" + "service unpublished", then no reconnect for 8+ minutes). Callbacks
+    // from an older generation are ignored; any failure or unexpected stop of the CURRENT
+    // generation schedules a retry with backoff instead of giving up.
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var generation = 0
+    private var registrationListener: NsdManager.RegistrationListener? = null
+    private var discoveryListener: NsdManager.DiscoveryListener? = null
+    private var registeredGeneration = -1
+    private var browsingGeneration = -1
+    private var retryAttempt = 0
+    private val retryRunnable = Runnable { restartNsd(reason = "retry", force = true) }
+    private val deferredRestartRunnable = Runnable { restartNsd(reason = "deferred network change", force = true) }
+    private val beginRunnable = Runnable { beginNsd() }
+
+    private fun newRegistrationListener(gen: Int) = object : NsdManager.RegistrationListener {
         override fun onServiceRegistered(info: NsdServiceInfo) {
             Log.i(TAG, "DISCOVERY service published name=${info.serviceName}")
+            onCycleHealthy(gen, registered = true)
         }
         override fun onRegistrationFailed(info: NsdServiceInfo, errorCode: Int) {
             Log.w(TAG, "DISCOVERY publish failed code=$errorCode")
+            onCycleFailed(gen, "publish failed code=$errorCode")
         }
         override fun onServiceUnregistered(info: NsdServiceInfo) {
             Log.i(TAG, "DISCOVERY service unpublished")
+            onCycleFailed(gen, "service unpublished unexpectedly")
         }
         override fun onUnregistrationFailed(info: NsdServiceInfo, errorCode: Int) {
             Log.w(TAG, "DISCOVERY unpublish failed code=$errorCode")
         }
     }
 
-    private val discoveryListener = object : NsdManager.DiscoveryListener {
+    private fun newDiscoveryListener(gen: Int) = object : NsdManager.DiscoveryListener {
         override fun onDiscoveryStarted(type: String) {
             Log.i(TAG, "DISCOVERY browsing started")
+            onCycleHealthy(gen, registered = false)
         }
         override fun onDiscoveryStopped(type: String) {
             Log.i(TAG, "DISCOVERY browsing stopped")
+            onCycleFailed(gen, "browsing stopped unexpectedly")
         }
         override fun onStartDiscoveryFailed(type: String, errorCode: Int) {
             Log.w(TAG, "DISCOVERY browse start failed code=$errorCode")
-            running = false
+            onCycleFailed(gen, "browse start failed code=$errorCode")
         }
         override fun onStopDiscoveryFailed(type: String, errorCode: Int) {
             Log.w(TAG, "DISCOVERY browse stop failed code=$errorCode")
@@ -97,6 +122,7 @@ class NsdDiscoveryService(
     override fun start() {
         if (running) return
         running = true
+        retryAttempt = 0
         runCatching {
             wifiManager?.createMulticastLock("bridgey-discovery")?.apply {
                 setReferenceCounted(false)
@@ -112,16 +138,9 @@ class NsdDiscoveryService(
                 networkCallback,
             )
         }.onFailure { Log.w(TAG, "DISCOVERY could not register network callback: ${it.message}") }
-        // Seeds the restartNsd() debounce window as of the registration this beginNsd() call is
-        // about to make. registerNetworkCallback delivers an immediate onAvailable for a network
-        // that's already up (the common case: Wi-Fi already connected at cold start), racing this
-        // same beginNsd() on another thread. Without this, that immediate callback wins the race
-        // and unregisters the listeners this call is still in the middle of registering (NsdManager
-        // marks a listener "in use" synchronously on registerService/discoverServices, well before
-        // its onServiceRegistered/onDiscoveryStarted confirmation) - registering the replacement
-        // then throws "already in use" (caught below), and the net result is BOTH the original and
-        // the replacement registration end up torn down: mDNS goes completely dark until some other
-        // network event happens to trigger another restartNsd().
+        // registerNetworkCallback delivers an immediate onAvailable for a network that is already
+        // up (the common cold-start case). Seeding the debounce window makes that callback defer to
+        // the end of the window instead of tearing down this brand-new registration at once.
         lastRestartElapsedMs = SystemClock.elapsedRealtime()
         beginNsd()
     }
@@ -130,31 +149,56 @@ class NsdDiscoveryService(
     override fun stop() {
         if (!running) return
         running = false
+        handler.removeCallbacks(retryRunnable)
+        handler.removeCallbacks(deferredRestartRunnable)
+        handler.removeCallbacks(beginRunnable)
         runCatching { connectivityManager?.unregisterNetworkCallback(networkCallback) }
-        runCatching { nsd.stopServiceDiscovery(discoveryListener) }
-        runCatching { nsd.unregisterService(registrationListener) }
+        tearDownCurrentCycle()
         runCatching { multicastLock?.release() }
         multicastLock = null
         found.clear()
         emitPeers()
     }
 
-    /** Re-issues registration + browse against whatever network is current. Safe to call while
-     * already running (unlike [start], which is a one-time no-op guard). */
+    /** Re-issues registration + browse against whatever network is current, with fresh listeners.
+     * Network changes inside the debounce window are deferred to its end, never dropped. */
     @Synchronized
-    private fun restartNsd() {
+    private fun restartNsd(reason: String = "network available", force: Boolean = false) {
         if (!running) return
         val now = SystemClock.elapsedRealtime()
-        if (now - lastRestartElapsedMs < 3_000) return
+        val sinceLast = now - lastRestartElapsedMs
+        if (!force && sinceLast < RESTART_DEBOUNCE_MS) {
+            handler.removeCallbacks(deferredRestartRunnable)
+            handler.postDelayed(deferredRestartRunnable, RESTART_DEBOUNCE_MS - sinceLast)
+            return
+        }
         lastRestartElapsedMs = now
-        runCatching { nsd.stopServiceDiscovery(discoveryListener) }
-        runCatching { nsd.unregisterService(registrationListener) }
+        handler.removeCallbacks(retryRunnable)
+        handler.removeCallbacks(deferredRestartRunnable)
+        Log.i(TAG, "DISCOVERY restarting ($reason)")
+        tearDownCurrentCycle()
         found.clear()
         emitPeers()
-        beginNsd()
+        // Fresh listeners can never collide with the old ones; the short pause only gives the
+        // asynchronous unregister time to finish so the service keeps its exact mDNS name.
+        handler.removeCallbacks(beginRunnable)
+        handler.postDelayed(beginRunnable, REREGISTER_DELAY_MS)
     }
 
+    /** Stops the current cycle. Bumping the generation first makes its stop callbacks "old". */
+    private fun tearDownCurrentCycle() {
+        generation++
+        registrationListener?.let { listener -> runCatching { nsd.unregisterService(listener) } }
+        discoveryListener?.let { listener -> runCatching { nsd.stopServiceDiscovery(listener) } }
+        registrationListener = null
+        discoveryListener = null
+    }
+
+    @Synchronized
     private fun beginNsd() {
+        if (!running) return
+        tearDownCurrentCycle()
+        val gen = generation
         val info = NsdServiceInfo().apply {
             serviceName = registeredServiceName
             serviceType = SERVICE_TYPE
@@ -164,19 +208,38 @@ class NsdDiscoveryService(
             setAttribute("version", PROTOCOL_VERSION.toString())
             setAttribute("platform", "android")
         }
-        // registerService/discoverServices reuse the same listener instances restartNsd() just
-        // asked NsdManager to unregister/stop - that teardown is async (confirmed only via
-        // onServiceUnregistered/onStopDiscoveryFailed), so NsdManager can still consider a listener
-        // "in use" here and throw IllegalArgumentException. Observed in practice: registerNetworkCallback
-        // fires onAvailable immediately for an already-connected Wi-Fi network, so restartNsd() runs
-        // within milliseconds of start()'s own beginNsd() on every cold start with Wi-Fi already up -
-        // this raced and crashed the whole app on every launch once ACCESS_NETWORK_STATE let the
-        // network callback actually register. Safe to swallow: if the old registration is still
-        // technically alive, the service/browse it set up keeps working regardless.
-        runCatching { nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, registrationListener) }
-            .onFailure { Log.w(TAG, "DISCOVERY publish start failed: ${it.message}") }
-        runCatching { nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener) }
-            .onFailure { Log.w(TAG, "DISCOVERY browse start failed: ${it.message}") }
+        val registration = newRegistrationListener(gen).also { registrationListener = it }
+        val browse = newDiscoveryListener(gen).also { discoveryListener = it }
+        runCatching { nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, registration) }
+            .onFailure {
+                Log.w(TAG, "DISCOVERY publish start failed: ${it.message}")
+                onCycleFailed(gen, "publish start threw")
+            }
+        runCatching { nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, browse) }
+            .onFailure {
+                Log.w(TAG, "DISCOVERY browse start failed: ${it.message}")
+                onCycleFailed(gen, "browse start threw")
+            }
+    }
+
+    @Synchronized
+    private fun onCycleHealthy(gen: Int, registered: Boolean) {
+        if (gen != generation) return
+        if (registered) registeredGeneration = gen else browsingGeneration = gen
+        if (registeredGeneration == gen && browsingGeneration == gen) {
+            retryAttempt = 0
+            handler.removeCallbacks(retryRunnable)
+        }
+    }
+
+    /** A failure or unexpected stop of the CURRENT cycle: never give up while running. */
+    @Synchronized
+    private fun onCycleFailed(gen: Int, reason: String) {
+        if (!running || gen != generation) return
+        val delay = discoveryRetryDelayMillis(retryAttempt++)
+        Log.w(TAG, "DISCOVERY self-heal: $reason, retrying in ${delay}ms")
+        handler.removeCallbacks(retryRunnable)
+        handler.postDelayed(retryRunnable, delay)
     }
 
     @Synchronized
@@ -226,9 +289,20 @@ class NsdDiscoveryService(
         const val DEFAULT_PORT = 42_458
         const val PROTOCOL_VERSION = 1
         private const val TAG = "Bridgey"
+        private const val RESTART_DEBOUNCE_MS = 3_000L
+        private const val REREGISTER_DELAY_MS = 750L
     }
 }
 
 data class LocalDiscoveryIdentity(val deviceId: String, val deviceName: String) {
     init { require(runCatching { UUID.fromString(deviceId) }.isSuccess) }
+}
+
+/** Backoff for re-establishing NSD after a failure: 2 s, 5 s, 15 s, 30 s, then every 60 s. */
+internal fun discoveryRetryDelayMillis(attempt: Int): Long = when {
+    attempt <= 0 -> 2_000L
+    attempt == 1 -> 5_000L
+    attempt == 2 -> 15_000L
+    attempt == 3 -> 30_000L
+    else -> 60_000L
 }

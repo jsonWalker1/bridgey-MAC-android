@@ -2200,7 +2200,7 @@ class PairingCoordinator(
     private fun confirm(current: Session) {
         current.localConfirmed = true
         val identityKey = identity.publicKey()
-        current.send(
+        val sent = current.send(
             Message(
                 kind = "pairing.confirm",
                 sessionId = current.id,
@@ -2210,6 +2210,14 @@ class PairingCoordinator(
                 signature = identity.sign(authTranscript(current)),
             ),
         )
+        // ZOMBIE-SESSION GUARD (2026-10-01): a confirmation that never reached the peer must not
+        // complete pairing. Closing the socket ends this session's read loop, which then fails the
+        // session normally and keeps the reconnect schedule alive.
+        if (!sent) {
+            android.util.Log.w("Bridgey", "PAIRING confirmation not delivered, closing session")
+            current.close()
+            return
+        }
         completeIfConfirmed(current)
     }
 
@@ -2224,6 +2232,16 @@ class PairingCoordinator(
 
     private fun completeIfConfirmed(current: Session) {
         if (current.localConfirmed && current.remoteConfirmed) {
+            // ZOMBIE-SESSION GUARD (2026-10-01): only the active session may become Connected. A
+            // session replaced or failed meanwhile (observed live: a parallel connection replaced
+            // and then lost the active session 13 ms before this one finished confirming) would
+            // otherwise mark Bridgey "Connected" with no socket and cancel the pending reconnect,
+            // leaving the phone silently disconnected until the app restarted.
+            if (session !== current) {
+                android.util.Log.w("Bridgey", "PAIRING verification ignored: session is no longer active")
+                current.close()
+                return
+            }
             trust.save(current.remoteDeviceId, current.peerName, current.remoteIdentityKey!!)
             reconnectJob?.cancel()
             reconnectJob = null
