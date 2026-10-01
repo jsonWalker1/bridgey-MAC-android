@@ -978,6 +978,7 @@ class PairingCoordinator(
         availableAudioRoutes: List<String>? = null,
         bluetoothRouteName: String? = null,
         resync: Boolean = false,
+        conversationId: String? = null,
     ) {
         if (!isFeatureAvailable(BridgeyFeature.NOTIFICATIONS)) return
         val connectedSession = session ?: return
@@ -1008,6 +1009,9 @@ class PairingCoordinator(
                         put("bluetoothRouteName", bluetoothRouteName.take(64))
                     }
                     if (resync) put("resync", true)
+                    // TAP ROUTING POC: the app's own conversation id (Notification.shortcutId), generic
+                    // for every app; the Mac decides whether it can map it to a native target.
+                    if (!conversationId.isNullOrBlank() && conversationId.length <= 256) put("conversationId", conversationId)
                 }
                 .put("actions", JSONArray().apply {
                     actions.take(4).forEach { action ->

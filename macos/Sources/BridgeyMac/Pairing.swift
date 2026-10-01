@@ -131,6 +131,8 @@ struct RemoteNotificationPayload: Codable {
     /// BRIDGEY NOTIFICATION++ RECONCILIATION: `true` = a re-post of an existing notification
     /// (reconnect/reconciliation) - replace it silently, no banner and no sound.
     let resync: Bool?
+    /// TAP ROUTING POC: Android `Notification.shortcutId` (conversation id), when the app sets one.
+    let conversationId: String?
 }
 
 struct RemoteNotificationActionPayload: Codable {
@@ -195,6 +197,8 @@ private func defaultRemoteFeatureState() -> [BridgeyFeature: Bool] {
 private final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
     var onDismiss: ((String, String) -> Void)?
     var onAction: ((String, String, String, String?) -> Void)?
+    /// TAP ROUTING POC: (notificationID, deviceID, androidPackage, conversationID).
+    var onOpen: ((String, String, String, String?) -> Void)?
 
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
@@ -219,6 +223,12 @@ private final class NotificationPresenter: NSObject, UNUserNotificationCenterDel
               let deviceID = response.notification.request.content.userInfo["androidDeviceId"] as? String else { return }
         if response.actionIdentifier == UNNotificationDismissActionIdentifier {
             onDismiss?(notificationID, deviceID)
+        } else if response.actionIdentifier == UNNotificationDefaultActionIdentifier {
+            // TAP ROUTING POC: a plain click on the notification body used to do nothing.
+            let userInfo = response.notification.request.content.userInfo
+            if let package = userInfo["androidPackage"] as? String {
+                onOpen?(notificationID, deviceID, package, userInfo["androidConversationId"] as? String)
+            }
         } else if response.actionIdentifier != UNNotificationDefaultActionIdentifier {
             let replyText = (response as? UNTextInputNotificationResponse)?.userText
             onAction?(notificationID, deviceID, response.actionIdentifier, replyText)
@@ -364,6 +374,11 @@ final class PairingCoordinator: ObservableObject {
                 // Already forwarded as notifications.dismiss - never include it in a Clear All.
                 self?.clearAllDetector.noteExplainedRemoval([remoteNotificationRequestIdentifier(deviceID: deviceID, notificationID: notificationID)], at: Date())
                 self?.dismissAndroidNotification(notificationID, deviceID: deviceID)
+            }
+        }
+        notificationPresenter.onOpen = { [weak self] notificationID, deviceID, package, conversationID in
+            Task { @MainActor [weak self] in
+                self?.handleNotificationTapPoc(notificationID, deviceID: deviceID, androidPackage: package, conversationID: conversationID)
             }
         }
         notificationPresenter.onAction = { [weak self] notificationID, deviceID, actionToken, replyText in
@@ -2543,6 +2558,36 @@ final class PairingCoordinator: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: timeout)
     }
 
+    // MARK: - BRIDGEY NOTIFICATION TAP ROUTING POC - NOT PRODUCTION (see NotificationTapRouterPoc.swift)
+
+    private func handleNotificationTapPoc(_ notificationID: String, deviceID: String, androidPackage: String, conversationID: String?) {
+        let identifier = remoteNotificationRequestIdentifier(deviceID: deviceID, notificationID: notificationID)
+        // macOS removes a clicked notification from Notification Center without a dismiss callback;
+        // it must never count towards an inferred Clear All.
+        clearAllDetector.noteExplainedRemoval([identifier], at: Date())
+        let policy = NotificationTapPolicy.current
+        let target = resolveNotificationTapTargetOnThisMac(androidPackage: androidPackage, conversationID: conversationID)
+        NSLog("POC_TAP clicked package=%@ conversation=%@ target=%@ policy=%@", androidPackage,
+              conversationID.map { $0.contains("@") ? "*@" + ($0.split(separator: "@").last.map(String.init) ?? "") : "present" } ?? "none",
+              String(describing: target), policy.rawValue)
+        guard target != .none else {
+            NSLog("POC_TAP fallback: no macOS target, existing behaviour kept")
+            return
+        }
+        openNotificationTapTarget(target) { [weak self] success, detail in
+            guard let self else { return }
+            NSLog("POC_TAP open success=%@ detail=%@", String(success), detail)
+            if success && policy == .clear {
+                self.dismissAndroidNotification(notificationID, deviceID: deviceID)
+                NSLog("POC_TAP clear: dismiss sent to Android")
+            }
+            UNUserNotificationCenter.current().getDeliveredNotifications { delivered in
+                let stillDelivered = delivered.contains { $0.request.identifier == identifier }
+                NSLog("POC_TAP after-open macStillDelivered=%@", String(stillDelivered))
+            }
+        }
+    }
+
     // MARK: - BRIDGEY NOTIFICATION++ macOS CLEAR ALL (see NotificationClearAllDetector.swift)
 
     private var clearAllDetector = NotificationClearAllDetector()
@@ -2682,6 +2727,9 @@ final class PairingCoordinator: ObservableObject {
             "androidDeviceId": deviceID,
             "resync": resync,
         ]
+        if let conversationID = payload.conversationId, !conversationID.isEmpty, conversationID.count <= 256 {
+            content.userInfo["androidConversationId"] = conversationID // TAP ROUTING POC
+        }
         let request = UNNotificationRequest(
             identifier: identifier,
             content: content,

@@ -168,6 +168,7 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
                 availableAudioRoutes = audioRoutes,
                 bluetoothRouteName = bluetoothRouteName,
                 resync = resync,
+                conversationId = notification.shortcutId, // TAP ROUTING POC
             )
             markForwarded(notificationId)
             val now = android.os.SystemClock.elapsedRealtime()

@@ -109,7 +109,33 @@ the Mac cannot have seen).
 - Not yet validated on hardware: WhatsApp multi-message conversation, multiple
   conversations, Notification Sync OFF/ON toggle, phone reboot.
 
-## 7. NOT IN SCOPE / DECIDED
+## 7. NOTIFICATION TAP ROUTING — PROOF OF CONCEPT (2026-10-01, NOT HARDWARE-TESTED)
+
+Clicking a mirrored notification on the Mac (`UNNotificationDefaultActionIdentifier`)
+previously did nothing; the existing Android "Open" action button
+(`contentIntent`, Notification++ POC in `0bdbec4`) opens the app on the phone and
+is unchanged.
+
+- Android sends `conversationId` (= `shortcutId`) on every `notifications.post`.
+- macOS `NotificationTapRouterPoc.swift`: Android package → macOS app catalog
+  (POC data: WhatsApp, Discord, Slack, Telegram), installed-check via
+  `NSWorkspace.urlForApplication(withBundleIdentifier:)`, deep link only if the
+  app is registered for it (`urlsForApplications(toOpen:)`), opened with
+  `NSWorkspace.open(_:withApplicationAt:)` / `openApplication(at:)` whose
+  completion reports the real result. No target → existing behaviour.
+- Policy without UI: `defaults write dev.bridgey.mac BridgeyPocTapPolicy clear|keep`
+  (default `clear`). Open & Clear sends `notifications.dismiss` only after a
+  successful open. A click removes the notification from Notification Center
+  without a dismiss callback, so the tap is registered as an explained removal
+  for the Clear All detector.
+- WhatsApp: Mac opens a chat only from a phone number (`whatsapp://send?phone=`).
+  Android conversation ids observed so far are `<id>@lid` (no number) → expected
+  result is "open WhatsApp app", not the specific chat. Group ids (`@g.us`)
+  cannot be mapped either. To confirm with a real incoming WhatsApp message.
+- Pending hardware matrix: plain notification click (fallback), WhatsApp click
+  (Open & Clear, Open & Keep), reconnect/resync/update keep `conversationId`.
+
+## 8. NOT IN SCOPE / DECIDED
 
 - No Bridgey UI button for clearing phone notifications.
 - No private API, Accessibility or UI automation for Notification Center.

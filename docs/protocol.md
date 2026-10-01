@@ -422,6 +422,14 @@ with exactly the same filters and identity as `notifications.post`).
   after Android reports a `REASON_CANCEL_ALL` removal. There is no periodic sync.
 - Clients that do not recognise `notifications.sync` ignore it.
 
+`notifications.post` may carry an optional string `conversationId` (at most 256
+characters): the source app's own conversation identifier
+(`Notification.shortcutId`), sent for every app that sets one. It is used only
+by the experimental notification tap-routing proof of concept, which maps it to
+a native macOS deep link where possible (for example a WhatsApp
+`<phone>@s.whatsapp.net` JID); `<id>@lid` and group IDs cannot be mapped. Older
+receivers ignore the field.
+
 `notifications.post` may carry an optional boolean `resync`. `true` marks a
 re-post of a notification that already existed (reconnect or reconciliation):
 macOS replaces its delivered notification without a banner or sound. Absent or
