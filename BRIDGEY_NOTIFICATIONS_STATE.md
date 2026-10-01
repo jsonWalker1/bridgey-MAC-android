@@ -109,31 +109,35 @@ the Mac cannot have seen).
 - Not yet validated on hardware: WhatsApp multi-message conversation, multiple
   conversations, Notification Sync OFF/ON toggle, phone reboot.
 
-## 7. NOTIFICATION TAP ROUTING — PROOF OF CONCEPT (2026-10-01, NOT HARDWARE-TESTED)
+## 7. NOTIFICATION CLICK ACTIONS (per-app routing, macOS)
 
-Clicking a mirrored notification on the Mac (`UNNotificationDefaultActionIdentifier`)
-previously did nothing; the existing Android "Open" action button
-(`contentIntent`, Notification++ POC in `0bdbec4`) opens the app on the phone and
-is unchanged.
+Replaces the tap-routing POC (`6d72ffb`). `NotificationActionRouting.swift`:
 
-- Android sends `conversationId` (= `shortcutId`) on every `notifications.post`.
-- macOS `NotificationTapRouterPoc.swift`: Android package → macOS app catalog
-  (POC data: WhatsApp, Discord, Slack, Telegram), installed-check via
-  `NSWorkspace.urlForApplication(withBundleIdentifier:)`, deep link only if the
-  app is registered for it (`urlsForApplications(toOpen:)`), opened with
-  `NSWorkspace.open(_:withApplicationAt:)` / `openApplication(at:)` whose
-  completion reports the real result. No target → existing behaviour.
-- Policy without UI: `defaults write dev.bridgey.mac BridgeyPocTapPolicy clear|keep`
-  (default `clear`). Open & Clear sends `notifications.dismiss` only after a
-  successful open. A click removes the notification from Notification Center
-  without a dismiss callback, so the tap is registered as an explained removal
-  for the Clear All detector.
-- WhatsApp: Mac opens a chat only from a phone number (`whatsapp://send?phone=`).
-  Android conversation ids observed so far are `<id>@lid` (no number) → expected
-  result is "open WhatsApp app", not the specific chat. Group ids (`@g.us`)
-  cannot be mapped either. To confirm with a real incoming WhatsApp message.
-- Pending hardware matrix: plain notification click (fallback), WhatsApp click
-  (Open & Clear, Open & Keep), reconnect/resync/update keep `conversationId`.
+- **Model**: `NotificationActionRule` (Android package, display name, action,
+  Mac app bundle identifier + name, URL, Clear/Keep) and a global
+  `NotificationActionDefaults`. Actions: `ask`, `openNativeApp`, `openURL`
+  (`{conversationId}` placeholder, URL-encoded), `openOnPhone` (the
+  notification's own Android "Open" action), `doNothing`.
+- **Routing**: per-app rule → global default (ask / open on phone / do nothing)
+  → `ask`. A rule whose target is unusable (app not installed, invalid URL, phone
+  not available) falls through to the default.
+- **Clear** = exactly like closing the notification (removed on the Mac,
+  `notifications.dismiss` to the phone; while disconnected Android keeps it and
+  the next resync brings it back). **Keep** = stays on both; macOS removes a
+  clicked notification, so Bridgey re-adds the same request silently (without
+  the icon attachment). A failed open never clears. Every click is registered as
+  an explained removal for the Clear All detector.
+- **Ask**: native alert — choose a Mac app (`NSOpenPanel`, stored by bundle
+  identifier), open on phone (if available), or cancel; optional "Always do
+  this for <app>" creates the rule.
+- **Settings → Notification click actions**: default action + Clear/Keep, one
+  row per app rule (action, Mac app chooser or URL, Clear/Keep, remove), "Add app
+  rule" from Android apps seen in forwarded notifications.
+- **Persistence**: `UserDefaults` key `notificationActions.v1` (JSON). WhatsApp
+  is seeded once as an example rule (open `net.whatsapp.WhatsApp` + Clear) only
+  if WhatsApp for Mac is installed; removing it is permanent.
+- Android unchanged (`conversationId` already on the wire). Not yet tested with a
+  real WhatsApp click.
 
 ## 8. NOT IN SCOPE / DECIDED
 

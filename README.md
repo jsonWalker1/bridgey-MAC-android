@@ -48,7 +48,14 @@ moved since. Everything below was added here:
   changed, so reconnect after regaining Wi-Fi could silently take up to
   ~18 minutes waiting on mDNS's own backoff schedule instead of ~10 seconds;
   and the connection layer is now self-healing after disconnects, with an
-  explicit Android-side connect timeout and screen-lock diagnostics.
+  explicit Android-side connect timeout and screen-lock diagnostics. Two more
+  were found and fixed on hardware later: Android's mDNS restart after a
+  Wi-Fi change reused NSD listeners that were still being torn down ("listener
+  already in use"), leaving the phone neither advertised nor browsing until the
+  app restarted - every cycle now uses fresh listeners and any failure retries
+  with backoff; and two near-simultaneous connections could leave the phone
+  "Connected" to a session that had already died, cancelling the reconnect -
+  only the active session can now complete pairing.
 - **Calls infrastructure** — the call-handling code was extracted into
   dedicated modules (`CallsController.kt`, `Calls.swift`, replacing the old
   `NotificationCall.swift`), and a `calls.v2` Telecom-based protocol
@@ -71,6 +78,9 @@ moved since. Everything below was added here:
   macOS Notification Center "Clear" of the Bridgey stack now also clears the
   matching phone notifications (`notifications.dismissMany`), with no extra UI.
   Turning notification forwarding off clears the mirrored notifications.
+  What a click on a phone notification does on the Mac is configurable per
+  app in Settings → Notification click actions (ask, open a Mac app, open a
+  URL, open on the phone, or nothing; then clear or keep).
   Hardware-validated on a Samsung Galaxy S23 Ultra + MacBook; see
   `BRIDGEY_NOTIFICATIONS_STATE.md`.
 - Android now restarts its connection service automatically after a device

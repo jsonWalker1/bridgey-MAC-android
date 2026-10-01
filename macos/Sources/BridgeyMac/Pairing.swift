@@ -197,8 +197,8 @@ private func defaultRemoteFeatureState() -> [BridgeyFeature: Bool] {
 private final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
     var onDismiss: ((String, String) -> Void)?
     var onAction: ((String, String, String, String?) -> Void)?
-    /// TAP ROUTING POC: (notificationID, deviceID, androidPackage, conversationID).
-    var onOpen: ((String, String, String, String?) -> Void)?
+    /// Plain click on the notification body: (notificationID, deviceID, content).
+    var onOpen: ((String, String, UNNotificationContent) -> Void)?
 
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
@@ -224,11 +224,8 @@ private final class NotificationPresenter: NSObject, UNUserNotificationCenterDel
         if response.actionIdentifier == UNNotificationDismissActionIdentifier {
             onDismiss?(notificationID, deviceID)
         } else if response.actionIdentifier == UNNotificationDefaultActionIdentifier {
-            // TAP ROUTING POC: a plain click on the notification body used to do nothing.
-            let userInfo = response.notification.request.content.userInfo
-            if let package = userInfo["androidPackage"] as? String {
-                onOpen?(notificationID, deviceID, package, userInfo["androidConversationId"] as? String)
-            }
+            // Routed by NotificationActionRouting (per-app rules configured in Settings).
+            onOpen?(notificationID, deviceID, response.notification.request.content)
         } else if response.actionIdentifier != UNNotificationDefaultActionIdentifier {
             let replyText = (response as? UNTextInputNotificationResponse)?.userText
             onAction?(notificationID, deviceID, response.actionIdentifier, replyText)
@@ -262,6 +259,7 @@ final class PairingCoordinator: ObservableObject {
     let mediaController = MediaController()
     let mediaRemote = MediaRemoteController()
     let shortcuts = ShortcutSettings()
+    let notificationActions = NotificationActionSettings()
     // M1: transport/security/lifecycle foundation only - no BridgeyFeature gate yet (that's M3), no
     // encoder/decoder/KVM consumer wired up yet (M2/M4/M5).
     lazy var videoChannel = VideoChannelController(
@@ -376,9 +374,9 @@ final class PairingCoordinator: ObservableObject {
                 self?.dismissAndroidNotification(notificationID, deviceID: deviceID)
             }
         }
-        notificationPresenter.onOpen = { [weak self] notificationID, deviceID, package, conversationID in
+        notificationPresenter.onOpen = { [weak self] notificationID, deviceID, content in
             Task { @MainActor [weak self] in
-                self?.handleNotificationTapPoc(notificationID, deviceID: deviceID, androidPackage: package, conversationID: conversationID)
+                self?.handleNotificationClick(notificationID, deviceID: deviceID, content: content)
             }
         }
         notificationPresenter.onAction = { [weak self] notificationID, deviceID, actionToken, replyText in
@@ -2558,34 +2556,130 @@ final class PairingCoordinator: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: timeout)
     }
 
-    // MARK: - BRIDGEY NOTIFICATION TAP ROUTING POC - NOT PRODUCTION (see NotificationTapRouterPoc.swift)
+    // MARK: - NOTIFICATION CLICK ACTIONS (see NotificationActionRouting.swift)
 
-    private func handleNotificationTapPoc(_ notificationID: String, deviceID: String, androidPackage: String, conversationID: String?) {
+    private func handleNotificationClick(_ notificationID: String, deviceID: String, content: UNNotificationContent) {
         let identifier = remoteNotificationRequestIdentifier(deviceID: deviceID, notificationID: notificationID)
         // macOS removes a clicked notification from Notification Center without a dismiss callback;
         // it must never count towards an inferred Clear All.
         clearAllDetector.noteExplainedRemoval([identifier], at: Date())
-        let policy = NotificationTapPolicy.current
-        let target = resolveNotificationTapTargetOnThisMac(androidPackage: androidPackage, conversationID: conversationID)
-        NSLog("POC_TAP clicked package=%@ conversation=%@ target=%@ policy=%@", androidPackage,
-              conversationID.map { $0.contains("@") ? "*@" + ($0.split(separator: "@").last.map(String.init) ?? "") : "present" } ?? "none",
-              String(describing: target), policy.rawValue)
-        guard target != .none else {
-            NSLog("POC_TAP fallback: no macOS target, existing behaviour kept")
+        let phoneOpenToken = remoteNotificationCategories[content.categoryIdentifier]?.actions
+            .first(where: { $0.title == "Open" })?.identifier
+        let context = NotificationClickContext(
+            androidPackage: content.userInfo["androidPackage"] as? String,
+            conversationID: content.userInfo["androidConversationId"] as? String,
+            canOpenOnPhone: phoneOpenToken != nil && isConnected(to: deviceID)
+        )
+        let decision = notificationActions.route(context)
+        NSLog("PLUGIN notification click package=%@ decision=%@", context.androidPackage ?? "-", String(describing: decision))
+        switch decision {
+        case .doNothing:
+            finishNotificationClick(identifier: identifier, notificationID: notificationID, deviceID: deviceID, content: content, clear: false)
+        case let .openOnPhone(clear):
+            if let phoneOpenToken {
+                performAndroidNotificationAction(notificationID, deviceID: deviceID, actionToken: phoneOpenToken, replyText: nil)
+            }
+            finishNotificationClick(identifier: identifier, notificationID: notificationID, deviceID: deviceID, content: content, clear: clear)
+        case .openApplication, .openURL:
+            openNotificationClickTarget(decision) { [weak self] success, detail in
+                NSLog("PLUGIN notification click open success=%@ detail=%@", String(success), detail)
+                // A failed open never clears: the notification stays where it is.
+                self?.finishNotificationClick(identifier: identifier, notificationID: notificationID, deviceID: deviceID,
+                                              content: content, clear: success && decision.clears)
+            }
+        case let .ask(clear):
+            askNotificationClick(identifier: identifier, notificationID: notificationID, deviceID: deviceID, content: content,
+                                 context: context, phoneOpenToken: phoneOpenToken, clear: clear)
+        }
+    }
+
+    /// The `ask` action: a small native choice, optionally remembered as a per-app rule.
+    private func askNotificationClick(identifier: String, notificationID: String, deviceID: String, content: UNNotificationContent,
+                                      context: NotificationClickContext, phoneOpenToken: String?, clear: Bool) {
+        let package = context.androidPackage
+        let appName = package.flatMap { notificationActions.seenApps[$0] } ?? content.title
+        let alert = NSAlert()
+        alert.messageText = "Open notification from \(appName)"
+        alert.informativeText = "Choose what Bridgey should do with this notification. Rules can be changed in Settings → Notification click actions."
+        alert.addButton(withTitle: "Choose Mac app…")
+        if context.canOpenOnPhone { alert.addButton(withTitle: "Open on phone") }
+        alert.addButton(withTitle: "Cancel")
+        if package != nil {
+            alert.showsSuppressionButton = true
+            alert.suppressionButton?.title = "Always do this for \(appName)"
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        let remember = alert.suppressionButton?.state == .on
+        let clearBehavior: NotificationClearBehavior = clear ? .clear : .keep
+        switch response {
+        case .alertFirstButtonReturn:
+            guard let app = NotificationActionSettings.chooseMacApplication() else {
+                return finishNotificationClick(identifier: identifier, notificationID: notificationID, deviceID: deviceID, content: content, clear: false)
+            }
+            if remember, let package {
+                notificationActions.upsert(NotificationActionRule(androidPackage: package, displayName: appName, action: .openNativeApp,
+                                                                  macAppBundleIdentifier: app.bundleIdentifier, macAppName: app.name,
+                                                                  url: nil, clearBehavior: clearBehavior))
+            }
+            let decision = NotificationClickDecision.openApplication(bundleIdentifier: app.bundleIdentifier, clear: clear)
+            openNotificationClickTarget(decision) { [weak self] success, detail in
+                NSLog("PLUGIN notification click open success=%@ detail=%@", String(success), detail)
+                self?.finishNotificationClick(identifier: identifier, notificationID: notificationID, deviceID: deviceID,
+                                              content: content, clear: success && clear)
+            }
+        case .alertSecondButtonReturn where context.canOpenOnPhone:
+            if remember, let package {
+                notificationActions.upsert(NotificationActionRule(androidPackage: package, displayName: appName, action: .openOnPhone,
+                                                                  macAppBundleIdentifier: nil, macAppName: nil, url: nil, clearBehavior: clearBehavior))
+            }
+            if let phoneOpenToken {
+                performAndroidNotificationAction(notificationID, deviceID: deviceID, actionToken: phoneOpenToken, replyText: nil)
+            }
+            finishNotificationClick(identifier: identifier, notificationID: notificationID, deviceID: deviceID, content: content, clear: clear)
+        default:
+            finishNotificationClick(identifier: identifier, notificationID: notificationID, deviceID: deviceID, content: content, clear: false)
+        }
+    }
+
+    /// Clear = exactly what closing the notification does (removed on the Mac, dismissed on the
+    /// phone; Android stays authoritative, so while disconnected the next resync brings it back).
+    /// Keep = the notification stays on both: macOS drops a clicked notification from Notification
+    /// Center, so Bridgey re-adds the same request silently (without the icon attachment, which
+    /// macOS already consumed).
+    private func finishNotificationClick(identifier: String, notificationID: String, deviceID: String,
+                                         content: UNNotificationContent, clear: Bool) {
+        let center = UNUserNotificationCenter.current()
+        if clear {
+            center.removeDeliveredNotifications(withIdentifiers: [identifier])
+            if isConnected(to: deviceID) {
+                dismissAndroidNotification(notificationID, deviceID: deviceID)
+            } else {
+                NSLog("PLUGIN notification click clear: phone not connected, Android keeps it until the next sync")
+            }
             return
         }
-        openNotificationTapTarget(target) { [weak self] success, detail in
-            guard let self else { return }
-            NSLog("POC_TAP open success=%@ detail=%@", String(success), detail)
-            if success && policy == .clear {
-                self.dismissAndroidNotification(notificationID, deviceID: deviceID)
-                NSLog("POC_TAP clear: dismiss sent to Android")
-            }
-            UNUserNotificationCenter.current().getDeliveredNotifications { delivered in
-                let stillDelivered = delivered.contains { $0.request.identifier == identifier }
-                NSLog("POC_TAP after-open macStillDelivered=%@", String(stillDelivered))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            center.getDeliveredNotifications { delivered in
+                guard !delivered.contains(where: { $0.request.identifier == identifier }),
+                      let copy = content.mutableCopy() as? UNMutableNotificationContent else { return }
+                copy.attachments = []
+                copy.sound = nil
+                copy.interruptionLevel = .passive
+                copy.userInfo["resync"] = true
+                DispatchQueue.main.async {
+                    self?.notificationPostedAt[identifier] = Date()
+                    center.add(UNNotificationRequest(identifier: identifier, content: copy, trigger: nil)) { error in
+                        NSLog("PLUGIN notification click keep: re-added error=%@", error.map { String(describing: $0) } ?? "none")
+                    }
+                }
             }
         }
+    }
+
+    private func isConnected(to deviceID: String) -> Bool {
+        if case let .connected(connectedDeviceID, _) = state, connectedDeviceID == deviceID, session != nil { return true }
+        return false
     }
 
     // MARK: - BRIDGEY NOTIFICATION++ macOS CLEAR ALL (see NotificationClearAllDetector.swift)
@@ -2695,6 +2789,9 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func postNotification(_ payload: RemoteNotificationPayload, deviceID: String) {
+        if payload.callType == nil {
+            notificationActions.observe(androidPackage: payload.packageName, displayName: payload.applicationName)
+        }
         let content = UNMutableNotificationContent()
         content.title = payload.callType == nil ? payload.applicationName : remoteCallStatusTitle(payload.callType)
         content.subtitle = payload.title
@@ -2728,7 +2825,7 @@ final class PairingCoordinator: ObservableObject {
             "resync": resync,
         ]
         if let conversationID = payload.conversationId, !conversationID.isEmpty, conversationID.count <= 256 {
-            content.userInfo["androidConversationId"] = conversationID // TAP ROUTING POC
+            content.userInfo["androidConversationId"] = conversationID // for {conversationId} URL rules
         }
         let request = UNNotificationRequest(
             identifier: identifier,

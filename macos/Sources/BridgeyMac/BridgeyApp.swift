@@ -677,6 +677,7 @@ private struct SettingsView: View {
                     }
                 }
             }
+            NotificationActionSettingsView(actions: pairing.notificationActions)
             Section("Paired devices") {
                 if pairing.trustedDevices.isEmpty { Text("No paired devices").foregroundStyle(.secondary) }
                 ForEach(pairing.trustedDevices) { device in

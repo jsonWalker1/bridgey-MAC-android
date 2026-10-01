@@ -43,8 +43,21 @@ if xcrun --find actool >/dev/null 2>&1; then
 else
   echo "warning: actool is unavailable; keeping the compatible Bridgey.icns icon only" >&2
 fi
+# Local development builds prefer a free "Apple Development" certificate when one exists in the
+# keychain (create it once in Xcode → Settings → Accounts → Manage Certificates). Its Team ID gives
+# every build the same code identity, so macOS stops asking for Keychain access after each update;
+# ad-hoc signatures change identity on every build. Set BRIDGEY_ADHOC_SIGNING=1 to opt out.
+DEVELOPMENT_IDENTITY=""
+if [ -z "${MACOS_SIGNING_IDENTITY:-}" ] && [ -z "${BRIDGEY_ADHOC_SIGNING:-}" ]; then
+  DEVELOPMENT_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+    | sed -n 's/.*"\(Apple Development: [^"]*\)".*/\1/p' | head -n 1)"
+fi
 if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
   codesign --force --deep --options runtime --timestamp --entitlements Resources/Bridgey.entitlements --sign "$MACOS_SIGNING_IDENTITY" "$APP_PATH"
+elif [ -n "$DEVELOPMENT_IDENTITY" ]; then
+  echo "Signing with $DEVELOPMENT_IDENTITY" >&2
+  codesign --force --deep --options runtime --timestamp=none \
+    --entitlements Resources/Bridgey.entitlements --sign "$DEVELOPMENT_IDENTITY" "$APP_PATH"
 else
   # Keep an explicit, stable designated requirement for ad-hoc builds. System
   # services such as Notification Center and Local Network privacy otherwise
