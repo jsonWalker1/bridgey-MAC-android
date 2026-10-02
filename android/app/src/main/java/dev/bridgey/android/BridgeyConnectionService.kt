@@ -18,6 +18,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
 class BridgeyConnectionService : Service() {
@@ -25,6 +26,11 @@ class BridgeyConnectionService : Service() {
     private lateinit var notificationManager: NotificationManager
     private var supportedProfile = true
     private var lastStatus = "Not connected · waiting for paired device"
+    // Bridgey only reaches the Mac over the local network: with no Wi-Fi at all the status line says
+    // so and offers the system Wi-Fi panel, instead of a generic "Not connected".
+    private val wifiAvailable = MutableStateFlow(true)
+    private val wifiNetworks = mutableSetOf<android.net.Network>()
+    private var wifiCallback: android.net.ConnectivityManager.NetworkCallback? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -66,16 +72,18 @@ class BridgeyConnectionService : Service() {
                 setBypassDnd(true)
             },
         )
+        watchWifi()
+        lastStatus = currentStatus()
         startForeground(NOTIFICATION_ID, buildNotification(lastStatus))
         serviceScope.launch {
-            (application as BridgeyApplication).pairing.state.collect { state ->
-                lastStatus = when (state) {
-                    is PairingState.Connected -> "Connected to ${state.peerName}"
-                    is PairingState.Connecting -> "Connecting to ${state.peerName}…"
-                    is PairingState.Verification -> "Pairing confirmation required"
-                    is PairingState.Failed -> "Not connected"
-                    PairingState.Idle -> "Not connected · waiting for paired device"
-                }
+            (application as BridgeyApplication).pairing.state.collect {
+                lastStatus = currentStatus()
+                notificationManager.notify(NOTIFICATION_ID, buildNotification(lastStatus))
+            }
+        }
+        serviceScope.launch {
+            wifiAvailable.collect {
+                lastStatus = currentStatus()
                 notificationManager.notify(NOTIFICATION_ID, buildNotification(lastStatus))
             }
         }
@@ -194,6 +202,33 @@ class BridgeyConnectionService : Service() {
 
     private fun transferNotificationId(transferId: String) = 50_000 + (transferId.hashCode() and 0x0fff)
 
+    private fun currentStatus(): String {
+        val pairing = (application as BridgeyApplication).pairing
+        return connectionStatusText(pairing.state.value, wifiAvailable.value, pairing.trustedDevices.value.isNotEmpty())
+    }
+
+    /** Event-driven (no polling): Wi-Fi networks appearing/disappearing, delivered on the main thread. */
+    private fun watchWifi() {
+        val connectivity = getSystemService(android.net.ConnectivityManager::class.java) ?: return
+        wifiAvailable.value = connectivity.activeNetwork
+            ?.let(connectivity::getNetworkCapabilities)
+            ?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) ?: false
+        val callback = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                wifiNetworks += network; wifiAvailable.value = true
+            }
+            override fun onLost(network: android.net.Network) {
+                wifiNetworks -= network; wifiAvailable.value = wifiNetworks.isNotEmpty()
+            }
+        }
+        val request = android.net.NetworkRequest.Builder()
+            .addTransportType(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        runCatching { connectivity.registerNetworkCallback(request, callback, Handler(Looper.getMainLooper())) }
+            .onSuccess { wifiCallback = callback }
+            .onFailure { android.util.Log.w("Bridgey", "WIFI status callback unavailable: ${it.message}") }
+    }
+
     private fun buildNotification(status: String): android.app.Notification {
         val openAppIntent = Intent()
             .setComponent(ComponentName(this, MainActivity::class.java)).apply {
@@ -255,6 +290,17 @@ class BridgeyConnectionService : Service() {
         if (connectedDeviceId != null && pairing.isFeatureAvailable(BridgeyFeature.CLIPBOARD)) {
             notification.addAction(android.R.drawable.ic_menu_send, "Send clipboard", pendingCapture)
         }
+        if (status == NO_WIFI_STATUS) {
+            val wifiSettings = Intent(
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) android.provider.Settings.Panel.ACTION_WIFI
+                else android.provider.Settings.ACTION_WIFI_SETTINGS,
+            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            notification.addAction(
+                android.R.drawable.ic_menu_manage,
+                "Wi-Fi",
+                PendingIntent.getActivity(this, 5, wifiSettings, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE),
+            )
+        }
         return notification
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Turn off", turnOff)
             .build()
@@ -313,6 +359,9 @@ class BridgeyConnectionService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        wifiCallback?.let { callback ->
+            runCatching { getSystemService(android.net.ConnectivityManager::class.java).unregisterNetworkCallback(callback) }
+        }
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -367,5 +416,19 @@ class ClipboardCaptureActivity : Activity() {
             finishAndRemoveTask()
             overridePendingTransition(0, 0)
         }, 150)
+    }
+}
+
+internal const val NO_WIFI_STATUS = "No Wi-Fi · connect to the same Wi-Fi as your Mac"
+
+/** Status line of the persistent notification. "No Wi-Fi" wins over a plain "Not connected" only
+ *  when there is a paired Mac to reach and no Wi-Fi network at all; a live session is never hidden. */
+internal fun connectionStatusText(state: PairingState, wifiAvailable: Boolean, hasTrustedMac: Boolean): String = when (state) {
+    is PairingState.Connected -> "Connected to ${state.peerName}"
+    is PairingState.Verification -> "Pairing confirmation required"
+    else -> if (!wifiAvailable && hasTrustedMac) NO_WIFI_STATUS else when (state) {
+        is PairingState.Connecting -> "Connecting to ${state.peerName}…"
+        is PairingState.Failed -> "Not connected"
+        else -> "Not connected · waiting for paired device"
     }
 }
