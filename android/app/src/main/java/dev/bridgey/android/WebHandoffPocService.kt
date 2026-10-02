@@ -36,6 +36,9 @@ import org.json.JSONObject
  * Only text, roles, ids, bounds and link targets are read; password/editable fields are skipped,
  * and nothing leaves the phone unless `send` is set (then only the continuation URL is sent, via
  * the existing explicit "send link" quick action).
+ *
+ * Toolbar chip UX POC: [WebHandoffToolbarChip] shows a Bridgey icon over the browser's address bar;
+ * `adb shell am broadcast -a dev.bridgey.webpoc.CHIP --ez on false` turns it off.
  */
 class WebHandoffPocService : AccessibilityService() {
     private var lastSelection: JSONObject? = null
@@ -43,6 +46,8 @@ class WebHandoffPocService : AccessibilityService() {
     // seen in the bar is remembered per browser.
     private val lastUrlByBrowser = mutableMapOf<String, String>()
     private var overlay: FrameLayout? = null
+    private var lastSelectionAt = 0L
+    private var chip: WebHandoffToolbarChip? = null
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -57,6 +62,7 @@ class WebHandoffPocService : AccessibilityService() {
                     }
                 }
                 ACTION_SELECTION -> handOffSelection(intent.getBooleanExtra("send", false))
+                ACTION_CHIP -> chip?.setEnabled(intent.getBooleanExtra("on", true))
             }
         }
     }
@@ -64,29 +70,38 @@ class WebHandoffPocService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         val filter = IntentFilter().apply {
-            addAction(ACTION_DUMP); addAction(ACTION_PICK); addAction(ACTION_SELECTION)
+            addAction(ACTION_DUMP); addAction(ACTION_PICK); addAction(ACTION_SELECTION); addAction(ACTION_CHIP)
         }
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(receiver, filter, android.Manifest.permission.DUMP, null, RECEIVER_EXPORTED)
         } else {
             registerReceiver(receiver, filter, android.Manifest.permission.DUMP, null)
         }
+        chip = WebHandoffToolbarChip(this, ::continueFromChip, { (application as BridgeyApplication).pairing.quickActions.status.value }, ::log)
+            .also { it.requestUpdate(0) }
         log("service connected")
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        chip?.requestUpdate(300)
     }
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(receiver) }
         removeOverlay()
+        chip?.destroy()
         super.onDestroy()
     }
 
     override fun onInterrupt() = Unit
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
+        chip?.requestUpdate()
         val browser = event.packageName?.toString() ?: return
         if (browser !in BROWSERS) return
         if (event.eventType != AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED) {
-            if (event.source?.viewIdResourceName?.endsWith(":id/url_bar") == true) browserRoot()?.let(::pageUrl)
+            if (event.source?.viewIdResourceName?.substringAfter(":id/") in URL_FIELD_IDS) browserRoot()?.let(::pageUrl)
             return
         }
         val source = event.source
@@ -101,6 +116,7 @@ class WebHandoffPocService : AccessibilityService() {
             .put("selected", selected.take(400))
             .put("viewId", source?.viewIdResourceName ?: JSONObject.NULL)
             .put("class", source?.className?.toString() ?: JSONObject.NULL)
+        lastSelectionAt = if (selected.isNotBlank()) android.os.SystemClock.elapsedRealtime() else 0L
         log("SELECTION event ${lastSelection}")
     }
 
@@ -199,6 +215,41 @@ class WebHandoffPocService : AccessibilityService() {
         report("Selection: ${selected.take(60)}", continuation.takeIf { send })
     }
 
+    /**
+     * Toolbar chip "Continue": a fresh text selection wins; otherwise the first fully visible
+     * paragraph-sized text in the page (the reading position) becomes the Text Fragment.
+     */
+    private fun continueFromChip(): String? {
+        val root = browserRoot() ?: return null
+        val selected = lastSelection?.optString("selected").orEmpty()
+        if (selected.isNotBlank() && android.os.SystemClock.elapsedRealtime() - lastSelectionAt < 120_000) {
+            handOffSelection(send = true)
+            return "selection"
+        }
+        val url = pageUrl(root) ?: return null
+        val nodes = mutableListOf<AccessibilityNodeInfo>()
+        fun flatten(node: AccessibilityNodeInfo) {
+            if (nodes.size >= MAX_SCAN_NODES) return
+            nodes += node
+            for (i in 0 until node.childCount) node.getChild(i)?.let(::flatten)
+        }
+        flatten(root)
+        val webRoot = nodes.firstOrNull { it.className == "android.webkit.WebView" }
+        val web = webRoot?.let(::bounds)
+        val reading = nodes.firstOrNull { node ->
+            val b = bounds(node)
+            web != null && isDescendant(node, webRoot) && !node.isPassword && !node.isEditable &&
+                b.top >= web.top && b.bottom <= web.bottom && node.isVisibleToUser &&
+                label(node).split(Regex("\\s+")).size >= 6
+        }
+        // A whole paragraph is long; its first sentence is enough to land on it.
+        val text = reading?.let(::label)?.split(Regex("(?<=[.!?])\\s"))?.firstOrNull()
+        val continuation = continuationUrl(url, null, text)
+        log("CHIP continue reading=${text?.take(120)} url=$continuation")
+        report("Continue on Mac: ${text?.take(40) ?: url}", continuation)
+        return continuation
+    }
+
     private fun report(message: String, sendUrl: String?) {
         log("RESULT $message")
         android.os.Handler(mainLooper).post { Toast.makeText(this, "Web Handoff POC: $message", Toast.LENGTH_SHORT).show() }
@@ -253,7 +304,7 @@ class WebHandoffPocService : AccessibilityService() {
 
     private fun pageUrl(root: AccessibilityNodeInfo): String? {
         val browser = root.packageName?.toString().orEmpty()
-        val bar = root.findAccessibilityNodeInfosByViewId("$browser:id/url_bar").firstOrNull()
+        val bar = urlField(root)
         val text = bar?.text?.toString()?.trim()?.takeIf { it.isNotEmpty() && !bar.isFocused }
             ?: return lastUrlByBrowser[browser]
         val url = if (text.startsWith("http://") || text.startsWith("https://")) text else "https://$text"
@@ -293,7 +344,15 @@ class WebHandoffPocService : AccessibilityService() {
         const val ACTION_DUMP = "dev.bridgey.webpoc.DUMP"
         const val ACTION_PICK = "dev.bridgey.webpoc.PICK"
         const val ACTION_SELECTION = "dev.bridgey.webpoc.SELECTION"
+        const val ACTION_CHIP = "dev.bridgey.webpoc.CHIP"
         val BROWSERS = setOf("com.brave.browser", "com.android.chrome", "com.sec.android.app.sbrowser")
+        /** Address field view ids: Chromium (Brave, Chrome) and Samsung Internet. */
+        private val URL_FIELD_IDS = listOf("url_bar", "location_bar_edit_text")
+
+        fun urlField(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+            val browser = root.packageName?.toString() ?: return null
+            return URL_FIELD_IDS.firstNotNullOfOrNull { root.findAccessibilityNodeInfosByViewId("$browser:id/$it").firstOrNull() }
+        }
         private const val MAX_DUMP_NODES = 400
         private const val MAX_SCAN_NODES = 3_000
     }

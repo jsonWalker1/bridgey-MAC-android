@@ -3,7 +3,7 @@
      how much page context can be handed off to the Mac. Separate from the KVM service, which keeps
      canRetrieveWindowContent=false. -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeViewTextSelectionChanged|typeWindowContentChanged|typeWindowStateChanged"
+    android:accessibilityEventTypes="typeViewTextSelectionChanged|typeWindowContentChanged|typeWindowStateChanged|typeViewScrolled|typeWindowsChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
     android:canRetrieveWindowContent="true"
