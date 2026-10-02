@@ -145,6 +145,20 @@
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
         </service>
+        <!-- BRIDGEY WEB HANDOFF POC (experimental, not production) - see WebHandoffPocService.kt.
+             Separate opt-in accessibility service limited to browser packages. -->
+        <service
+            android:name=".WebHandoffPocService"
+            android:exported="true"
+            android:label="@string/web_handoff_poc_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/web_handoff_poc_service_config" />
+        </service>
         <!-- Part 3 KVM POC input-injection layer - see BridgeyAccessibilityService's doc comment.
              Requires explicit, revocable user enablement under Settings > Accessibility; only ever
              dispatches gestures, never inspects window/content (see canRetrieveWindowContent below

@@ -8,4 +8,6 @@
     <string name="welcome_title">Welcome to Bridgey</string>
     <string name="welcome_body">Keep your Mac and phone on the same local network. Choose the Mac, compare the pairing code, then confirm it on both devices. Optional permissions are requested only when you enable the related feature.</string>
     <string name="welcome_continue">Get started</string>
+    <string name="web_handoff_poc_service_label">Bridgey Web Handoff (POC)</string>
+    <string name="web_handoff_poc_service_description">Experimental: reads the page open in your browser (text, element ids, link targets; never password fields) so you can continue reading it on your Mac. Nothing is sent unless you trigger a handoff.</string>
 </resources>
