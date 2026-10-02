@@ -64,4 +64,72 @@ final class QuickActionsTests: XCTestCase {
         XCTAssertFalse(featureEnabledByLegacyPeer(.links))
         XCTAssertFalse(featureEnabledByLegacyPeer(.media))
     }
+
+    // MARK: Books Handoff Alpha
+
+    func testBookHandoffValidation() {
+        let full = validatedBookHandoff(#"{"version":1,"title":"Alice","chapter":"CHAPTER X.","page":64,"pages":91,"quote":"Will you"}"#)
+        XCTAssertEqual(full, BookHandoff(title: "Alice", chapter: "CHAPTER X.", page: 64, pages: 91, quote: "Will you"))
+        XCTAssertEqual(validatedBookHandoff(#"{"version":1,"quote":"only a quote"}"#)?.quote, "only a quote")
+        XCTAssertNil(validatedBookHandoff(#"{"version":1,"chapter":"no title or quote","page":3}"#))
+        XCTAssertNil(validatedBookHandoff(#"{"version":2,"title":"Alice"}"#))
+        XCTAssertNil(validatedBookHandoff("https://example.com"))
+        XCTAssertNil(validatedBookHandoff(#"{"version":1,"title":""# + String(repeating: "x", count: 5000) + #""}"#))
+        let impossible = validatedBookHandoff(#"{"version":1,"title":"Alice","page":95,"pages":91}"#)
+        XCTAssertNil(impossible?.page); XCTAssertNil(impossible?.pages)
+        XCTAssertEqual(validatedBookHandoff(#"{"version":1,"title":"A\u0007lice"}"#)?.title, "Alice")
+    }
+
+    @MainActor private func bookRequest(_ value: String, id: String = UUID().uuidString) -> [String: Any] {
+        ["version": 1, "requestId": id, "feature": "links", "action": "book", "value": value]
+    }
+
+    @MainActor func testBookIsQueuedOnceAndDeclinedWhilePending() {
+        let actions = QuickActions()
+        actions.available = { $0 == .links }
+        var replies: [[String: Any]] = []
+        actions.send = { _, payload in replies.append(payload); return true }
+        actions.receive("quick.request", payload: bookRequest(#"{"version":1,"title":"Alice","page":64,"pages":91}"#))
+        XCTAssertEqual(actions.receivedBook?.title, "Alice")
+        XCTAssertEqual(replies.last?["accepted"] as? Bool, true)
+        actions.receive("quick.request", payload: bookRequest(#"{"version":1,"title":"Second"}"#))
+        XCTAssertEqual(actions.receivedBook?.title, "Alice")
+        XCTAssertEqual(replies.last?["accepted"] as? Bool, false)
+        // A pending book does not block web links (separate slot) and vice versa.
+        actions.receive("quick.request", payload: ["version": 1, "requestId": UUID().uuidString,
+            "feature": "links", "action": "offer", "value": "https://example.com"])
+        XCTAssertEqual(actions.receivedLink, "https://example.com")
+        actions.reset()
+        XCTAssertNil(actions.receivedBook); XCTAssertNil(actions.receivedLink)
+    }
+
+    @MainActor func testBookRejectedWhenLinksAreOffOrPayloadInvalid() {
+        let actions = QuickActions()
+        var replies: [[String: Any]] = []
+        actions.send = { _, payload in replies.append(payload); return true }
+        actions.receive("quick.request", payload: bookRequest(#"{"version":1,"title":"Alice"}"#))
+        XCTAssertNil(actions.receivedBook)
+        XCTAssertEqual(replies.last?["accepted"] as? Bool, false)
+        actions.available = { $0 == .links }
+        actions.receive("quick.request", payload: bookRequest("not json"))
+        XCTAssertNil(actions.receivedBook)
+        XCTAssertEqual(replies.last?["accepted"] as? Bool, false)
+    }
+
+    @MainActor func testContinueInBooksCopiesQuoteAndClearsOnlyWhenBooksOpened() {
+        let actions = QuickActions()
+        actions.available = { $0 == .links }
+        actions.send = { _, _ in true }
+        var copied: [String] = []
+        actions.copyText = { copied.append($0) }
+        actions.openBooks = { false }
+        actions.receive("quick.request", payload: bookRequest(#"{"version":1,"title":"Alice","quote":"Will you"}"#))
+        actions.continueInBooks()
+        XCTAssertNotNil(actions.receivedBook)
+        XCTAssertEqual(actions.status, "Could not open Books")
+        actions.openBooks = { true }
+        actions.continueInBooks()
+        XCTAssertNil(actions.receivedBook)
+        XCTAssertEqual(copied, ["Will you", "Will you"])
+    }
 }

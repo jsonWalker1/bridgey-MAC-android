@@ -13,6 +13,22 @@ struct QuickActionsPanel: View {
                 }
             }
         }
+        if let book = actions.receivedBook {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Continue reading from Android").font(.headline)
+                if let title = book.title { Text(title).font(.body.weight(.semibold)).lineLimit(2) }
+                if let chapter = book.chapter { Text(chapter).font(.caption).lineLimit(2) }
+                if let page = book.page {
+                    Text(book.pages.map { "Page \(page) of \($0) on the phone (\(page * 100 / $0) %)" } ?? "Page \(page) on the phone")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if let quote = book.quote { Text("“\(quote)”").font(.caption).italic().lineLimit(4).textSelection(.enabled) }
+                HStack {
+                    Button("Continue in Books", action: actions.continueInBooks)
+                    Button("Dismiss", action: actions.dismissBook)
+                }
+            }
+        }
         if let status = actions.status { Text(status).font(.caption).foregroundStyle(.secondary) }
     }
 }

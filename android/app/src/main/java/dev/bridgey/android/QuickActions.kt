@@ -52,9 +52,10 @@ class QuickActions(
     private val pending = mutableMapOf<String, Pair<String, Job>>()
     private var sequence = 0L
 
-    @Synchronized fun request(feature: BridgeyFeature, action: String, value: String = "") {
-        if (!available(feature)) { mutableStatus.value = "Feature is unavailable on one of your devices"; return }
-        if (feature.key in pending) return
+    /** Returns true only when the request was actually sent (false: unavailable, busy, offline). */
+    @Synchronized fun request(feature: BridgeyFeature, action: String, value: String = ""): Boolean {
+        if (!available(feature)) { mutableStatus.value = "Feature is unavailable on one of your devices"; return false }
+        if (feature.key in pending) return false
         val id = UUID.randomUUID().toString()
         val expiry = scope.launch {
             delay(8000)
@@ -72,13 +73,23 @@ class QuickActions(
                 .put("feature", feature.key).put("action", action).put("value", value).put("sequence", sequence))) {
             pending.remove(feature.key)?.second?.cancel()
             mutableStatus.value = "Not connected — request not sent"
+            return false
         }
+        return true
     }
 
-    fun sendLink(value: String) {
+    fun sendLink(value: String): Boolean {
         val url = validatedWebLink(value)
-        if (url == null) { mutableStatus.value = "Copy a valid http or https link first"; return }
-        request(BridgeyFeature.LINKS, "offer", url)
+        if (url == null) { mutableStatus.value = "Copy a valid http or https link first"; return false }
+        return request(BridgeyFeature.LINKS, "offer", url)
+    }
+
+    /** Books Handoff: a small JSON description of the book/position (see BooksHandoff.kt). */
+    fun sendBook(payload: String): Boolean {
+        if (payload.isBlank() || payload.toByteArray().size > BOOK_PAYLOAD_MAX) {
+            mutableStatus.value = "Book details too large — not sent"; return false
+        }
+        return request(BridgeyFeature.LINKS, "book", payload)
     }
 
     @Synchronized fun receive(kind: String, payload: JSONObject) {

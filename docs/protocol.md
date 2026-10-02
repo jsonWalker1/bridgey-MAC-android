@@ -143,6 +143,14 @@ that an operation definitely never reached the other peer.
   no user credentials, whitespace/control characters or backslashes, valid
   optional port. One pending received link per device; a second is declined.
   Acceptance means queued for explicit local Open/Dismiss, **not** opened.
+- `links` / `book` (Books Handoff Alpha): `value` is a JSON string, 4,096 UTF-8
+  bytes maximum: `{"version":1, "title"?, "chapter"?, "page"?, "pages"?,
+  "quote"?, "app"?}` with title/chapter ≤ 200 and quote ≤ 500 characters; at
+  least a title or a quote. Invalid pages are dropped. One pending received book
+  per device (separate from the pending link); a second is declined. Display
+  only: the Mac shows the details and, on an explicit "Continue in Books",
+  copies the quote and opens Apple Books — it never automates Books. Older Mac
+  apps decline the unknown action.
 - `media`: Android → Mac, only `toggle`, `pause`, `next`, `previous`, `seek`
   (integer seconds 0…604800), `volume` (integer 0…100). The Mac must locally
   opt in and select running Music or Spotify. Commands map to fixed player

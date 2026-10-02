@@ -102,6 +102,23 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
+        <!-- WEB HANDOFF ALPHA: Share → "Continue on Mac" (text/URLs only, no UI). Exported because the
+             system share sheet launches it; it only ever sends an http(s) link to the paired Mac. -->
+        <activity
+            android:name=".WebHandoffShareActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/web_handoff_share_label"
+            android:noHistory="true"
+            android:taskAffinity="dev.bridgey.android.web_handoff"
+            android:theme="@style/Theme.Bridgey.Transparent">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
         <activity
             android:name=".ClipboardCaptureActivity"
             android:documentLaunchMode="always"
@@ -133,6 +150,12 @@
         </receiver>
         <service android:name=".ClipboardTileService" android:exported="true"
             android:label="Bridgey clipboard" android:icon="@drawable/ic_bridgey_notification"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
+        </service>
+        <!-- BOOKS HANDOFF ALPHA: "Continue reading on Mac" tile. -->
+        <service android:name=".BooksHandoffTileService" android:exported="true"
+            android:label="@string/books_handoff_tile_label" android:icon="@drawable/ic_bridgey_notification"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
         </service>

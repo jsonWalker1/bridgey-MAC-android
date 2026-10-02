@@ -22,9 +22,45 @@ func validatedWebLink(_ value: String) -> String? {
     return text
 }
 
+/// Books Handoff Alpha: "continue reading" details sent by Android as the "book" action of Web links.
+/// Display-only; Apple Books is never automated.
+struct BookHandoff: Equatable {
+    let title: String?
+    let chapter: String?
+    let page: Int?
+    let pages: Int?
+    let quote: String?
+}
+
+func validatedBookHandoff(_ value: String) -> BookHandoff? {
+    guard value.utf8.count <= 4096, let data = value.data(using: .utf8),
+          let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          json["version"] as? Int == 1 else { return nil }
+    func text(_ key: String, _ max: Int) -> String? {
+        guard let raw = json[key] as? String else { return nil }
+        let cleaned = raw.unicodeScalars.filter { $0.value >= 32 || $0 == "\n" }.map(String.init).joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? nil : String(cleaned.prefix(max))
+    }
+    let title = text("title", 200), quote = text("quote", 500)
+    guard title != nil || quote != nil else { return nil }
+    let pages = (json["pages"] as? Int).flatMap { (1...100_000).contains($0) ? $0 : nil }
+    let page = (json["page"] as? Int).flatMap { $0 >= 1 && (pages == nil || $0 <= pages!) ? $0 : nil }
+    return BookHandoff(title: title, chapter: text("chapter", 200), page: page, pages: page == nil ? nil : pages, quote: quote)
+}
+
 @MainActor
 final class QuickActions: ObservableObject {
     @Published private(set) var receivedLink: String?
+    @Published private(set) var receivedBook: BookHandoff?
+    /// Opening Apple Books and copying the quote; replaceable in tests.
+    var openBooks: () -> Bool = {
+        NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Books.app"))
+    }
+    var copyText: (String) -> Void = { text in
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
     @Published private(set) var status: String?
     var available: (BridgeyFeature) -> Bool = { _ in false }
     var send: (String, [String: Any]) -> Bool = { _, _ in false }
@@ -63,6 +99,15 @@ final class QuickActions: ObservableObject {
             status = payload["accepted"] as? Bool == true
                 ? "Link delivered — waiting for the user to open it"
                 : "Link declined — check settings or dismiss the previous link"
+        } else if kind == "quick.request", payload["action"] as? String == "book" {
+            let book = (payload["value"] as? String).flatMap(validatedBookHandoff)
+            let accepted = available(.links) && payload["feature"] as? String == "links" && book != nil && receivedBook == nil
+            if accepted {
+                receivedBook = book
+                status = "Continue reading received — see below"
+                NSSound(named: NSSound.Name("Glass"))?.play()
+            }
+            _ = send("quick.result", ["version": 1, "requestId": id, "feature": "links", "accepted": accepted])
         } else if kind == "quick.request" {
             let link = (payload["value"] as? String).flatMap(validatedWebLink)
             let accepted = available(.links) && payload["feature"] as? String == "links" &&
@@ -81,5 +126,18 @@ final class QuickActions: ObservableObject {
         if NSWorkspace.shared.open(url) { receivedLink = nil } else { status = "Could not open your browser" }
     }
     func dismissLink() { receivedLink = nil }
-    func reset() { timeout?.cancel(); pending = nil; receivedLink = nil; status = nil }
+
+    /// Copies the quote (to find the place with ⌘F in Books) and opens Apple Books.
+    func continueInBooks() {
+        guard let book = receivedBook else { return }
+        if let quote = book.quote { copyText(quote) }
+        if openBooks() {
+            receivedBook = nil
+            status = book.quote != nil ? "Quote copied — in Books open the book, press ⌘F and ⌘V" : "Books opened — open the book and go to the page shown"
+        } else {
+            status = "Could not open Books"
+        }
+    }
+    func dismissBook() { receivedBook = nil }
+    func reset() { timeout?.cancel(); pending = nil; receivedLink = nil; receivedBook = nil; status = nil }
 }

@@ -1,22 +1,14 @@
 package dev.bridgey.android
 
 import android.accessibilityservice.AccessibilityService
-import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
-import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
-import android.view.MotionEvent
-import android.view.View
 import android.view.WindowManager
-import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
-import android.widget.Button
 import android.widget.ImageView
-import android.widget.LinearLayout
-import android.widget.TextView
 
 /**
  * BRIDGEY WEB HANDOFF TOOLBAR CHIP POC - EXPERIMENTAL, NOT PRODUCTION.
@@ -24,14 +16,14 @@ import android.widget.TextView
  * Draws a small Bridgey icon as an accessibility overlay over the browser's own address bar (the
  * trailing end of the `url_bar` node, located from the accessibility tree, never from hard-coded
  * coordinates). It is shown only while a supported browser is the focused app window and its
- * address bar is visible and not being edited; it pulses once per new page. Tapping it opens a tiny
- * "Continue on Mac" card; Continue hands the URL (+ reading position or selection as a Text Fragment)
- * to [onContinue], which uses the existing Web Handoff POC transport.
+ * address bar is visible and not being edited, and only while a Mac is connected (no misleading
+ * "send" without one); it pulses once per new page. Tapping it hands off immediately ([onTap] ->
+ * [WebHandoff.perform], which reports the outcome).
  */
 internal class WebHandoffToolbarChip(
     private val service: AccessibilityService,
-    private val onContinue: () -> String?,
-    private val status: () -> String?,
+    private val onTap: () -> Unit,
+    private val isConnected: () -> Boolean,
     private val log: (String) -> Unit,
 ) {
     private val main = Handler(Looper.getMainLooper())
@@ -39,9 +31,7 @@ internal class WebHandoffToolbarChip(
     private val density = service.resources.displayMetrics.density
     private var chip: ImageView? = null
     private var chipParams: WindowManager.LayoutParams? = null
-    private var card: View? = null
     private var lastPageUrl: String? = null
-    private var title: String? = null
     private var updateQueued = false
     private var enabled = true
     // Window/rotation animations report transient toolbar bounds; the chip only appears or moves
@@ -68,10 +58,11 @@ internal class WebHandoffToolbarChip(
 
     fun setEnabled(value: Boolean) { enabled = value; schedule(0) }
 
-    fun destroy() { main.removeCallbacksAndMessages(null); hideCard(); hideChip("destroy") }
+    fun destroy() { main.removeCallbacksAndMessages(null); hideChip("destroy") }
 
     private fun update() {
         if (!enabled) return hideChip("disabled")
+        if (!isConnected()) return hideChip("no connected Mac")
         val window = focusedAppWindow()
         val browser = window?.root?.packageName?.toString()
         if (window == null || browser !in WebHandoffPocService.BROWSERS) {
@@ -103,13 +94,8 @@ internal class WebHandoffToolbarChip(
         showChip(barBounds, hasContext = pageUrl != null)
         if (pageUrl != null && pageUrl != lastPageUrl) {
             lastPageUrl = pageUrl
-            title = null
-            hideCard()
             pulse()
         }
-        // The page title costs a tree walk, so it is looked up once per page (the heading may
-        // only appear after the page finished loading).
-        if (title == null && pageUrl != null) title = pageTitle(root)
     }
 
     /** Hidden for a possibly transient reason (window/rotation animation): look again shortly. */
@@ -129,17 +115,6 @@ internal class WebHandoffToolbarChip(
             ?: windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION && it.isActive }
     }
 
-    private fun pageTitle(root: AccessibilityNodeInfo): String? {
-        var found: String? = null
-        fun visit(node: AccessibilityNodeInfo, depth: Int) {
-            if (found != null || depth > 40) return
-            if (node.isHeading && !node.text.isNullOrBlank()) { found = node.text.toString().trim(); return }
-            for (i in 0 until node.childCount) node.getChild(i)?.let { visit(it, depth + 1) }
-        }
-        visit(root, 0)
-        return found?.take(80)
-    }
-
     private fun showChip(barBounds: Rect, hasContext: Boolean) {
         val size = dp(30)
         // Trailing end of the URL field, vertically centred on it: the domain text is left aligned,
@@ -149,7 +124,13 @@ internal class WebHandoffToolbarChip(
         val view = chip ?: ImageView(service).apply {
             setImageResource(R.mipmap.ic_launcher_round)
             contentDescription = "Continue on Mac with Bridgey"
-            setOnClickListener { toggleCard() }
+            setOnClickListener {
+                // A short tap-down scale gives immediate feedback; the result arrives as a toast.
+                animate().scaleX(0.85f).scaleY(0.85f).setDuration(90).withEndAction {
+                    animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                }.start()
+                onTap()
+            }
         }.also { created ->
             val params = WindowManager.LayoutParams(
                 size, size, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
@@ -172,7 +153,6 @@ internal class WebHandoffToolbarChip(
     }
 
     private fun hideChip(reason: String) {
-        hideCard()
         val view = chip ?: return
         runCatching { wm.removeView(view) }
         chip = null; chipParams = null
@@ -188,65 +168,6 @@ internal class WebHandoffToolbarChip(
             view.animate().scaleX(1f).scaleY(1f).setDuration(260).withEndAction(then).start()
         }.start()
         main.postDelayed({ once { main.postDelayed({ once {} }, 180) } }, 350)
-    }
-
-    private fun toggleCard() { if (card != null) hideCard() else showCard() }
-
-    private fun showCard() {
-        val chipAt = chipParams ?: return
-        val pad = dp(16)
-        val heading = TextView(service).apply { text = "Bridgey"; setTextColor(Color.rgb(120, 130, 150)); textSize = 12f }
-        val action = TextView(service).apply { text = "Continue on Mac"; setTextColor(Color.WHITE); textSize = 17f; setPadding(0, dp(4), 0, dp(6)) }
-        val page = TextView(service).apply {
-            text = "“${title ?: lastPageUrl ?: "This page"}”"; setTextColor(Color.rgb(200, 210, 225)); textSize = 14f; maxLines = 2
-        }
-        val result = TextView(service).apply { setTextColor(Color.rgb(140, 200, 255)); textSize = 13f; visibility = View.GONE }
-        val button = Button(service).apply {
-            text = "Continue"; isAllCaps = false
-            setOnClickListener {
-                val sent = onContinue()
-                result.visibility = View.VISIBLE
-                result.text = if (sent == null) "Nothing to hand off on this page" else "Sending to Mac…"
-                isEnabled = false
-                if (sent != null) {
-                    main.postDelayed({ result.text = status() ?: "Sent" }, 1500)
-                    main.postDelayed({ hideCard() }, 4500)
-                }
-            }
-        }
-        val view = LinearLayout(service).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, dp(8))
-            background = GradientDrawable().apply { cornerRadius = dp(18).toFloat(); setColor(Color.argb(240, 22, 28, 44)) }
-            elevation = dp(8).toFloat()
-            addView(heading); addView(action); addView(page); addView(result)
-            addView(button, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                gravity = Gravity.END; topMargin = dp(6)
-            })
-            // Any touch outside the card closes it and still reaches the browser.
-            setOnTouchListener { _, event -> if (event.actionMasked == MotionEvent.ACTION_OUTSIDE) hideCard(); false }
-        }
-        val width = dp(260)
-        val screenWidth = service.resources.displayMetrics.widthPixels
-        val params = WindowManager.LayoutParams(
-            width, WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT,
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = (chipAt.x + chipAt.width - width).coerceIn(dp(8), (screenWidth - width - dp(8)).coerceAtLeast(dp(8)))
-            y = chipAt.y + chipAt.height + dp(10)
-        }
-        wm.addView(view, params)
-        card = view
-        log("CARD shown title=$title")
-    }
-
-    private fun hideCard() {
-        val view = card ?: return
-        runCatching { wm.removeView(view) }
-        card = null
     }
 
     private fun dp(value: Int) = (value * density).toInt()

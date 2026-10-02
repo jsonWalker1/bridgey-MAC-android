@@ -17,6 +17,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.FrameLayout
 import android.widget.TextView
 import android.widget.Toast
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 /**
@@ -48,6 +49,8 @@ class WebHandoffPocService : AccessibilityService() {
     private var overlay: FrameLayout? = null
     private var lastSelectionAt = 0L
     private var chip: WebHandoffToolbarChip? = null
+    private val stateScope = kotlinx.coroutines.MainScope()
+    private var connectionWatch: kotlinx.coroutines.Job? = null
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -77,8 +80,19 @@ class WebHandoffPocService : AccessibilityService() {
         } else {
             registerReceiver(receiver, filter, android.Manifest.permission.DUMP, null)
         }
-        chip = WebHandoffToolbarChip(this, ::continueFromChip, { (application as BridgeyApplication).pairing.quickActions.status.value }, ::log)
-            .also { it.requestUpdate(0) }
+        chip = WebHandoffToolbarChip(
+            this,
+            onTap = { WebHandoff.perform(this, chipSource(), origin = "chip") },
+            isConnected = { WebHandoff.macConnected(this) },
+            log = ::log,
+        ).also { it.requestUpdate(0) }
+        current = java.lang.ref.WeakReference(this)
+        // The chip needs a connected Mac; connection changes produce no accessibility event.
+        // The Mac's feature list (Web links on/off) arrives shortly after the connection itself.
+        connectionWatch = stateScope.launch {
+            val pairing = (application as BridgeyApplication).pairing
+            kotlinx.coroutines.flow.merge(pairing.state, pairing.remoteFeatures).collect { chip?.requestUpdate(0) }
+        }
         log("service connected")
     }
 
@@ -91,6 +105,9 @@ class WebHandoffPocService : AccessibilityService() {
         runCatching { unregisterReceiver(receiver) }
         removeOverlay()
         chip?.destroy()
+        connectionWatch?.cancel()
+        stateScope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+        if (current?.get() === this) current = null
         super.onDestroy()
     }
 
@@ -110,13 +127,16 @@ class WebHandoffPocService : AccessibilityService() {
         val from = event.fromIndex
         val to = event.toIndex
         val selected = if (from in 0 until to && to <= text.length) text.substring(from, to) else ""
+        // Opening the share sheet (or tapping the chip) clears the browser selection; keep the last
+        // real selection so it can still be handed off (it expires after two minutes).
+        if (selected.isBlank() || source?.isEditable == true) return
         lastSelection = JSONObject()
             .put("nodeText", text.take(400))
             .put("from", from).put("to", to)
             .put("selected", selected.take(400))
             .put("viewId", source?.viewIdResourceName ?: JSONObject.NULL)
             .put("class", source?.className?.toString() ?: JSONObject.NULL)
-        lastSelectionAt = if (selected.isNotBlank()) android.os.SystemClock.elapsedRealtime() else 0L
+        lastSelectionAt = android.os.SystemClock.elapsedRealtime()
         log("SELECTION event ${lastSelection}")
     }
 
@@ -215,18 +235,20 @@ class WebHandoffPocService : AccessibilityService() {
         report("Selection: ${selected.take(60)}", continuation.takeIf { send })
     }
 
-    /**
-     * Toolbar chip "Continue": a fresh text selection wins; otherwise the first fully visible
-     * paragraph-sized text in the page (the reading position) becomes the Text Fragment.
-     */
-    private fun continueFromChip(): String? {
-        val root = browserRoot() ?: return null
-        val selected = lastSelection?.optString("selected").orEmpty()
-        if (selected.isNotBlank() && android.os.SystemClock.elapsedRealtime() - lastSelectionAt < 120_000) {
-            handOffSelection(send = true)
-            return "selection"
-        }
-        val url = pageUrl(root) ?: return null
+    /** A selection made in the last two minutes, with up to three words of context on each side. */
+    private fun freshSelection(): Triple<String, String, String>? {
+        val selection = lastSelection ?: return null
+        val selected = selection.optString("selected")
+        if (selected.isBlank() || android.os.SystemClock.elapsedRealtime() - lastSelectionAt > 120_000) return null
+        val nodeText = selection.optString("nodeText")
+        val from = selection.optInt("from"); val to = selection.optInt("to")
+        val prefix = nodeText.take(from.coerceIn(0, nodeText.length)).trim().split(Regex("\\s+")).takeLast(3).joinToString(" ")
+        val suffix = nodeText.drop(to.coerceIn(0, nodeText.length)).trim().split(Regex("\\s+")).take(3).joinToString(" ")
+        return Triple(selected, prefix, suffix)
+    }
+
+    /** Reading position: the first sentence of the first fully visible paragraph-sized text. */
+    private fun readingText(root: AccessibilityNodeInfo): String? {
         val nodes = mutableListOf<AccessibilityNodeInfo>()
         fun flatten(node: AccessibilityNodeInfo) {
             if (nodes.size >= MAX_SCAN_NODES) return
@@ -234,20 +256,78 @@ class WebHandoffPocService : AccessibilityService() {
             for (i in 0 until node.childCount) node.getChild(i)?.let(::flatten)
         }
         flatten(root)
-        val webRoot = nodes.firstOrNull { it.className == "android.webkit.WebView" }
-        val web = webRoot?.let(::bounds)
+        val webRoot = nodes.firstOrNull { it.className == "android.webkit.WebView" } ?: return null
+        val web = bounds(webRoot)
         val reading = nodes.firstOrNull { node ->
             val b = bounds(node)
-            web != null && isDescendant(node, webRoot) && !node.isPassword && !node.isEditable &&
+            isDescendant(node, webRoot) && !node.isPassword && !node.isEditable &&
                 b.top >= web.top && b.bottom <= web.bottom && node.isVisibleToUser &&
                 label(node).split(Regex("\\s+")).size >= 6
         }
-        // A whole paragraph is long; its first sentence is enough to land on it.
-        val text = reading?.let(::label)?.split(Regex("(?<=[.!?])\\s"))?.firstOrNull()
-        val continuation = continuationUrl(url, null, text)
-        log("CHIP continue reading=${text?.take(120)} url=$continuation")
-        report("Continue on Mac: ${text?.take(40) ?: url}", continuation)
-        return continuation
+        return reading?.let(::label)?.split(Regex("(?<=[.!?])\\s"))?.firstOrNull()
+    }
+
+    /**
+     * Books Handoff: the reader app's window (title = book title) and its position description
+     * ("CHAPTER X. …, stránka 64 z 91"; the scrub label "64 / 91" when the toolbar is shown).
+     * Only the position/title strings are kept; page text is not collected.
+     */
+    internal fun readerSource(): BookSource? {
+        val window = windows.firstOrNull { w ->
+            w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION &&
+                w.root?.packageName?.toString() in READERS
+        } ?: return null
+        val root = window.root ?: return null
+        val title = window.title?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+        val positions = mutableListOf<String>()
+        fun visit(node: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 14 || positions.size > 60) return
+            (node.contentDescription ?: node.text)?.toString()?.takeIf { it.length < 200 && it.any(Char::isDigit) }?.let(positions::add)
+            for (i in 0 until node.childCount) node.getChild(i)?.let { visit(it, depth + 1) }
+        }
+        visit(root, 0)
+        val position = parseReaderPosition(positions)
+        // At the start of a book the "chapter" in the description is the book title itself.
+        val chapter = position?.first?.takeIf { it != title }
+        log("READER title=${title != null} chapter=${chapter != null} page=${position?.second}")
+        return BookSource(title, chapter, position?.second, position?.third, app = root.packageName?.toString())
+    }
+
+    /** A browser page window is on screen (behind the share sheet / shade). */
+    internal fun browserOnScreen(): Boolean = windows.any { w ->
+        w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION &&
+            w.root?.let { it.packageName?.toString() in BROWSERS && urlField(it) != null } == true
+    }
+
+    /** Browser chip: the page in front, a fresh selection, else the reading position. */
+    private fun chipSource(): WebHandoffSource? {
+        val root = browserRoot() ?: return null
+        val url = pageUrl(root) ?: return null
+        val sel = freshSelection()
+        return WebHandoffSource(url, sel?.first, sel?.second.orEmpty(), sel?.third.orEmpty(),
+            readingText = if (sel == null) readingText(root) else null)
+    }
+
+    /**
+     * Share → "Continue on Mac": enrich the shared URL with context only when it is the same page
+     * the browser shows (or last showed); shared text without a URL is a selection on that page.
+     */
+    internal fun shareSource(sharedUrl: String?, sharedText: String?): WebHandoffSource? {
+        val root = browserRoot()
+        val known = root?.let(::pageUrl) ?: lastUrlByBrowser.values.lastOrNull()
+        if (sharedUrl == null) {
+            val page = known ?: return null
+            val text = sharedText?.trim()?.takeIf { it.isNotEmpty() && it.length <= 500 } ?: return WebHandoffSource(page)
+            val sel = freshSelection()?.takeIf { it.first.trim() == text }
+            return WebHandoffSource(page, text, sel?.second.orEmpty(), sel?.third.orEmpty())
+        }
+        if (known == null || !samePage(sharedUrl, known)) {
+            log("SHARE no page match (known=${known != null})")
+            return WebHandoffSource(sharedUrl)
+        }
+        val sel = freshSelection()
+        return WebHandoffSource(sharedUrl, sel?.first, sel?.second.orEmpty(), sel?.third.orEmpty(),
+            readingText = if (sel == null) root?.let(::readingText) else null)
     }
 
     private fun report(message: String, sendUrl: String?) {
@@ -298,9 +378,13 @@ class WebHandoffPocService : AccessibilityService() {
 
     // ---- helpers --------------------------------------------------------------------------
 
-    private fun browserRoot(): AccessibilityNodeInfo? =
-        windows.mapNotNull { it.root }.firstOrNull { it.packageName?.toString() in BROWSERS }
+    // The browser's selection menu is a separate window of the same package; prefer the window that
+    // has the address field (the page itself).
+    private fun browserRoot(): AccessibilityNodeInfo? {
+        val roots = windows.mapNotNull { it.root }.filter { it.packageName?.toString() in BROWSERS }
+        return roots.firstOrNull { urlField(it) != null } ?: roots.firstOrNull()
             ?: rootInActiveWindow?.takeIf { it.packageName?.toString() in BROWSERS }
+    }
 
     private fun pageUrl(root: AccessibilityNodeInfo): String? {
         val browser = root.packageName?.toString().orEmpty()
@@ -345,7 +429,11 @@ class WebHandoffPocService : AccessibilityService() {
         const val ACTION_PICK = "dev.bridgey.webpoc.PICK"
         const val ACTION_SELECTION = "dev.bridgey.webpoc.SELECTION"
         const val ACTION_CHIP = "dev.bridgey.webpoc.CHIP"
+        /** The running service, for Share → "Continue on Mac" context (null when not enabled). */
+        @Volatile internal var current: java.lang.ref.WeakReference<WebHandoffPocService>? = null
         val BROWSERS = setOf("com.brave.browser", "com.android.chrome", "com.sec.android.app.sbrowser")
+        /** Books Handoff Alpha: reader apps whose position may be read (on an explicit tap only). */
+        val READERS = setOf("com.google.android.apps.books")
         /** Address field view ids: Chromium (Brave, Chrome) and Samsung Internet. */
         private val URL_FIELD_IDS = listOf("url_bar", "location_bar_edit_text")
 

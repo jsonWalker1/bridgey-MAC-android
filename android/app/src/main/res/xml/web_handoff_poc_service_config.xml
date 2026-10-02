@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- BRIDGEY WEB HANDOFF POC (experimental): reads web content of supported browsers only, to measure
-     how much page context can be handed off to the Mac. Separate from the KVM service, which keeps
+     how much page context can be handed off to the Mac. Books Handoff Alpha: also Google Play Books,
+     whose book title and position are read only when the user taps "Continue reading on Mac". Separate from the KVM service, which keeps
      canRetrieveWindowContent=false. -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeViewTextSelectionChanged|typeWindowContentChanged|typeWindowStateChanged|typeViewScrolled|typeWindowsChanged"
@@ -9,4 +10,4 @@
     android:canRetrieveWindowContent="true"
     android:description="@string/web_handoff_poc_service_description"
     android:notificationTimeout="100"
-    android:packageNames="com.brave.browser,com.android.chrome,com.sec.android.app.sbrowser" />
+    android:packageNames="com.brave.browser,com.android.chrome,com.sec.android.app.sbrowser,com.google.android.apps.books" />
