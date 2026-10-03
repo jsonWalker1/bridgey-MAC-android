@@ -269,15 +269,15 @@ final class PairingCoordinator: ObservableObject {
             return false
         },
         send: { [weak self] kind, payload in self?.sendQuickPayload(kind: kind, payload: payload) == true },
-        pairingKeyProvider: { [weak self] in self?.session?.pairingKey },
-        sessionIdProvider: { [weak self] in self?.session?.id },
-        remoteHostProvider: { [weak self] in self?.session?.remoteHost }
+        pairingKeyProvider: { [weak self] in self?.activeSession?.pairingKey },
+        sessionIdProvider: { [weak self] in self?.activeSession?.id },
+        remoteHostProvider: { [weak self] in self?.activeSession?.remoteHost }
     )
     // M2: adapts the verified ~/screen-poc-mac decode/display pipeline onto the video channel above.
     let screenStreamDecoder = ScreenStreamDecoder()
 
     var trustedDevices: [TrustedDeviceInfo] {
-        trustRegistry.devices.map { device in
+        registry.devices.map { device in
             TrustedDeviceInfo(id: device.id, name: device.name)
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
@@ -286,17 +286,24 @@ final class PairingCoordinator: ObservableObject {
     private var deviceName: String
     private let settings: BridgeySettings
     private let identity: MacIdentity
-    private let trustRegistry: MacTrustRegistry
+    // MULTI-DEVICE CORE (DeviceCore.swift): trust + presence per deviceId and one independent
+    // PeerSession per device. Nothing below the routing seam is limited to a single peer.
+    private let registry: DeviceRegistry
+    private let peers: PeerSessionManager<Session>
     private var listener: NWListener?
-    private var session: Session?
+    /// COMPATIBILITY SEAM. Today's features are single-peer, so they use `activeSession`: the session
+    /// of the routed device (`DeviceRouting.activePeer`). This is routing only - inactive sessions
+    /// stay connected and authenticated and keep their own capabilities. Migrating a feature to
+    /// multi-device means replacing its `activeSession` with `peers.session(for: deviceID)`.
+    private(set) var activePeerID: String?
+    private var activeSession: Session? { activePeerID.flatMap { peers.session(for: $0) } }
+    private var failureMessage: String?
     private var discoveryCancellable: AnyCancellable?
     private var settingsCancellable: AnyCancellable?
-    private var reconnectWorkItem: DispatchWorkItem?
-    private var connectionTimeoutWorkItem: DispatchWorkItem?
-    private var heartbeatWorkItem: DispatchWorkItem?
-    private var lastTrustedEndpoint: (host: String, port: Int, name: String)?
-    private var lastKnownPeers: [DiscoveredPeer] = []
-    private var reconnectAttempt = 0
+    private var routingCancellable: AnyCancellable?
+    private var reconnectWork: [String: DispatchWorkItem] = [:]
+    private var reconnectAttempts: [String: Int] = [:]
+    private var lastEndpoints: [String: (host: String, port: Int, name: String)] = [:]
     private var callRequestID: String?
     private var callTimeoutWorkItem: DispatchWorkItem?
     private var callStatusClearWorkItem: DispatchWorkItem?
@@ -354,19 +361,21 @@ final class PairingCoordinator: ObservableObject {
     private let diagnostics = BridgeyDiagnostics()
     private let notificationHistoryStore: NotificationHistoryStore
 
-    init(deviceID: String, deviceName: String, settings: BridgeySettings) {
-        self.deviceID = deviceID
-        self.deviceName = deviceName
+    init(local: LocalDevice, settings: BridgeySettings) {
+        self.deviceID = local.deviceID
+        self.deviceName = local.name
         self.settings = settings
         let notificationHistoryStore = NotificationHistoryStore()
         self.notificationHistoryStore = notificationHistoryStore
         if settings.notificationHistoryEnabled {
             notificationHistory = notificationHistoryStore.load()
         }
-        identity = MacIdentity()
-        let trustRegistry = MacTrustRegistry()
-        self.trustRegistry = trustRegistry
-        trustedDeviceIDs = trustRegistry.deviceIDs
+        identity = local.identity
+        let registry = DeviceRegistry(trust: MacTrustRegistry())
+        self.registry = registry
+        peers = PeerSessionManager(localDeviceID: local.deviceID)
+        trustedDeviceIDs = registry.trustedDeviceIDs
+        settings.migratePreferredDevice(trustedDeviceIDs: registry.trustedDeviceIDs)
         notificationPresenter.onDismiss = { [weak self] notificationID, deviceID in
             Task { @MainActor [weak self] in
                 // Already forwarded as notifications.dismiss - never include it in a Clear All.
@@ -478,6 +487,11 @@ final class PairingCoordinator: ObservableObject {
                     self.publishLocalMemory(force: true)
                 }
             }
+        routingCancellable = settings.$preferredDeviceID.combineLatest(settings.$deviceRoutingMode)
+            .dropFirst()
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.recomputeActivePeer() }
+            }
     }
 
     func refreshNotificationAuthorization() {
@@ -525,47 +539,49 @@ final class PairingCoordinator: ObservableObject {
 
     func observe(_ discovery: BonjourDiscovery) {
         discoveryCancellable = discovery.$peers.sink { [weak self] peers in
-            self?.lastKnownPeers = peers
-            self?.connectTrustedPeerIfNeeded(peers)
+            guard let self else { return }
+            // Presence is keyed by the advertised deviceId, never by service name/host/address.
+            self.registry.updatePresence(DevicePresence.group(peers, localDeviceID: self.deviceID))
+            self.connectTrustedPeersIfNeeded()
         }
     }
 
-    func pair(host: String, port: Int, peerName: String) {
-        reconnectWorkItem?.cancel()
-        reconnectWorkItem = nil
+    /// User action on a discovered device: pairs a new device, or selects a trusted one as the
+    /// preferred device for today's single-peer features (dialling it only if it has no session).
+    func pair(host: String, port: Int, peerName: String, deviceID peerID: String? = nil) {
+        failureMessage = nil
+        if let peerID, registry.trustedDeviceIDs.contains(peerID) {
+            settings.setPreferredDevice(peerID)
+            if peers.isBusy(peerID) {
+                refreshState()
+                return
+            }
+        }
+        dial(host: host, port: port, peerName: peerName, expectedDeviceID: peerID)
+    }
+
+    /// Opens one outgoing session. Never touches any other device's session.
+    private func dial(host: String, port: Int, peerName: String, expectedDeviceID: String?) {
+        if let expectedDeviceID { reconnectWork.removeValue(forKey: expectedDeviceID)?.cancel() }
         diagnostics.record(category: "pairing", event: "connection_started")
         guard let endpointPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
-            state = .failed("Invalid peer port")
+            failureMessage = "Invalid peer port"
+            refreshState()
             return
         }
-        state = .connecting(peerName)
-        lastTrustedEndpoint = (host, port, peerName)
+        if let expectedDeviceID { lastEndpoints[expectedDeviceID] = (host, port, peerName) }
         NSLog("CONNECT attempting %@:%d peer=%@", host, port, peerName)
         let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
         let current = Session(connection: connection, peerName: peerName)
         current.remoteHost = host
         current.initiatedLocally = true
+        current.expectedDeviceID = expectedDeviceID
         current.id = UUID().uuidString.lowercased()
         current.privateKey = P256.KeyAgreement.PrivateKey()
         current.localEphemeralKey = current.privateKey!.publicKey.x963Representation.base64EncodedString()
-        session?.close()
-        session = current
-        remoteBattery = nil
-        remoteStorage = nil
-        resetRemoteMemoryState()
-        resetTelemetrySubscriptionState()
-        clearPingStatus()
-        quickActions.reset()
-        mediaController.reset()
-        mediaRemote.reset()
-        videoChannel.reset()
-        screenStreamDecoder.reset()
-        lastSentBattery = nil
-        lastSentStorage = nil
-        remoteFeatures = defaultRemoteFeatureState()
-        remoteFeatureStateReceived = false
-        clearRemoteCall()
+        peers.addPending(current, initiatedLocally: true, expectedDeviceID: expectedDeviceID)
         scheduleConnectionTimeout(for: current)
+        refreshState()
         configure(current) { [weak self, weak current] in
             guard let self, let current, current.privateKey != nil else { return }
             current.send(PairingMessage(
@@ -579,7 +595,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     func confirm() {
-        guard let current = session else { return }
+        guard let current = peers.verifyingSession else { return }
         confirm(current)
     }
 
@@ -602,74 +618,38 @@ final class PairingCoordinator: ObservableObject {
         completeIfConfirmed(current)
     }
 
+    /// Cancels the pairing being verified and clears a shown failure. Connected devices are not
+    /// affected.
     func cancel() {
-        connectionTimeoutWorkItem?.cancel()
-        heartbeatWorkItem?.cancel()
-        reconnectWorkItem?.cancel()
-        reconnectWorkItem = nil
-        reconnectAttempt = 0
-        let current = session
-        session = nil
-        current?.send(PairingMessage(kind: "pairing.cancel", sessionId: current?.id ?? ""))
-        current?.close()
-        stopMacSound()
-        androidRinging = false
-        clearRemoteCall()
-        clearPendingCall()
-        clearCallStatus()
-        clearClipboardSendStatus()
-        clearPingStatus()
-        quickActions.reset()
-        mediaController.reset()
-        mediaRemote.reset()
-        videoChannel.reset()
-        screenStreamDecoder.reset()
-        lastSentBattery = nil
-        lastSentStorage = nil
-        resetRemoteMemoryState()
-        resetTelemetrySubscriptionState()
-        remoteFeatures = defaultRemoteFeatureState()
-        remoteFeatureStateReceived = false
-        state = .idle
+        failureMessage = nil
+        if let verifying = peers.verifyingSession {
+            verifying.send(PairingMessage(kind: "pairing.cancel", sessionId: verifying.id))
+            endSession(verifying, scheduleReconnect: false)
+        }
+        refreshState()
     }
 
+    /// Disconnects the active device (the one today's UI shows). Other sessions stay connected.
     func dismiss() {
-        connectionTimeoutWorkItem?.cancel()
-        heartbeatWorkItem?.cancel()
-        reconnectWorkItem?.cancel()
-        reconnectWorkItem = nil
-        reconnectAttempt = 0
-        let current = session
-        session = nil
-        current?.close()
-        stopMacSound()
-        androidRinging = false
-        remoteBattery = nil
-        remoteStorage = nil
-        clearRemoteCall()
-        clearPendingCall()
-        clearCallStatus()
-        clearClipboardSendStatus()
-        clearPingStatus()
-        quickActions.reset()
-        mediaController.reset()
-        mediaRemote.reset()
-        videoChannel.reset()
-        screenStreamDecoder.reset()
-        lastSentBattery = nil
-        lastSentStorage = nil
-        resetRemoteMemoryState()
-        resetTelemetrySubscriptionState()
-        remoteFeatures = defaultRemoteFeatureState()
-        remoteFeatureStateReceived = false
-        state = .idle
+        failureMessage = nil
+        guard let id = activePeerID, let current = activeSession else {
+            refreshState()
+            return
+        }
+        reconnectWork.removeValue(forKey: id)?.cancel()
+        reconnectAttempts[id] = 0
+        endSession(current, scheduleReconnect: false)
     }
 
     func forget(deviceID: String) {
-        trustRegistry.remove(deviceID: deviceID)
-        trustedDeviceIDs.remove(deviceID)
+        registry.forget(deviceID)
+        trustedDeviceIDs = registry.trustedDeviceIDs
         settings.removeDevice(deviceID)
-        if case let .connected(connectedID, _) = state, connectedID == deviceID { dismiss() }
+        if settings.preferredDeviceID == deviceID { settings.setPreferredDevice(nil) }
+        reconnectWork.removeValue(forKey: deviceID)?.cancel()
+        reconnectAttempts[deviceID] = nil
+        lastEndpoints[deviceID] = nil
+        if let current = peers.session(for: deviceID) { endSession(current, scheduleReconnect: false) }
         NSLog("PAIRING revoked peerId=%@", String(deviceID.prefix(8)))
     }
 
@@ -717,7 +697,7 @@ final class PairingCoordinator: ObservableObject {
             setTransientCallStatus("Clipboard does not contain a valid phone number")
             return
         }
-        guard let current = session, case .connected = state,
+        guard let current = activeSession, case .connected = state,
               let plaintext = try? JSONEncoder().encode(CallRequestPayload(number: number)),
               let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else {
             setTransientCallStatus("Android is not connected")
@@ -748,7 +728,7 @@ final class PairingCoordinator: ObservableObject {
     func sendCallControl(callID: String, action: String, deviceID: String, route: String? = nil) {
         guard case let .connected(connectedDeviceID, _) = state,
               connectedDeviceID == deviceID,
-              let current = session,
+              let current = activeSession,
               current.remoteDeviceID == deviceID,
               featureEnabled(.calls, current: current),
               UUID(uuidString: callID) != nil,
@@ -773,7 +753,7 @@ final class PairingCoordinator: ObservableObject {
     /// mediaRemote last received a state update for, so Android can reject it if its primary
     /// session has since changed underneath the Mac.
     private func sendMediaRemoteAction(action: String, value: Int64?, generation: Int64) {
-        guard case .connected = state, let current = session,
+        guard case .connected = state, let current = activeSession,
               isFeatureAvailable(.media),
               let plaintext = try? JSONEncoder().encode(MediaRemoteActionPayload(
                 version: 1, requestId: UUID().uuidString.lowercased(), action: action, value: value, generation: generation
@@ -834,7 +814,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func featureEnabled(_ feature: BridgeyFeature, current: Session? = nil) -> Bool {
-        let id = (current ?? session)?.remoteDeviceID
+        let id = (current ?? activeSession)?.remoteDeviceID
         return settings.isEnabled(feature, for: id?.isEmpty == false ? id : nil)
     }
 
@@ -850,7 +830,7 @@ final class PairingCoordinator: ObservableObject {
     /// KVM) passes one, to know once the sync has definitely finished (delivered, rejected, or timed
     /// out) before forwarding the follow-up KEY(Ctrl+V). Behavior for existing callers is unchanged.
     func sendClipboard(completion: ((Bool) -> Void)? = nil) {
-        guard let current = session, case .connected = state else {
+        guard let current = activeSession, case .connected = state else {
             completion?(false)
             return
         }
@@ -891,7 +871,7 @@ final class PairingCoordinator: ObservableObject {
         clipboardCompletion = completion
         clipboardStatus = "Sending…"
         let timeout = DispatchWorkItem { [weak self, weak current] in
-            guard let self, let current, self.session === current,
+            guard let self, let current, self.activeSession === current,
                   self.clipboardSendID == messageID else { return }
             self.clipboardSendID = nil
             self.clipboardTimeoutWorkItem = nil
@@ -917,7 +897,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     func sendPing() {
-        guard let current = session, case .connected = state else {
+        guard let current = activeSession, case .connected = state else {
             setTransientPingStatus("Android is not connected")
             return
         }
@@ -989,7 +969,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func sendQuickPayload(kind: String, payload: [String: Any]) -> Bool {
-        guard let current = session, case .connected = state, let key = current.pairingKey,
+        guard let current = activeSession, case .connected = state, let key = current.pairingKey,
               let data = try? JSONSerialization.data(withJSONObject: payload), data.count <= 32768,
               let encrypted = try? encrypt(data, key: key) else { return false }
         current.send(PairingMessage(kind: kind, sessionId: current.id,
@@ -1010,7 +990,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func receiveQuickPayload(_ message: PairingMessage, current: Session) {
-        guard session === current, case .connected = state, message.sessionId == current.id,
+        guard activeSession === current, case .connected = state, message.sessionId == current.id,
               let key = current.pairingKey, let id = message.messageId, current.acceptMessageID(id),
               let nonce = message.nonce, let ciphertext = message.ciphertext,
               let data = try? decrypt(nonce: nonce, ciphertext: ciphertext, key: key), data.count <= 8192,
@@ -1023,7 +1003,7 @@ final class PairingCoordinator: ObservableObject {
         if message.kind == "quick.request", payload["feature"] as? String == "media" {
             guard let requestID = payload["requestId"] as? String, UUID(uuidString: requestID) != nil else { return }
             let reply: (Bool) -> Void = { [weak self, weak current] accepted in
-                guard let self, let current, self.session === current else { return }
+                guard let self, let current, self.activeSession === current else { return }
                 _ = self.sendQuickPayload(kind: "quick.result", payload: [
                     "version": 1, "requestId": requestID, "feature": "media", "accepted": accepted
                 ])
@@ -1038,7 +1018,7 @@ final class PairingCoordinator: ObservableObject {
 
     private func publishLocalBattery(force: Bool = false) {
         guard isFeatureAvailable(.battery),
-              let current = session, case .connected = state,
+              let current = activeSession, case .connected = state,
               let status = currentMacBatteryStatus(),
               force || status != lastSentBattery,
               let plaintext = try? JSONEncoder().encode(BatteryPayload(
@@ -1070,7 +1050,7 @@ final class PairingCoordinator: ObservableObject {
 
     private func publishLocalStorage(force: Bool = false) {
         guard isFeatureAvailable(.storage),
-              let current = session, case .connected = state,
+              let current = activeSession, case .connected = state,
               let status = currentMacStorageStatus(),
               force || shouldResendStorage(status, previous: lastSentStorage),
               let plaintext = try? JSONEncoder().encode(TelemetryPayload(
@@ -1121,7 +1101,7 @@ final class PairingCoordinator: ObservableObject {
     /// Not gated by any single telemetry feature - this just signals "my panel is open/closed";
     /// each metric's own publish function independently respects its own Settings toggle.
     private func sendTelemetrySubscription(subscribe: Bool) {
-        guard let current = session, case .connected = state else { return }
+        guard let current = activeSession, case .connected = state else { return }
         current.send(PairingMessage(
             kind: subscribe ? "telemetry.subscribe" : "telemetry.unsubscribe",
             sessionId: current.id
@@ -1166,7 +1146,7 @@ final class PairingCoordinator: ObservableObject {
     /// A read/computation failure sends explicit `cpuUnavailable: true` rather than a fabricated
     /// number.
     private func publishLocalCpu() {
-        guard isFeatureAvailable(.cpu), let current = session, case .connected = state else { return }
+        guard isFeatureAvailable(.cpu), let current = activeSession, case .connected = state else { return }
         let sample = currentMacCpuSample()
         let previous = previousCpuSample
         let status: CpuStatus?
@@ -1206,7 +1186,7 @@ final class PairingCoordinator: ObservableObject {
     /// site, same dead-band principle - just a second independent metric on the same message kind.
     private func publishLocalMemory(force: Bool = false) {
         guard isFeatureAvailable(.memory),
-              let current = session, case .connected = state,
+              let current = activeSession, case .connected = state,
               let status = currentMacMemoryStatus(),
               force || shouldResendMemory(status, previous: lastSentMemory),
               let plaintext = try? JSONEncoder().encode(TelemetryPayload(
@@ -1230,7 +1210,7 @@ final class PairingCoordinator: ObservableObject {
     /// encode). macOS never sends a Celsius value (see MacTemperature.swift for why); an explicit
     /// unavailable state is sent rather than silence, matching CPU.
     private func publishLocalTemperature() {
-        guard isFeatureAvailable(.temperature), let current = session, case .connected = state else { return }
+        guard isFeatureAvailable(.temperature), let current = activeSession, case .connected = state else { return }
         var payload = TelemetryPayload(version: 1)
         switch currentMacTemperatureStatus() {
         case .known(let thermalState): payload.thermalState = thermalState
@@ -1258,7 +1238,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func sendFindCommand(kind: String) -> Bool {
-        guard let current = session, case .connected = state,
+        guard let current = activeSession, case .connected = state,
               (kind != "find.start" || isFeatureAvailable(.findDevice)),
               let payload = try? JSONEncoder().encode(FindDevicePayload(alertId: "active")),
               let encrypted = try? encrypt(payload, key: current.pairingKey!) else { return false }
@@ -1327,7 +1307,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     func chooseAndSendFile() {
-        guard session != nil, case .connected = state else {
+        guard activeSession != nil, case .connected = state else {
             fileTransferStatus = "Not connected — file was not sent"
             return
         }
@@ -1355,7 +1335,7 @@ final class PairingCoordinator: ObservableObject {
 
     @discardableResult
     func sendDroppedFile(_ url: URL) -> Bool {
-        guard session != nil, case .connected = state else {
+        guard activeSession != nil, case .connected = state else {
             fileTransferStatus = "Not connected — file was not sent"
             return false
         }
@@ -1400,7 +1380,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func prepareFile(_ url: URL) {
-        guard let current = session, case .connected = state else { return }
+        guard let current = activeSession, case .connected = state else { return }
         let expectedSessionID = current.id
         let operationID = UUID()
         let preparationCancellation = FileCancellationToken()
@@ -1414,7 +1394,7 @@ final class PairingCoordinator: ObservableObject {
                 let transfer = try OutgoingFileTransfer(url: url, cancellation: preparationCancellation)
                 DispatchQueue.main.async {
                     guard let self, self.fileOperationID == operationID,
-                          let current = self.session, current.id == expectedSessionID,
+                          let current = self.activeSession, current.id == expectedSessionID,
                           case .connected = self.state else { return }
                     self.filePreparationCancellation = nil
                     do {
@@ -1458,7 +1438,7 @@ final class PairingCoordinator: ObservableObject {
         let transferIDs = Set(incomingFiles.keys).union(outgoingFiles.keys)
         transferIDs.forEach { transferID in
             markTransferCancelled(transferID)
-            session?.send(PairingMessage(kind: "files.cancel", sessionId: session?.id ?? "", transferId: transferID))
+            activeSession?.send(PairingMessage(kind: "files.cancel", sessionId: activeSession?.id ?? "", transferId: transferID))
         }
         incomingFiles.values.forEach { $0.cancel() }
         incomingFiles.removeAll()
@@ -1472,7 +1452,7 @@ final class PairingCoordinator: ObservableObject {
 
     func cancelFileTransfer(id transferID: String) {
         markTransferCancelled(transferID)
-        session?.send(PairingMessage(kind: "files.cancel", sessionId: session?.id ?? "", transferId: transferID))
+        activeSession?.send(PairingMessage(kind: "files.cancel", sessionId: activeSession?.id ?? "", transferId: transferID))
         incomingFiles.removeValue(forKey: transferID)?.cancel()
         outgoingFiles.removeValue(forKey: transferID)?.cancel()
         markFileTransferFinished(id: transferID, status: "Transfer cancelled")
@@ -1481,7 +1461,7 @@ final class PairingCoordinator: ObservableObject {
 
     func retryFileTransfer(id transferID: String) {
         guard let url = outgoingFileSources[transferID] else { return }
-        guard session != nil, case .connected = state else {
+        guard activeSession != nil, case .connected = state else {
             markFileTransferFinished(id: transferID, status: "Reconnect before retrying")
             return
         }
@@ -1572,7 +1552,7 @@ final class PairingCoordinator: ObservableObject {
     /// ECDH+SAS-verified handshake holds the pairingKey this payload must decrypt with. A no-op if
     /// the phone hasn't opted in (isFeatureAvailable(.remoteScreenShare) false) or nothing is paired.
     private func sendRemoteScreenShareStart() {
-        guard let current = session, case .connected = state, isFeatureAvailable(.remoteScreenShare) else { return }
+        guard let current = activeSession, case .connected = state, isFeatureAvailable(.remoteScreenShare) else { return }
         guard let plaintext = try? JSONEncoder().encode(RemoteScreenSharePayload(version: 1)),
               let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
         current.send(PairingMessage(
@@ -1586,7 +1566,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func sendRemoteScreenShareStop() {
-        guard let current = session, case .connected = state, isFeatureAvailable(.remoteScreenShare) else { return }
+        guard let current = activeSession, case .connected = state, isFeatureAvailable(.remoteScreenShare) else { return }
         guard let plaintext = try? JSONEncoder().encode(RemoteScreenSharePayload(version: 1)),
               let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
         current.send(PairingMessage(
@@ -1605,7 +1585,7 @@ final class PairingCoordinator: ObservableObject {
     /// No feature-negotiation gate (unlike Remote Screen Share): a peer that doesn't understand this
     /// command kind just ignores it, same fallback every other unrecognized `kind` already gets.
     private func sendSwitchKeyboard() {
-        guard let current = session, case .connected = state else { return }
+        guard let current = activeSession, case .connected = state else { return }
         guard let plaintext = try? JSONEncoder().encode(SwitchKeyboardPayload(version: 1)),
               let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
         current.send(PairingMessage(
@@ -1649,7 +1629,8 @@ final class PairingCoordinator: ObservableObject {
             listener.start(queue: .main)
             self.listener = listener
         } catch {
-            state = .failed("Could not start pairing listener")
+            failureMessage = "Could not start pairing listener"
+            refreshState()
         }
     }
 
@@ -1666,40 +1647,14 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func accept(_ connection: NWConnection) {
-        // A session that has already identified its peer (received pairing.offer/answer) is
-        // actively mid-handshake or connected; a brand new incoming connection racing against it
-        // must not tear it down, or two devices reconnecting near the same moment can flap
-        // forever without either ever completing. Before a peer is identified, the session is
-        // cheap enough (a fresh socket, no handshake progress) that letting a fresh contender
-        // replace it is fine.
-        let stateClaimsSession: Bool
-        if case .idle = state { stateClaimsSession = false } else if case .failed = state { stateClaimsSession = false } else { stateClaimsSession = true }
-        if let existing = session, !existing.remoteDeviceID.isEmpty, stateClaimsSession {
-            NSLog("CONNECT rejecting new connection: session with peer=%@ already in progress", String(existing.remoteDeviceID.prefix(8)))
-            connection.cancel()
-            return
-        }
+        // A new socket is pending until it says which device it is (pairing.offer). Duplicate
+        // protection is then applied per deviceId, so it can never displace another device's session.
         NSLog("CONNECT accepting incoming connection")
-        session?.close()
-        let current = Session(connection: connection, peerName: "Android device")
+        let current = Session(connection: connection, peerName: "Bridgey device")
         current.remoteHost = Self.remoteHostString(connection)
         current.initiatedLocally = false
-        session = current
-        remoteBattery = nil
-        remoteStorage = nil
-        resetRemoteMemoryState()
-        resetTelemetrySubscriptionState()
-        clearPingStatus()
-        quickActions.reset()
-        mediaController.reset()
-        mediaRemote.reset()
-        videoChannel.reset()
-        screenStreamDecoder.reset()
-        lastSentBattery = nil
-        lastSentStorage = nil
-        remoteFeatures = defaultRemoteFeatureState()
-        remoteFeatureStateReceived = false
-        clearRemoteCall()
+        peers.addPending(current, initiatedLocally: false, expectedDeviceID: nil)
+        scheduleConnectionTimeout(for: current)
         configure(current, onReady: {})
     }
 
@@ -1709,45 +1664,12 @@ final class PairingCoordinator: ObservableObject {
             self.receive(message, in: current)
         }
         current.onFailure = { [weak self, weak current] in
-            guard let self, self.session === current else { return }
-            self.connectionTimeoutWorkItem?.cancel()
-            self.heartbeatWorkItem?.cancel()
-            self.cancelIncomingFiles()
-            self.clearClipboardSendStatus()
-            self.clearCallStatus()
-            if !self.outgoingFiles.isEmpty {
-                self.outgoingFiles.values.forEach { $0.cancel() }
-                self.outgoingFiles.removeAll()
-                self.fileTransferStatus = "File transfer interrupted"
-            }
-            // Unified: a transport failure during the handshake (.connecting/.verification) is
-            // treated exactly like one after .connected — full cleanup, back to .idle, and a
-            // reconnect attempt scheduled if this is a trusted peer. Previously only the
-            // .connected case did this; a drop mid-handshake (common right after a network blip,
-            // exactly when a reconnect attempt is most likely to also glitch) landed in `.failed`
-            // with no automatic recovery and no log line at all.
-            let wasConnected: Bool
-            if case .connected = self.state { wasConnected = true } else { wasConnected = false }
-            self.session = nil
-            self.remoteBattery = nil
-            self.remoteStorage = nil
-            self.clearPingStatus()
-            self.quickActions.reset()
-            self.mediaController.reset()
-            self.mediaRemote.reset()
-            self.videoChannel.reset()
-            self.screenStreamDecoder.reset()
-            self.lastSentBattery = nil
-            self.lastSentStorage = nil
-            self.resetRemoteMemoryState()
-            self.resetTelemetrySubscriptionState()
-            self.clearRemoteCall()
-            self.remoteFeatures = defaultRemoteFeatureState()
-            self.remoteFeatureStateReceived = false
-            self.state = .idle
-            NSLog("CONNECTION lost: wasConnected=%@", String(wasConnected))
+            // Transport failure in any phase: only this session ends; reconnect is per device.
+            guard let self, let current, self.peers.contains(current) else { return }
+            let wasConnected = self.peers.phase(of: current) == .connected
+            NSLog("CONNECTION lost: wasConnected=%@ peer=%@", String(wasConnected), String(current.remoteDeviceID.prefix(8)))
             self.diagnostics.record(category: "transport", event: "disconnected", outcome: "reconnecting")
-            self.scheduleReconnect()
+            self.endSession(current, scheduleReconnect: true)
         }
         current.connection.stateUpdateHandler = { [weak self, weak current] newState in
             DispatchQueue.main.async {
@@ -1764,21 +1686,9 @@ final class PairingCoordinator: ObservableObject {
                     NSLog("TRANSPORT connection cancelled")
                     current.onFailure?()
                 case let .waiting(error) where localNetworkPermissionDenied(error):
-                    guard self.session === current else { return }
-                    self.connectionTimeoutWorkItem?.cancel()
-                    self.heartbeatWorkItem?.cancel()
-                    self.session = nil
-                    self.clearPingStatus()
-                    self.quickActions.reset()
-                    self.mediaController.reset()
-                    self.mediaRemote.reset()
-                    self.videoChannel.reset()
-                    self.screenStreamDecoder.reset()
-                    self.lastSentBattery = nil
-                    self.clearRemoteCall()
-                    self.remoteFeatureStateReceived = false
-                    current.close()
-                    self.state = .failed("Local Network access is off. Enable Bridgey in System Settings → Privacy & Security → Local Network.")
+                    guard self.peers.contains(current) else { return }
+                    self.failureMessage = "Local Network access is off. Enable Bridgey in System Settings → Privacy & Security → Local Network."
+                    self.endSession(current, scheduleReconnect: false)
                     self.diagnostics.record(category: "transport", event: "local_network_denied", outcome: "permission_required")
                 default:
                     // DIAGNOSTIC (temporary, logging only): otherwise-unlogged NWConnection state
@@ -1791,23 +1701,159 @@ final class PairingCoordinator: ObservableObject {
         current.connection.start(queue: .main)
     }
 
+    /// Ends exactly one session. Other devices' sessions are untouched; single-peer feature state
+    /// is reset only when this was the routed (active) session.
+    private func endSession(_ current: Session, scheduleReconnect: Bool) {
+        current.heartbeatWork?.cancel()
+        current.timeoutWork?.cancel()
+        let wasActive = current === activeSession
+        let deviceID = peers.remove(current)
+        current.close()
+        if wasActive { interruptFeatureTransfers() }
+        recomputeActivePeer()
+        if scheduleReconnect, let deviceID, registry.trustedDeviceIDs.contains(deviceID) {
+            self.scheduleReconnect(deviceID)
+        }
+    }
+
+    /// Binds a socket to the device it announced (proved later by the identity signature).
+    private func identify(_ current: Session, as remoteID: String) -> Bool {
+        let (result, displaced) = peers.identify(current, as: remoteID)
+        guard result == .identified else {
+            NSLog("CONNECT rejecting connection for peer=%@: %@", String(remoteID.prefix(8)), String(describing: result))
+            peers.remove(current)
+            current.timeoutWork?.cancel()
+            current.close()
+            refreshState()
+            return false
+        }
+        if let displaced {
+            NSLog("CONNECT simultaneous dial with peer=%@: keeping the lower-id initiated connection", String(remoteID.prefix(8)))
+            displaced.heartbeatWork?.cancel()
+            displaced.timeoutWork?.cancel()
+            displaced.close()
+        }
+        return true
+    }
+
+    /// Ends in-flight clipboard/file/call exchanges of the single-peer feature layer.
+    private func interruptFeatureTransfers() {
+        cancelIncomingFiles()
+        clearClipboardSendStatus()
+        clearCallStatus()
+        if !outgoingFiles.isEmpty {
+            outgoingFiles.values.forEach { $0.cancel() }
+            outgoingFiles.removeAll()
+            fileTransferStatus = "File transfer interrupted"
+        }
+    }
+
+    /// The routing seam: recomputes which connected device today's single-peer features use.
+    private func recomputeActivePeer() {
+        let next = DeviceRouting.activePeer(
+            mode: settings.deviceRoutingMode,
+            preferredDeviceID: settings.preferredDeviceID,
+            connected: peers.connectedInOrder
+        )
+        guard next != activePeerID else {
+            refreshState()
+            return
+        }
+        let previous = activePeerID.flatMap { peers.session(for: $0) }
+        activePeerID = next
+        NSLog("ROUTING active peer -> %@", next.map { String($0.prefix(8)) } ?? "none")
+        activePeerChanged(previous: previous)
+        refreshState()
+    }
+
+    /// Feature layer only. Today's single-peer features restart against the newly routed session.
+    /// No session, capability, trust or connection state changes, and no capability update is sent.
+    private func activePeerChanged(previous: Session?) {
+        if localWantsRemoteTelemetryUpdates, let previous, peers.phase(of: previous) == .connected {
+            // Battery-conscious: the device we no longer show must stop sampling for us.
+            previous.send(PairingMessage(kind: "telemetry.unsubscribe", sessionId: previous.id))
+        }
+        // Transfers bound to the previous peer cannot complete through the feature layer any more.
+        if previous != nil { interruptFeatureTransfers() }
+        stopMacSound()
+        androidRinging = false
+        remoteBattery = nil
+        remoteStorage = nil
+        clearPingStatus()
+        quickActions.reset()
+        mediaController.reset()
+        mediaRemote.reset()
+        videoChannel.reset()
+        screenStreamDecoder.reset()
+        lastSentBattery = nil
+        lastSentStorage = nil
+        resetRemoteMemoryState()
+        resetTelemetrySubscriptionState()
+        clearRemoteCall()
+        remoteFeatures = defaultRemoteFeatureState()
+        remoteFeatureStateReceived = false
+        guard let current = activeSession, peers.phase(of: current) == .connected else { return }
+        clearAllDetector.reset() // a new session re-seeds from what is delivered after settling
+        clearAllSettlingStartedAt = Date()
+        publishLocalBattery(force: true)
+        if localWantsRemoteTelemetryUpdates { sendTelemetrySubscription(subscribe: true) }
+        if let capabilities = activePeerID.flatMap(peers.capabilities(for:)) { applyRemoteFeatures(capabilities) }
+    }
+
+    /// Today's single-value status (UI, menu icon, feature guards), derived from the Core.
+    /// `.connected` means the routed (active) device is connected.
+    private func refreshState() {
+        let next: PairingState
+        if let verifying = peers.verifyingSession, let code = verifying.code {
+            next = .verification(peerName: verifying.peerName, code: code)
+        } else if let current = activeSession, peers.phase(of: current) == .connected {
+            next = .connected(deviceID: current.remoteDeviceID, peerName: current.peerName)
+        } else if let failureMessage {
+            next = .failed(failureMessage)
+        } else if let dialing = (peers.identifiedSessions + peers.pendingSessions).first(where: { $0.initiatedLocally }) {
+            next = .connecting(dialing.peerName)
+        } else {
+            next = .idle
+        }
+        if state != next { state = next }
+    }
+
+    /// Protocol messages owned by the Core; everything else belongs to a feature.
+    private static let coreMessageKinds: Set<String> = [
+        "pairing.offer", "pairing.answer", "pairing.confirm", "pairing.cancel",
+        "heartbeat.ping", "heartbeat.pong", "features.update",
+    ]
+
     private func receive(_ message: PairingMessage, in current: Session) {
+        // COMPATIBILITY SEAM: features consume only the routed session. An inactive session stays
+        // connected; its feature messages are received by the Core but not consumed yet.
+        guard Self.coreMessageKinds.contains(message.kind) || current === activeSession else {
+            if peers.phase(of: current) == .connected {
+                current.unconsumedFeatureMessages += 1
+                if current.unconsumedFeatureMessages == 1 {
+                    NSLog("ROUTING feature messages from inactive peer=%@ not consumed (kind=%@)", String(current.remoteDeviceID.prefix(8)), message.kind)
+                    diagnostics.record(category: "routing", event: "inactive_peer_feature_message", outcome: "not_consumed")
+                }
+            }
+            return
+        }
         do {
             switch message.kind {
             case "quick.request", "quick.result":
                 receiveQuickPayload(message, current: current)
             case "heartbeat.ping":
-                guard message.sessionId == current.id, case .connected = state else { return }
+                guard message.sessionId == current.id, peers.phase(of: current) == .connected else { return }
                 current.heartbeatSupported = true
                 current.send(PairingMessage(kind: "heartbeat.pong", sessionId: current.id, messageId: message.messageId))
             case "heartbeat.pong":
-                guard message.sessionId == current.id, case .connected = state else { return }
+                guard message.sessionId == current.id, peers.phase(of: current) == .connected else { return }
                 current.heartbeatSupported = true
             case "pairing.offer":
                 guard let publicKey = message.publicKey else { throw PairingError.invalidMessage }
                 current.id = message.sessionId
-                current.peerName = message.deviceName ?? "Android device"
+                current.peerName = message.deviceName ?? "Bridgey device"
                 guard let remoteDeviceID = message.deviceId else { throw PairingError.invalidMessage }
+                guard identify(current, as: remoteDeviceID) else { return }
                 current.remoteDeviceID = remoteDeviceID
                 current.remoteEphemeralKey = publicKey
                 let key = P256.KeyAgreement.PrivateKey()
@@ -1829,6 +1875,7 @@ final class PairingCoordinator: ObservableObject {
                       let key = current.privateKey,
                       let publicKey = message.publicKey,
                       let remoteDeviceID = message.deviceId else { throw PairingError.invalidMessage }
+                guard identify(current, as: remoteDeviceID) else { return }
                 current.peerName = message.deviceName ?? current.peerName
                 current.remoteDeviceID = remoteDeviceID
                 current.remoteEphemeralKey = publicKey
@@ -1843,7 +1890,7 @@ final class PairingCoordinator: ObservableObject {
                       let identityKey = message.identityKey,
                       let proof = message.proof,
                       let signature = message.signature,
-                      trustedIdentityKey(remoteID).map({ $0 == identityKey }) ?? true,
+                      registry.evaluate(deviceID: remoteID, identityKey: identityKey) != .identityMismatch,
                       verifyConfirmationProof(
                         proof,
                         key: current.pairingKey!,
@@ -1857,9 +1904,10 @@ final class PairingCoordinator: ObservableObject {
                 current.remoteConfirmed = true
                 completeIfConfirmed(current)
             case "pairing.cancel":
-                cancel()
+                endSession(current, scheduleReconnect: false)
+                refreshState()
             case "features.update":
-                guard case .connected = state,
+                guard peers.phase(of: current) == .connected,
                       message.sessionId == current.id,
                       let messageID = message.messageId,
                       current.acceptMessageID(messageID),
@@ -1871,41 +1919,13 @@ final class PairingCoordinator: ObservableObject {
                       BridgeyFeature.allCases.filter(featureEnabledByLegacyPeer).allSatisfy({ payload.features[$0.rawValue] != nil }) else {
                     throw PairingError.invalidMessage
                 }
-                remoteFeatures = Dictionary(uniqueKeysWithValues: BridgeyFeature.allCases.map {
-                    ($0, payload.features[$0.rawValue] ?? false)
+                // Core: every session keeps its own real negotiated capabilities.
+                let capabilities = Dictionary(uniqueKeysWithValues: BridgeyFeature.allCases.map {
+                    ($0.rawValue, payload.features[$0.rawValue] ?? false)
                 })
-                remoteFeatureStateReceived = true
-                if !isFeatureAvailable(.links) { quickActions.reset() }
-                mediaController.reset()
-                mediaRemote.reset()
-                videoChannel.reset()
-                screenStreamDecoder.reset()
-                mediaController.refresh()
-                if remoteFeatures[.battery] == false { remoteBattery = nil }
-                if remoteFeatures[.storage] == false { remoteStorage = nil }
-                if remoteFeatures[.memory] == false { remoteMemory = nil }
-                if remoteFeatures[.cpu] == false { remoteCpu = nil }
-                if remoteFeatures[.temperature] == false { remoteTemperature = nil }
-                if remoteFeatures[.ping] == false { clearPingStatus() }
-                if remoteFeatures[.clipboard] == false { clearClipboardSendStatus() }
-                if remoteFeatures[.notifications] == false {
-                    clearRemoteCall()
-                    let peerID = current.remoteDeviceID
-                    removeAllRemoteNotifications(reason: "peer_feature_off") { $0 == peerID }
-                }
-                if remoteFeatures[.calls] == false { clearCallStatus() }
-                if remoteFeatures[.files] == false && fileTransferActive {
-                    cancelFileTransfer()
-                    fileTransferStatus = nil
-                }
-                if remoteFeatures[.findDevice] == false {
-                    stopMacSound()
-                    androidRinging = false
-                }
-                flushPendingCallIfPossible()
-                publishLocalBattery(force: true)
-                publishLocalStorage(force: true)
-                publishLocalMemory(force: true)
+                peers.setCapabilities(capabilities, for: current)
+                // Features: only the routed session's capabilities drive today's single-peer features.
+                if current === activeSession { applyRemoteFeatures(capabilities) }
             case "screenshare.remoteStartResult":
                 NSLog("REMOTE_START result from Android: %@", message.status ?? "unknown")
             case "ping.request":
@@ -2307,7 +2327,7 @@ final class PairingCoordinator: ObservableObject {
                         self.updateFileTransfer(id: transferID, name: transfer.displayName, status: value, active: true)
                     },
                     completion: { [weak self, weak current] result in
-                        guard let self, let current, self.session === current else { return }
+                        guard let self, let current, self.activeSession === current else { return }
                         switch result {
                         case let .success(completion):
                             guard !transfer.isCancelled,
@@ -2371,44 +2391,86 @@ final class PairingCoordinator: ObservableObject {
                 break
             }
         } catch {
+            NSLog("PROTOCOL invalid message kind=%@ from peer=%@, closing that session", message.kind, String(current.remoteDeviceID.prefix(8)))
             current.close()
-            state = .failed("Invalid pairing message")
             diagnostics.record(category: "protocol", event: "message_rejected", outcome: "session_closed")
         }
     }
 
+    /// Mirrors the routed session's capabilities into today's single-peer feature state.
+    private func applyRemoteFeatures(_ capabilities: [String: Bool]) {
+        remoteFeatures = Dictionary(uniqueKeysWithValues: BridgeyFeature.allCases.map {
+            ($0, capabilities[$0.rawValue] ?? false)
+        })
+        remoteFeatureStateReceived = true
+        if !isFeatureAvailable(.links) { quickActions.reset() }
+        mediaController.reset()
+        mediaRemote.reset()
+        videoChannel.reset()
+        screenStreamDecoder.reset()
+        mediaController.refresh()
+        if remoteFeatures[.battery] == false { remoteBattery = nil }
+        if remoteFeatures[.storage] == false { remoteStorage = nil }
+        if remoteFeatures[.memory] == false { remoteMemory = nil }
+        if remoteFeatures[.cpu] == false { remoteCpu = nil }
+        if remoteFeatures[.temperature] == false { remoteTemperature = nil }
+        if remoteFeatures[.ping] == false { clearPingStatus() }
+        if remoteFeatures[.clipboard] == false { clearClipboardSendStatus() }
+        if remoteFeatures[.notifications] == false {
+            clearRemoteCall()
+            let peerID = activePeerID ?? ""
+            removeAllRemoteNotifications(reason: "peer_feature_off") { $0 == peerID }
+        }
+        if remoteFeatures[.calls] == false { clearCallStatus() }
+        if remoteFeatures[.files] == false && fileTransferActive {
+            cancelFileTransfer()
+            fileTransferStatus = nil
+        }
+        if remoteFeatures[.findDevice] == false {
+            stopMacSound()
+            androidRinging = false
+        }
+        flushPendingCallIfPossible()
+        publishLocalBattery(force: true)
+        publishLocalStorage(force: true)
+        publishLocalMemory(force: true)
+    }
+
     private func completeIfConfirmed(_ current: Session) {
         if current.localConfirmed && current.remoteConfirmed {
-            connectionTimeoutWorkItem?.cancel()
+            let id = current.remoteDeviceID
+            guard peers.deviceID(of: current) == id else { return }
+            current.timeoutWork?.cancel()
             saveTrust(current)
-            state = .connected(deviceID: current.remoteDeviceID, peerName: current.peerName)
+            peers.markConnected(current)
+            failureMessage = nil
+            registry.recordConnection(deviceID: id, name: current.peerName, at: Date())
             diagnostics.record(category: "pairing", event: "connected")
-            reconnectAttempt = 0
-            reconnectWorkItem?.cancel()
-            // lastTrustedEndpoint previously was only ever set by pair() (an outbound dial), so a
-            // peer whose most recent connection came from *them* dialing *us* (accept(_:)), or any
-            // peer after this app restarts, had a permanently inert reconnect timer for that peer.
-            // Looking it up from the current discovery snapshot instead works regardless of which
-            // side initiated, and always reflects the peer's latest known host/port.
-            if let peer = lastKnownPeers.first(where: { $0.deviceIDHint == current.remoteDeviceID }),
-               let host = peer.host, let port = peer.port {
-                lastTrustedEndpoint = (host, port, current.peerName)
+            reconnectAttempts[id] = 0
+            reconnectWork.removeValue(forKey: id)?.cancel()
+            // Per-device last endpoint from current discovery, whichever side initiated.
+            if let endpoint = registry.endpoints(for: id).first {
+                lastEndpoints[id] = (endpoint.host, endpoint.port, current.peerName)
             }
-            sendFeatureState()
-            clearAllDetector.reset() // a new session re-seeds from what is delivered after settling
-            clearAllSettlingStartedAt = Date()
-            publishLocalBattery(force: true)
-            if localWantsRemoteTelemetryUpdates { sendTelemetrySubscription(subscribe: true) }
+            sendFeatureState(to: current)
             scheduleHeartbeat(for: current)
+            if settings.preferredDeviceID == nil { settings.setPreferredDevice(id) }
+            recomputeActivePeer()
             NSLog("PAIRING verified peer=%@", current.peerName)
         }
     }
 
+    /// Sends every connected session its real local feature state (per-device settings). Never
+    /// depends on which device is active.
     private func sendFeatureState() {
-        guard let current = session, case .connected = state, let key = current.pairingKey else { return }
-        let features = Dictionary(uniqueKeysWithValues: BridgeyFeature.allCases.map {
-            ($0.rawValue, settings.isEnabled($0, for: current.remoteDeviceID))
-        })
+        for current in peers.identifiedSessions where peers.phase(of: current) == .connected {
+            sendFeatureState(to: current)
+        }
+    }
+
+    private func sendFeatureState(to current: Session) {
+        guard peers.phase(of: current) == .connected, let key = current.pairingKey else { return }
+        let features = PeerFeatureState.payload(for: current.remoteDeviceID) { [settings] in settings.isEnabled($0, for: $1) }
         guard let payload = try? JSONEncoder().encode(FeatureStatePayload(version: 1, features: features)),
               let encrypted = try? encrypt(payload, key: key) else { return }
         current.send(PairingMessage(
@@ -2482,11 +2544,19 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func authenticateOrPrompt(_ current: Session) {
-        if trustedIdentityKey(current.remoteDeviceID) != nil {
+        if registry.identityKey(for: current.remoteDeviceID) != nil {
             confirm(current)
-        } else {
-            state = .verification(peerName: current.peerName, code: current.code!)
+            return
         }
+        if let other = peers.verifyingSession, other !== current {
+            // One verification code on screen at a time; the other device can retry.
+            NSLog("PAIRING another device is being verified, rejecting peer=%@", String(current.remoteDeviceID.prefix(8)))
+            current.send(PairingMessage(kind: "pairing.cancel", sessionId: current.id))
+            endSession(current, scheduleReconnect: false)
+            return
+        }
+        peers.setPhase(.verifying, for: current)
+        refreshState()
     }
 
     private func authTranscript(_ current: Session) -> Data {
@@ -2494,10 +2564,6 @@ final class PairingCoordinator: ObservableObject {
             ? [deviceID, current.remoteDeviceID, current.localEphemeralKey, current.remoteEphemeralKey]
             : [current.remoteDeviceID, deviceID, current.remoteEphemeralKey, current.localEphemeralKey]
         return Data((["bridgey-auth-v1", current.id] + fields).joined(separator: "\0").utf8)
-    }
-
-    private func trustedIdentityKey(_ deviceID: String) -> String? {
-        trustRegistry.identityKey(for: deviceID)
     }
 
     private func verifySignature(_ value: String, identityKey: String, data: Data) -> Bool {
@@ -2508,51 +2574,66 @@ final class PairingCoordinator: ObservableObject {
         return publicKey.isValidSignature(signature, for: data)
     }
 
-    func connectTrustedPeerIfNeeded(_ peers: [DiscoveredPeer]) {
-        guard state == .idle else { return }
-        guard let peer = peers.first(where: {
-            guard let id = $0.deviceIDHint else { return false }
-            return trustedDeviceIDs.contains(id) && deviceID < id
-        }), let host = peer.host, let port = peer.port else { return }
-        NSLog("RECONNECT discovery match peer=%@", peer.deviceNameHint)
-        pair(host: host, port: port, peerName: peer.deviceNameHint)
+    /// Dials every trusted, discovered device that has no session yet (lower deviceId dials).
+    private func connectTrustedPeersIfNeeded() {
+        let targets = ReconnectPlanner.discoveryDialTargets(
+            localDeviceID: deviceID,
+            trustedDeviceIDs: registry.trustedDeviceIDs,
+            presence: registry.presence,
+            endpointIndex: { [reconnectAttempts] in reconnectAttempts[$0, default: 0] },
+            isBusy: { [peers, reconnectWork] in peers.isBusy($0) || reconnectWork[$0] != nil }
+        )
+        for target in targets {
+            let name = registry.presence[target.deviceID]?.name ?? "Bridgey device"
+            NSLog("RECONNECT discovery match peer=%@", name)
+            dial(host: target.endpoint.host, port: target.endpoint.port, peerName: name, expectedDeviceID: target.deviceID)
+        }
     }
 
-    private func scheduleReconnect() {
-        guard let endpoint = lastTrustedEndpoint else {
-            NSLog("RECONNECT skipped: no known trusted endpoint yet")
+    /// Per-device reconnect backoff. One device's retries never affect another device.
+    private func scheduleReconnect(_ deviceID: String) {
+        let attempt = reconnectAttempts[deviceID, default: 0]
+        let known = registry.endpoints(for: deviceID)
+        // Retries rotate through a device's endpoints, so a stale advert cannot pin every attempt.
+        guard let endpoint = (known.isEmpty ? nil : known[attempt % known.count]).map({ (host: $0.host, port: $0.port) })
+                ?? lastEndpoints[deviceID].map({ (host: $0.host, port: $0.port) }) else {
+            NSLog("RECONNECT skipped: no known endpoint for peer=%@", String(deviceID.prefix(8)))
             return
         }
-        reconnectWorkItem?.cancel()
+        reconnectWork[deviceID]?.cancel()
         // Jitter is added here (not inside reconnectDelay, which stays a pure, tested function)
         // so two devices racing to reconnect at the same moment don't stay in lockstep and keep
         // colliding on every subsequent retry.
-        let delay = reconnectDelay(attempt: reconnectAttempt) + TimeInterval.random(in: 0..<1)
-        reconnectAttempt += 1
-        NSLog("RECONNECT scheduling attempt to %@:%d in %.1fs", endpoint.host, endpoint.port, delay)
+        let delay = reconnectDelay(attempt: attempt) + TimeInterval.random(in: 0..<1)
+        reconnectAttempts[deviceID] = attempt + 1
+        let name = registry.device(deviceID)?.name ?? lastEndpoints[deviceID]?.name ?? "Bridgey device"
+        NSLog("RECONNECT scheduling attempt to peer=%@ %@:%d in %.1fs", String(deviceID.prefix(8)), endpoint.host, endpoint.port, delay)
         diagnostics.record(category: "reconnect", event: "scheduled")
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.state == .idle else { return }
-            NSLog("RECONNECT attempting %@:%d", endpoint.host, endpoint.port)
+            guard let self else { return }
+            self.reconnectWork[deviceID] = nil
+            guard !self.peers.isBusy(deviceID), self.registry.trustedDeviceIDs.contains(deviceID) else { return }
+            let current = self.registry.endpoints(for: deviceID)
+            let target = (current.isEmpty ? nil : current[attempt % current.count]).map { (host: $0.host, port: $0.port) } ?? endpoint
+            NSLog("RECONNECT attempting peer=%@ %@:%d", String(deviceID.prefix(8)), target.host, target.port)
             self.diagnostics.record(category: "reconnect", event: "attempt")
-            self.pair(host: endpoint.host, port: endpoint.port, peerName: endpoint.name)
+            self.dial(host: target.host, port: target.port, peerName: name, expectedDeviceID: deviceID)
         }
-        reconnectWorkItem = work
+        reconnectWork[deviceID] = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
+    /// Times out a session that has not finished its handshake (verification waits for the user).
     private func scheduleConnectionTimeout(for current: Session) {
-        connectionTimeoutWorkItem?.cancel()
+        current.timeoutWork?.cancel()
         let timeout = DispatchWorkItem { [weak self, weak current] in
-            guard let self, let current, self.session === current else { return }
-            guard case .connecting = self.state else { return }
-            self.session = nil
-            current.close()
-            self.state = .idle
+            guard let self, let current, self.peers.contains(current) else { return }
+            let phase = self.peers.phase(of: current)
+            guard phase == nil || phase == .connecting else { return }
             NSLog("TRANSPORT connection timed out")
-            self.scheduleReconnect()
+            self.endSession(current, scheduleReconnect: true)
         }
-        connectionTimeoutWorkItem = timeout
+        current.timeoutWork = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: timeout)
     }
 
@@ -2678,7 +2759,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func isConnected(to deviceID: String) -> Bool {
-        if case let .connected(connectedDeviceID, _) = state, connectedDeviceID == deviceID, session != nil { return true }
+        if case let .connected(connectedDeviceID, _) = state, connectedDeviceID == deviceID, activeSession != nil { return true }
         return false
     }
 
@@ -2691,7 +2772,7 @@ final class PairingCoordinator: ObservableObject {
     private var clearAllNotificationsAuthorized: Bool?
 
     private func checkNotificationClearAll() {
-        guard case let .connected(deviceID, _) = state, let current = session else { return }
+        guard case let .connected(deviceID, _) = state, let current = activeSession else { return }
         let forwardingAvailable = isFeatureAvailable(.notifications) && featureEnabled(.notifications, current: current)
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { settings in
@@ -2742,7 +2823,7 @@ final class PairingCoordinator: ObservableObject {
         guard !notificationIDs.isEmpty,
               case let .connected(connectedDeviceID, _) = state,
               connectedDeviceID == deviceID,
-              let current = session,
+              let current = activeSession,
               current.remoteDeviceID == deviceID,
               isFeatureAvailable(.notifications),
               featureEnabled(.notifications, current: current) else { return }
@@ -2764,13 +2845,14 @@ final class PairingCoordinator: ObservableObject {
         diagnostics.record(category: "notification", event: "dismiss_many_sent")
     }
 
+    /// Per-session heartbeat; a timeout ends only this session.
     private func scheduleHeartbeat(for current: Session) {
-        heartbeatWorkItem?.cancel()
+        current.heartbeatWork?.cancel()
         let work = DispatchWorkItem { [weak self, weak current] in
-            guard let self, let current, self.session === current, case .connected = self.state else { return }
+            guard let self, let current, self.peers.phase(of: current) == .connected else { return }
             let sinceLastReceived = Date().timeIntervalSince(current.lastReceivedAt)
             if heartbeatExpired(supported: current.heartbeatSupported, lastReceivedAt: current.lastReceivedAt) {
-                NSLog("CONNECTION lost: heartbeat timed out (sinceLastReceived=%.1fs)", sinceLastReceived)
+                NSLog("CONNECTION lost: heartbeat timed out (sinceLastReceived=%.1fs) peer=%@", sinceLastReceived, String(current.remoteDeviceID.prefix(8)))
                 current.close()
                 return
             }
@@ -2779,12 +2861,14 @@ final class PairingCoordinator: ObservableObject {
                 sessionId: current.id,
                 messageId: UUID().uuidString.lowercased()
             ))
-            self.publishLocalBattery()
-            self.mediaController.refresh()
-            self.checkNotificationClearAll() // piggybacks on the existing heartbeat, no new timer
+            if current === self.activeSession {
+                self.publishLocalBattery()
+                self.mediaController.refresh()
+                self.checkNotificationClearAll() // piggybacks on the existing heartbeat, no new timer
+            }
             self.scheduleHeartbeat(for: current)
         }
-        heartbeatWorkItem = work
+        current.heartbeatWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
     }
 
@@ -2930,7 +3014,7 @@ final class PairingCoordinator: ObservableObject {
     private func dismissAndroidNotification(_ notificationID: String, deviceID: String) {
         guard case let .connected(connectedDeviceID, _) = state,
               connectedDeviceID == deviceID,
-              let current = session,
+              let current = activeSession,
               current.remoteDeviceID == deviceID,
               featureEnabled(.notifications, current: current),
               !notificationID.isEmpty,
@@ -2957,7 +3041,7 @@ final class PairingCoordinator: ObservableObject {
     ) {
         guard case let .connected(connectedDeviceID, _) = state,
               connectedDeviceID == deviceID,
-              let current = session,
+              let current = activeSession,
               current.remoteDeviceID == deviceID,
               featureEnabled(.notifications, current: current),
               !notificationID.isEmpty,
@@ -3076,13 +3160,8 @@ final class PairingCoordinator: ObservableObject {
 
     private func saveTrust(_ current: Session) {
         guard let identityKey = current.remoteIdentityKey else { return }
-        if trustRegistry.remember(
-            deviceID: current.remoteDeviceID,
-            name: current.peerName,
-            identityKey: identityKey
-        ) {
-            trustedDeviceIDs.insert(current.remoteDeviceID)
-        }
+        registry.remember(deviceID: current.remoteDeviceID, name: current.peerName, identityKey: identityKey)
+        trustedDeviceIDs = registry.trustedDeviceIDs
     }
 
 }
@@ -3106,6 +3185,12 @@ private final class Session {
     var remoteConfirmed = false
     var lastReceivedAt = Date()
     var heartbeatSupported = false
+    // Per-session lifecycle (multi-device Core): each device's session owns its own timers.
+    var heartbeatWork: DispatchWorkItem?
+    var timeoutWork: DispatchWorkItem?
+    /// The device an outgoing dial targets (discovery hint) until the peer identifies itself.
+    var expectedDeviceID: String?
+    var unconsumedFeatureMessages = 0
     var onMessage: ((PairingMessage) -> Void)?
     var onFailure: (() -> Void)?
     private var buffer = Data()
@@ -3458,7 +3543,7 @@ private final class IncomingFileTransfer {
     }
 }
 
-private final class MacIdentity {
+final class MacIdentity {
     private let service = "dev.bridgey.identity"
     private let account = "p256-signing-v1"
     private let key: P256.Signing.PrivateKey

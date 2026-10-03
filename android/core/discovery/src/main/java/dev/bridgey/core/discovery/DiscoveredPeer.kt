@@ -8,6 +8,8 @@ data class DiscoveredPeer(
     val protocolVersionHint: Int?,
     val host: String?,
     val port: Int?,
+    /** Additive TXT `type` hint (computer/phone/tablet/...). Descriptive only, never identity. */
+    val deviceTypeHint: String? = null,
 ) {
     val key: String get() = serviceName
 }
@@ -25,11 +27,13 @@ object DiscoveryTxtRecord {
             ?: serviceName.take(64)
         val platform = decode(attributes["platform"], MAX_PLATFORM_BYTES)
             ?.takeIf { it.matches(Regex("[a-z][a-z0-9-]{0,15}")) }
+        val type = decode(attributes["type"], MAX_PLATFORM_BYTES)
+            ?.takeIf { it.matches(Regex("[a-z][a-z0-9-]{0,15}")) }
         val version = decode(attributes["version"], MAX_VERSION_BYTES)
             ?.toIntOrNull()
             ?.takeIf { it in 1..Int.MAX_VALUE }
 
-        return DiscoveredPeer(serviceName, id, name, platform, version, null, null)
+        return DiscoveredPeer(serviceName, id, name, platform, version, null, null, deviceTypeHint = type)
     }
 
     private fun decode(value: ByteArray?, maxBytes: Int): String? {

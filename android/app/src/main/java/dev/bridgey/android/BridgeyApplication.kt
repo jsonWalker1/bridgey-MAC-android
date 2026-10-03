@@ -54,8 +54,9 @@ class BridgeyApplication : Application() {
         val systemDeviceName = Settings.Global.getString(contentResolver, "device_name") ?: "Android device"
         settings = BridgeySettings(this, systemDeviceName)
         val deviceName = settings.state.value.deviceName
-        pairing = PairingCoordinator(this, deviceId, deviceName, settings = settings)
-        discovery = NsdDiscoveryService(this, LocalDiscoveryIdentity(deviceId, deviceName))
+        val local = LocalDevice(deviceId, deviceName, LocalDevice.deviceTypeFor(resources.configuration.smallestScreenWidthDp))
+        pairing = PairingCoordinator(this, local.deviceId, local.name, settings = settings)
+        discovery = NsdDiscoveryService(this, LocalDiscoveryIdentity(local.deviceId, local.name, local.deviceType))
         photoSync = PhotoSyncManager(this, pairing, settings, applicationScope)
         pocketGuard = PocketGuard(this)
         applicationScope.launch {
@@ -74,21 +75,13 @@ class BridgeyApplication : Application() {
                     }
                 }
         }
+        // Multi-device Core: the coordinator owns per-device reconnect; discovery only feeds presence.
         applicationScope.launch {
-            combine(discovery.peers, pairing.trustedDeviceIds, pairing.state) { peers, trustedIds, state ->
-                Triple(peers, trustedIds, state)
-            }.collect { (peers, trustedIds, state) ->
-                if (isBridgeyEnabled && state is PairingState.Idle) {
-                    val match = peers.firstOrNull {
-                        val peerId = it.deviceIdHint
-                        peerId != null && peerId in trustedIds && deviceId < peerId
-                    }
-                    val host = match?.host
-                    if (match != null && host != null) {
-                        android.util.Log.i("Bridgey", "RECONNECT auto-pair match peer=${match.deviceNameHint}")
-                        pairing.pair(host, match.port ?: 42_458, match.deviceNameHint)
-                    }
-                } else if (state is PairingState.Connected) {
+            discovery.peers.collect { peers -> if (isBridgeyEnabled) pairing.onDiscovery(peers) }
+        }
+        applicationScope.launch {
+            pairing.state.collect { state ->
+                if (state is PairingState.Connected) {
                     lastBatteryIntent?.let(::publishBattery)
                     photoSync.requestScan()
                 }

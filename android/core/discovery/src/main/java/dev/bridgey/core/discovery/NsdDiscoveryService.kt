@@ -207,6 +207,7 @@ class NsdDiscoveryService(
             setAttribute("name", identity.deviceName.take(64))
             setAttribute("version", PROTOCOL_VERSION.toString())
             setAttribute("platform", "android")
+            identity.deviceType?.let { setAttribute("type", it) } // additive hint; older peers ignore unknown keys
         }
         val registration = newRegistrationListener(gen).also { registrationListener = it }
         val browse = newDiscoveryListener(gen).also { discoveryListener = it }
@@ -270,6 +271,8 @@ class NsdDiscoveryService(
     private fun accept(info: NsdServiceInfo) {
         val attributes = info.attributes.mapValues { it.value ?: byteArrayOf() }
         val parsed = DiscoveryTxtRecord.parse(info.serviceName, attributes)
+        // Our own advert after an mDNS rename ("Bridgey-xxxx (2)") is recognised by deviceId.
+        if (parsed.deviceIdHint == identity.deviceId) return
         val host = resolvedHost(info)
         found[parsed.key] = parsed.copy(host = host?.hostAddress, port = info.port.takeIf { it in 1..65535 })
         emitPeers()
@@ -294,7 +297,7 @@ class NsdDiscoveryService(
     }
 }
 
-data class LocalDiscoveryIdentity(val deviceId: String, val deviceName: String) {
+data class LocalDiscoveryIdentity(val deviceId: String, val deviceName: String, val deviceType: String? = null) {
     init { require(runCatching { UUID.fromString(deviceId) }.isSuccess) }
 }
 
