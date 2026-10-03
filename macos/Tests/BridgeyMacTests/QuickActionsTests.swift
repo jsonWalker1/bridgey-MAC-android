@@ -132,4 +132,90 @@ final class QuickActionsTests: XCTestCase {
         XCTAssertNil(actions.receivedBook)
         XCTAssertEqual(copied, ["Will you", "Will you"])
     }
+
+    // MARK: Find in Books / Google Play Books
+
+    func testBooksAutomationQueryHelpers() {
+        XCTAssertEqual(BooksAutomation.typographic("It isn't \"mine\""), "It isn’t “mine”")
+        XCTAssertEqual(BooksAutomation.longestSegment("“It isn’t mine,” said the Hatter. “I keep them to sell”"), "I keep them to sell")
+        XCTAssertEqual(BooksAutomation.norm("Výkony  vznešeného\nrytíře."), "výkony vznešeného rytíře")
+        XCTAssertEqual(BooksAutomation.parseResultLabel("CHAPTER XI. Who Stole the Tarts?, 155, “It isn’t mine,” said the Hatter.")?.chapter,
+                       "CHAPTER XI. Who Stole the Tarts?")
+        XCTAssertEqual(BooksAutomation.parseResultLabel("5, výkony vznešeného rytíře.")?.page, 5)
+        XCTAssertNil(BooksAutomation.parseResultLabel("5, výkony vznešeného rytíře.")?.chapter)
+        XCTAssertNil(BooksAutomation.parseResultLabel("Vymazat text"))
+        XCTAssertNil(BooksAutomation.parseResultLabel("Nalezen 1 výsledek"))
+        XCTAssertEqual(BooksAutomation.chapterName("CHAPTER X. The Lobster Quadrille"), "The Lobster Quadrille")
+        XCTAssertEqual(BooksAutomation.chapterName("Down the Rabbit-Hole"), "Down the Rabbit-Hole")
+        XCTAssertNil(BooksAutomation.chapterName("CHAPTER XII."))
+        XCTAssertEqual(BooksAutomation.snippet("CHAPTER I. Down the Rabbit-Hole, 8, Down the Rabbit-Hole"), "Down the Rabbit-Hole")
+    }
+
+    func testBookHandoffKeepsTheSourceApp() {
+        let book = validatedBookHandoff(#"{"version":1,"title":"Alice","app":"com.google.android.apps.books"}"#)
+        XCTAssertEqual(book?.app, "com.google.android.apps.books")
+        XCTAssertTrue(book?.fromGooglePlayBooks == true)
+        XCTAssertFalse(validatedBookHandoff(#"{"version":1,"title":"Alice","app":"com.amazon.kindle"}"#)?.fromGooglePlayBooks == true)
+    }
+
+    @MainActor private func actionsWithBook(_ json: String = #"{"version":1,"title":"Alice","quote":"Will you","app":"com.google.android.apps.books"}"#) -> QuickActions {
+        let actions = QuickActions()
+        actions.available = { $0 == .links }
+        actions.send = { _, _ in true }
+        actions.copyText = { _ in }
+        actions.receive("quick.request", payload: ["version": 1, "requestId": UUID().uuidString,
+            "feature": "links", "action": "book", "value": json])
+        return actions
+    }
+
+    @MainActor private func waitUntilIdle(_ actions: QuickActions) {
+        let end = Date().addingTimeInterval(3)
+        while actions.findingInBooks && Date() < end { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+        XCTAssertFalse(actions.findingInBooks)
+    }
+
+    @MainActor func testFindInBooksAsksForAccessibilityFirst() {
+        let actions = actionsWithBook()
+        var ran = false
+        actions.accessibilityTrusted = { _ in false }
+        actions.runBooksAutomation = { _, _ in ran = true; return .completed }
+        actions.findInBooks()
+        XCTAssertFalse(ran)
+        XCTAssertTrue(actions.status?.contains("Accessibility") == true)
+        XCTAssertNotNil(actions.receivedBook)
+    }
+
+    @MainActor func testFindInBooksOutcomes() {
+        var copied: [String] = []
+        for (result, keepsCard, copies, text) in [
+            (BooksAutomationResult.completed, false, false, "Found in Books"),
+            (.ambiguous(2), true, true, "appears 2×"),
+            (.notFound, true, false, "did not find"),
+            (.abortedFocus("x"), true, false, "another app"),
+            (.failed("x"), true, true, "Could not finish"),
+        ] {
+            copied = []
+            let actions = actionsWithBook()
+            actions.copyText = { copied.append($0) }
+            actions.accessibilityTrusted = { _ in true }
+            actions.runBooksAutomation = { book, status in
+                XCTAssertEqual(book.quote, "Will you"); status("Searching…"); return result
+            }
+            actions.findInBooks()
+            XCTAssertTrue(actions.findingInBooks)
+            waitUntilIdle(actions)
+            XCTAssertEqual(actions.receivedBook != nil, keepsCard, "\(result)")
+            XCTAssertEqual(!copied.isEmpty, copies, "\(result)")
+            XCTAssertTrue(actions.status?.contains(text) == true, "\(result): \(actions.status ?? "nil")")
+        }
+    }
+
+    @MainActor func testOpenInGooglePlayBooks() {
+        let actions = actionsWithBook()
+        var opened: [URL] = []
+        actions.openURL = { opened.append($0); return true }
+        actions.openInGooglePlayBooks()
+        XCTAssertEqual(opened, [URL(string: "https://play.google.com/books")!])
+        XCTAssertNotNil(actions.receivedBook)
+    }
 }

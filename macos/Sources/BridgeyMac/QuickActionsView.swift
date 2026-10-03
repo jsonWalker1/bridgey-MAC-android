@@ -24,8 +24,15 @@ struct QuickActionsPanel: View {
                 }
                 if let quote = book.quote { Text("“\(quote)”").font(.caption).italic().lineLimit(4).textSelection(.enabled) }
                 HStack {
-                    Button("Continue in Books", action: actions.continueInBooks)
-                    Button("Dismiss", action: actions.dismissBook)
+                    if book.title != nil && (book.quote != nil || book.chapter != nil) {
+                        Button(book.quote != nil ? "Find in Books" : "Go to chapter in Books", action: actions.findInBooks)
+                            .disabled(actions.findingInBooks)
+                    }
+                    Button("Continue in Books", action: actions.continueInBooks).disabled(actions.findingInBooks)
+                    Button("Dismiss", action: actions.dismissBook).disabled(actions.findingInBooks)
+                }
+                if book.fromGooglePlayBooks {
+                    Button("Open in Google Play Books", action: actions.openInGooglePlayBooks)
                 }
             }
         }

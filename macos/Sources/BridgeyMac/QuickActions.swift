@@ -30,6 +30,11 @@ struct BookHandoff: Equatable {
     let page: Int?
     let pages: Int?
     let quote: String?
+    var app: String? = nil
+
+    /// Google Play Books syncs the reading position through the Google account, so its web reader
+    /// continues where the phone was.
+    var fromGooglePlayBooks: Bool { app == "com.google.android.apps.books" }
 }
 
 func validatedBookHandoff(_ value: String) -> BookHandoff? {
@@ -46,7 +51,8 @@ func validatedBookHandoff(_ value: String) -> BookHandoff? {
     guard title != nil || quote != nil else { return nil }
     let pages = (json["pages"] as? Int).flatMap { (1...100_000).contains($0) ? $0 : nil }
     let page = (json["page"] as? Int).flatMap { $0 >= 1 && (pages == nil || $0 <= pages!) ? $0 : nil }
-    return BookHandoff(title: title, chapter: text("chapter", 200), page: page, pages: page == nil ? nil : pages, quote: quote)
+    return BookHandoff(title: title, chapter: text("chapter", 200), page: page, pages: page == nil ? nil : pages, quote: quote,
+                       app: text("app", 64))
 }
 
 @MainActor
@@ -57,6 +63,15 @@ final class QuickActions: ObservableObject {
     var openBooks: () -> Bool = {
         NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Books.app"))
     }
+    @Published private(set) var findingInBooks = false
+    /// "Find in Books" automation; replaceable in tests. Called off the main thread.
+    var runBooksAutomation: (BookHandoff, @escaping (String) -> Void) -> BooksAutomationResult = { book, status in
+        BooksAutomation(title: book.title ?? "", quote: book.quote ?? "", chapter: book.chapter, status: status).run()
+    }
+    var accessibilityTrusted: (_ prompt: Bool) -> Bool = { prompt in
+        AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt] as CFDictionary)
+    }
+    var openURL: (URL) -> Bool = { NSWorkspace.shared.open($0) }
     var copyText: (String) -> Void = { text in
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -139,5 +154,51 @@ final class QuickActions: ObservableObject {
         }
     }
     func dismissBook() { receivedBook = nil }
-    func reset() { timeout?.cancel(); pending = nil; receivedLink = nil; receivedBook = nil; status = nil }
+
+    /// Opens Apple Books, searches the quote and lands on it (explicit click only). Anything the
+    /// automation cannot verify ends in a message, with the quote copied for the manual way.
+    func findInBooks() {
+        guard let book = receivedBook, book.title != nil, book.quote != nil || book.chapter != nil, !findingInBooks else { return }
+        guard accessibilityTrusted(true) else {
+            status = "Allow Bridgey in System Settings → Privacy & Security → Accessibility, then try again"
+            return
+        }
+        findingInBooks = true
+        status = "Opening Books…"
+        let run = runBooksAutomation
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = run(book) { text in DispatchQueue.main.async { if self?.findingInBooks == true { self?.status = text } } }
+            DispatchQueue.main.async { self?.finishFind(result, book: book) }
+        }
+    }
+
+    private func finishFind(_ result: BooksAutomationResult, book: BookHandoff) {
+        findingInBooks = false
+        switch result {
+        case .completed:
+            if receivedBook == book { receivedBook = nil }
+            status = book.quote != nil ? "Found in Books — you are at the quote"
+                : "Books is at the start of \(book.chapter ?? "the chapter")" + (book.page.map { " (phone: page \($0))" } ?? "")
+        case .notFound:
+            status = "Books did not find this quote (different edition?)"
+        case .ambiguous(let count):
+            book.quote.map(copyText)
+            status = "The quote appears \(count)× — quote copied; pick the right place with ⌘F, ⌘V"
+        case .abortedFocus:
+            status = "Stopped: another app came to the front. Try again without switching apps"
+        case .failed(let reason):
+            book.quote.map(copyText)
+            status = "Could not finish in Books (\(reason)) — quote copied for ⌘F, ⌘V"
+        }
+    }
+
+    /// Experiment: Google Play Books on the web continues at the position synced from the phone.
+    func openInGooglePlayBooks() {
+        if openURL(URL(string: "https://play.google.com/books")!) {
+            status = "Google Play Books opened — open the book there, it continues at the synced page"
+        } else {
+            status = "Could not open your browser"
+        }
+    }
+    func reset() { timeout?.cancel(); pending = nil; receivedLink = nil; if !findingInBooks { receivedBook = nil }; status = nil }
 }

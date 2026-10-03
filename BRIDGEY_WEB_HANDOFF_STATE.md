@@ -269,12 +269,43 @@ quote as text — that path is app-agnostic.
   be stale while the toolbar is hidden; only Play Books for the tile; the tile has
   to be added to Quick Settings by the user.
 
+## 5b. BOOKS HANDOFF — 2026-10-03 ADDITIONS (uncommitted, alpha quality)
+
+User verdict: "as an alpha it works, but it needs a lot of tuning". Left as is.
+
+- **Find in Books (Mac)** — `BooksAutomation.swift`, the state machine from
+  `experiments/books-automation-poc` (README there: scenarios, failure modes). Button on the
+  book card; needs the Accessibility permission for Bridgey (asked via
+  `AXIsProcessTrustedWithOptions`) and Automation → System Events. Outcomes: completed (card
+  cleared), not found, ambiguous (never picks the first of many; quote copied), aborted on
+  focus change, failed (quote copied for the manual ⌘F/⌘V way).
+- **Go to chapter in Books** — without a quote (the Play Books tile sends none) the chapter
+  heading is searched and the row whose snippet is the heading is chosen → start of the chapter.
+- **Open in Google Play Books** (experiment) — for books from Play Books the card opens
+  `https://play.google.com/books`; Google syncs the reading position itself. A deep link needs
+  the volume id (`play.google.com/books/reader?id=…`), which Android does not expose; the uploaded
+  test EPUB did not appear in the web library.
+- **Tile fix** — the expanded Quick Settings shade hides the reader window from accessibility;
+  the service now remembers the last Play Books position (title/chapter/page only, throttled to
+  1.5 s, valid 5 min).
+- **Why the tile cannot send text:** Play Books exposes the text of whole chapters without
+  positions, so the paragraph on screen is unknown. Best next step (not done): on tap,
+  `AccessibilityService.takeScreenshot` + on-device OCR (ML Kit) of the reader window → send the
+  first full line as the quote → Find in Books lands exactly.
+- Mac: `QuickActions.reset()` on every new connection also clears the book card.
+
 ## 6. SIDE FINDINGS
 
-- **Foreground service after reinstall:** when the process is started by the
-  accessibility binding, `BridgeyConnectionService` may not run and Samsung
-  Freecess freezes networking (connection flapping) — start MainActivity once;
-  real fix not done.
+- **Foreground service after reinstall — FIXED 2026-10-03 (uncommitted):** when
+  Android started the process only to bind an accessibility service (after an update),
+  `BridgeyConnectionService` did not run, Samsung Freecess froze the app, and the
+  connection dropped every 10–20 s without recovering (Freecess unfroze it briefly on each
+  accessibility event). `WebHandoffPocService.onServiceConnected` now starts the foreground
+  service (allowed for a bound accessibility service). Verified: FGS up after install
+  without opening the app, 0 drops / 0 freezes in 75 s.
+- **Battery-optimization exemption (uncommitted):** `BackgroundRunning.kt` asks once after
+  pairing (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) and shows a "Background running" card
+  while the exemption is missing.
 - **"No Wi-Fi" status** in the persistent notification with a Wi-Fi action
   (`BridgeyConnectionService.kt`, `ConnectionStatusTextTest.kt`) — implemented
   and device-verified, **uncommitted**.
