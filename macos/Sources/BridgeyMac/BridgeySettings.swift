@@ -101,6 +101,10 @@ final class BridgeySettings: ObservableObject {
     @Published private(set) var loginItemMessage: String?
     @Published private(set) var hasCompletedOnboarding: Bool
     @Published private(set) var notificationHistoryEnabled: Bool
+    /// Multi-device routing preference (no UI yet). Routing only: never identity or trust.
+    @Published private(set) var deviceRoutingMode: DeviceRoutingMode
+    /// The device today's single-peer features prefer when it is connected. Kept while offline.
+    @Published private(set) var preferredDeviceID: String?
 
     private let defaults = UserDefaults.standard
 
@@ -110,6 +114,9 @@ final class BridgeySettings: ObservableObject {
         deviceName = storedDefaults.string(forKey: "settings.deviceName") ?? systemName
         hasCompletedOnboarding = storedDefaults.bool(forKey: "settings.onboarding.completed")
         notificationHistoryEnabled = storedDefaults.bool(forKey: "settings.notificationHistory.enabled")
+        deviceRoutingMode = storedDefaults.string(forKey: "settings.routing.mode")
+            .flatMap(DeviceRoutingMode.init(rawValue:)) ?? .singleActive
+        preferredDeviceID = storedDefaults.string(forKey: "settings.routing.preferredDeviceID")
         globalFeatures = Dictionary(uniqueKeysWithValues: BridgeyFeature.allCases.map {
             ($0, storedDefaults.object(forKey: "settings.global.\($0.rawValue)") as? Bool ?? !(([.media, .photoSync] as Set<BridgeyFeature>).union(BridgeyFeature.optIn).contains($0)))
         })
@@ -167,6 +174,27 @@ final class BridgeySettings: ObservableObject {
             globalEnabled: globalFeatures[feature] != false,
             deviceEnabled: deviceID.flatMap { deviceFeatures[$0]?[feature] }
         )
+    }
+
+    func setDeviceRoutingMode(_ mode: DeviceRoutingMode) {
+        defaults.set(mode.rawValue, forKey: "settings.routing.mode")
+        deviceRoutingMode = mode
+    }
+
+    func setPreferredDevice(_ deviceID: String?) {
+        guard preferredDeviceID != deviceID else { return }
+        defaults.set(deviceID, forKey: "settings.routing.preferredDeviceID")
+        preferredDeviceID = deviceID
+    }
+
+    /// One-time: an install from the single-device era keeps routing to its only trusted device.
+    func migratePreferredDevice(trustedDeviceIDs: Set<String>) {
+        let key = "settings.routing.preferredMigrated"
+        let migrated = defaults.bool(forKey: key)
+        if let id = DeviceRouting.migratedPreferredDeviceID(stored: preferredDeviceID, migrated: migrated, trustedDeviceIDs: trustedDeviceIDs) {
+            setPreferredDevice(id)
+        }
+        defaults.set(true, forKey: key)
     }
 
     func removeDevice(_ deviceID: String) {

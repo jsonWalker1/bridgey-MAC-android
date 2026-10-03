@@ -35,6 +35,21 @@ class DiscoveryTxtRecordTest {
         assertNull(peer.protocolVersionHint)
     }
 
+    @Test fun typeIsAnAdditiveHintAndUnknownKeysAreIgnored() {
+        val peer = DiscoveryTxtRecord.parse(
+            "Bridgey-a",
+            mapOf(
+                "id" to "550e8400-e29b-41d4-a716-446655440000".bytes(),
+                "type" to "tablet".bytes(),
+                "future-key" to "whatever".bytes(),
+            ),
+        )
+        assertEquals("tablet", peer.deviceTypeHint)
+        assertEquals("550e8400-e29b-41d4-a716-446655440000", peer.deviceIdHint)
+        assertNull(DiscoveryTxtRecord.parse("s", mapOf("type" to "Not A Type!".bytes())).deviceTypeHint)
+        assertNull(DiscoveryTxtRecord.parse("s", mapOf("id" to "550e8400-e29b-41d4-a716-446655440000".bytes())).deviceTypeHint)
+    }
+
     private fun String.bytes() = toByteArray(Charsets.UTF_8)
 }
 

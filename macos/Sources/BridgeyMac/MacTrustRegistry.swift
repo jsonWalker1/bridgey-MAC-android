@@ -3,8 +3,14 @@ import Security
 
 struct MacTrustedDevice: Codable, Equatable {
     let id: String
-    let name: String
+    var name: String
     let identityKey: String
+    // Optional descriptive metadata (multi-device Core). Absent in records written by earlier
+    // releases, which therefore decode unchanged. Never part of identity.
+    var platform: String? = nil
+    var deviceType: String? = nil
+    var protocolVersion: Int? = nil
+    var lastSeen: Date? = nil
 }
 
 final class MacTrustRegistry {
@@ -31,13 +37,39 @@ final class MacTrustRegistry {
         devicesByID[deviceID]?.identityKey
     }
 
+    func device(_ deviceID: String) -> MacTrustedDevice? { devicesByID[deviceID] }
+
     @discardableResult
     func remember(deviceID: String, name: String, identityKey: String) -> Bool {
         guard UUID(uuidString: deviceID) != nil,
               !name.isEmpty,
               Data(base64Encoded: identityKey) != nil else { return false }
         let previous = devicesByID[deviceID]
-        devicesByID[deviceID] = MacTrustedDevice(id: deviceID, name: name, identityKey: identityKey)
+        if var existing = previous, existing.identityKey == identityKey {
+            existing.name = name
+            devicesByID[deviceID] = existing
+        } else {
+            devicesByID[deviceID] = MacTrustedDevice(id: deviceID, name: name, identityKey: identityKey)
+        }
+        guard save() else {
+            devicesByID[deviceID] = previous
+            return false
+        }
+        return true
+    }
+
+    /// Updates descriptive metadata of an existing record; the identity key is never touched.
+    @discardableResult
+    func updateMetadata(deviceID: String, name: String, platform: String?, deviceType: String?,
+                        protocolVersion: Int?, lastSeen: Date) -> Bool {
+        guard let previous = devicesByID[deviceID] else { return false }
+        var updated = previous
+        if !name.isEmpty { updated.name = name }
+        updated.platform = platform ?? previous.platform
+        updated.deviceType = deviceType ?? previous.deviceType
+        updated.protocolVersion = protocolVersion ?? previous.protocolVersion
+        updated.lastSeen = lastSeen
+        devicesByID[deviceID] = updated
         guard save() else {
             devicesByID[deviceID] = previous
             return false

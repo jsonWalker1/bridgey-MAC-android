@@ -1465,7 +1465,7 @@ private fun DiscoveryHeader(state: PairingState, empty: Boolean) {
 
 @Composable
 private fun PeerCard(peer: DiscoveredPeer, trusted: Boolean, pairing: PairingCoordinator) {
-    Card(onClick = { peer.host?.let { pairing.pair(it, peer.port ?: 42_458, peer.deviceNameHint) } }, shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
+    Card(onClick = { peer.host?.let { pairing.pair(it, peer.port ?: 42_458, peer.deviceNameHint, peer.deviceIdHint) } }, shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
         Row(Modifier.padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(peer.deviceNameHint, fontWeight = FontWeight.SemiBold)

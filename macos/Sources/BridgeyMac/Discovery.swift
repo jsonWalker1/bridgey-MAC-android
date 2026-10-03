@@ -21,6 +21,8 @@ struct DiscoveredPeer: Identifiable, Equatable {
     let deviceIDHint: String?
     let deviceNameHint: String
     let platformHint: String?
+    /// Additive TXT `type` hint (computer/phone/tablet/...). Descriptive only, never identity.
+    let deviceTypeHint: String?
     let protocolVersionHint: Int?
     var host: String?
     var port: Int?
@@ -38,6 +40,9 @@ enum DiscoveryTXTRecord {
         let platform = decode(attributes["platform"], limit: 16).flatMap {
             $0.range(of: "^[a-z][a-z0-9-]{0,15}$", options: .regularExpression) == nil ? nil : $0
         }
+        let type = decode(attributes["type"], limit: 16).flatMap {
+            $0.range(of: "^[a-z][a-z0-9-]{0,15}$", options: .regularExpression) == nil ? nil : $0
+        }
         let version = decode(attributes["version"], limit: 8)
             .flatMap(Int.init)
             .flatMap { $0 > 0 ? $0 : nil }
@@ -46,6 +51,7 @@ enum DiscoveryTXTRecord {
             deviceIDHint: id,
             deviceNameHint: name,
             platformHint: platform,
+            deviceTypeHint: type,
             protocolVersionHint: version,
             host: nil,
             port: nil
@@ -71,19 +77,18 @@ final class BonjourDiscovery: NSObject, ObservableObject {
     private var isRunning = false
     private let deviceID: String
     private var deviceName: String
+    private let platform: String
+    private let deviceType: String
     var localDeviceID: String { deviceID }
     var localDeviceName: String { deviceName }
     private lazy var ownServiceName = "Bridgey-\(deviceID.prefix(8))"
 
-    init(deviceName preferredName: String? = nil) {
-        let defaults = UserDefaults.standard
-        if let stored = defaults.string(forKey: "deviceID"), UUID(uuidString: stored) != nil {
-            deviceID = stored
-        } else {
-            deviceID = UUID().uuidString.lowercased()
-            defaults.set(deviceID, forKey: "deviceID")
-        }
-        deviceName = preferredName ?? Host.current().localizedName ?? "Mac"
+    /// The advert belongs to the LocalDevice: its deviceId is the identity hint peers match on.
+    init(local: LocalDevice) {
+        deviceID = local.deviceID
+        deviceName = local.name
+        platform = local.platform
+        deviceType = local.deviceType
         super.init()
         browser.delegate = self
         start()
@@ -129,7 +134,8 @@ final class BonjourDiscovery: NSObject, ObservableObject {
             "id": Data(deviceID.utf8),
             "name": Data(String(deviceName.prefix(64)).utf8),
             "version": Data("1".utf8),
-            "platform": Data("macos".utf8),
+            "platform": Data(platform.utf8),
+            "type": Data(deviceType.utf8), // additive hint; older peers ignore unknown keys
         ]))
         service.publish()
         publishedService = service
@@ -139,6 +145,8 @@ final class BonjourDiscovery: NSObject, ObservableObject {
         guard service.name != ownServiceName else { return }
         let attributes = service.txtRecordData().map(NetService.dictionary(fromTXTRecord:)) ?? [:]
         var peer = DiscoveryTXTRecord.parse(serviceName: service.name, attributes: attributes)
+        // Our own advert after an mDNS rename ("Bridgey-xxxx (2)") is recognised by deviceId.
+        guard peer.deviceIDHint != deviceID.lowercased() else { return }
         peer.host = service.hostName
         peer.port = service.port > 0 ? service.port : nil
         let otherPeers = peers.filter { $0.id != peer.id }

@@ -54,6 +54,10 @@ data class BridgeySettingsState(
     val syncExistingLibraryEnabled: Boolean,
     val pocketModeEnabled: Boolean,
     val autoPocketDetectionEnabled: Boolean,
+    /** Multi-device routing preference (no UI yet). Routing only: never identity or trust. */
+    val deviceRoutingMode: DeviceRoutingMode = DeviceRoutingMode.SINGLE_ACTIVE,
+    /** The device today's single-peer features prefer when it is connected. Kept while offline. */
+    val preferredDeviceId: String? = null,
 )
 
 internal fun effectiveFeatureEnabled(
@@ -146,6 +150,27 @@ class BridgeySettings(context: Context, defaultDeviceName: String) {
         mutableState.value = mutableState.value.copy(autoPocketDetectionEnabled = enabled)
     }
 
+    fun setDeviceRoutingMode(mode: DeviceRoutingMode) {
+        preferences.edit().putString(KEY_ROUTING_MODE, mode.key).apply()
+        mutableState.value = mutableState.value.copy(deviceRoutingMode = mode)
+    }
+
+    @Synchronized
+    fun setPreferredDevice(deviceId: String?) {
+        if (mutableState.value.preferredDeviceId == deviceId) return
+        preferences.edit().putString(KEY_PREFERRED_DEVICE_ID, deviceId).apply()
+        mutableState.value = mutableState.value.copy(preferredDeviceId = deviceId)
+    }
+
+    /** One-time: an install from the single-device era keeps routing to its only trusted device. */
+    @Synchronized
+    fun migratePreferredDevice(trustedDeviceIds: Set<String>) {
+        val migrated = preferences.getBoolean(KEY_PREFERRED_MIGRATED, false)
+        DeviceRouting.migratedPreferredDeviceId(mutableState.value.preferredDeviceId, migrated, trustedDeviceIds)
+            ?.let(::setPreferredDevice)
+        preferences.edit().putBoolean(KEY_PREFERRED_MIGRATED, true).apply()
+    }
+
     fun removeDevice(deviceId: String) {
         val editor = preferences.edit()
         BridgeyFeature.entries.forEach { editor.remove("device.$deviceId.${it.key}") }
@@ -180,6 +205,8 @@ class BridgeySettings(context: Context, defaultDeviceName: String) {
             syncExistingLibraryEnabled = preferences.getBoolean(KEY_SYNC_EXISTING_LIBRARY, false),
             pocketModeEnabled = preferences.getBoolean(KEY_POCKET_MODE_ENABLED, false),
             autoPocketDetectionEnabled = preferences.getBoolean(KEY_AUTO_POCKET_DETECTION_ENABLED, false),
+            deviceRoutingMode = DeviceRoutingMode.fromKey(preferences.getString(KEY_ROUTING_MODE, null)),
+            preferredDeviceId = preferences.getString(KEY_PREFERRED_DEVICE_ID, null),
         )
     }
 
@@ -191,5 +218,8 @@ class BridgeySettings(context: Context, defaultDeviceName: String) {
         private const val KEY_SYNC_EXISTING_LIBRARY = "photo_sync.include_existing_library"
         private const val KEY_POCKET_MODE_ENABLED = "pocket_mode.enabled"
         private const val KEY_AUTO_POCKET_DETECTION_ENABLED = "pocket_mode.auto_detection_enabled"
+        private const val KEY_ROUTING_MODE = "routing.mode"
+        private const val KEY_PREFERRED_DEVICE_ID = "routing.preferred_device_id"
+        private const val KEY_PREFERRED_MIGRATED = "routing.preferred_migrated"
     }
 }

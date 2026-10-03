@@ -16,9 +16,10 @@ struct BridgeyApp: App {
         LegacyPreferences.migrateIfNeeded()
         let settings = BridgeySettings()
         _settings = StateObject(wrappedValue: settings)
-        let discovery = BonjourDiscovery(deviceName: settings.deviceName)
+        let local = LocalDevice.load(name: settings.deviceName)
+        let discovery = BonjourDiscovery(local: local)
         _discovery = StateObject(wrappedValue: discovery)
-        let pairing = PairingCoordinator(deviceID: discovery.localDeviceID, deviceName: discovery.localDeviceName, settings: settings)
+        let pairing = PairingCoordinator(local: local, settings: settings)
         pairing.observe(discovery)
         _pairing = StateObject(wrappedValue: pairing)
         let callServiceProvider = CallServiceProvider { [weak pairing] number in pairing?.sendCallWhenConnected(number) }
@@ -469,7 +470,7 @@ private struct BridgeyPanel: View {
                 ForEach(discovery.peers) { peer in
                     Button {
                         if let host = peer.host, let port = peer.port {
-                            pairing.pair(host: host, port: port, peerName: peer.deviceNameHint)
+                            pairing.pair(host: host, port: port, peerName: peer.deviceNameHint, deviceID: peer.deviceIDHint)
                         }
                     } label: {
                         HStack(spacing: 10) {

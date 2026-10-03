@@ -32,11 +32,16 @@ UTF-8 and advisory:
 | `name` | User-visible device name | 64 bytes |
 | `version` | Highest supported envelope major version | 8 bytes |
 | `platform` | `android`, `macos`, or a future identifier | 16 bytes |
+| `type` | Optional device type hint: `computer`, `phone`, `tablet`, or a future identifier | 16 bytes |
 
 The SRV port identifies the TLS WebSocket listener. TXT, hostnames, addresses,
-and ports are attacker-controlled until the peer authenticates. Implementations
-must deduplicate discoveries by service instance and refresh endpoints on every
-network change.
+and ports are attacker-controlled until the peer authenticates. `type` is
+additive: older peers ignore it, and like `platform` it is descriptive only and
+never used for identity, trust, routing or reconnect. Implementations group
+discoveries by the advertised `id` (one device may appear under several service
+instances; a device's own advert is filtered by `id`), treat each service
+instance as one endpoint of that device, and refresh endpoints on every network
+change.
 
 ## Framing and envelope
 
