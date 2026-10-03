@@ -18,6 +18,8 @@ class ManifestPermissionsTest {
                 "android.permission.INTERNET",
                 "android.permission.ACCESS_NETWORK_STATE",
                 "android.permission.WAKE_LOCK",
+                // Asked once after pairing: keeps Samsung's Freecess from freezing the connection.
+                "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
                 "android.permission.WRITE_SECURE_SETTINGS",
                 "android.permission.CHANGE_WIFI_MULTICAST_STATE",
                 "android.permission.POST_NOTIFICATIONS",

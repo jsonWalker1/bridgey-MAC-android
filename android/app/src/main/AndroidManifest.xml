@@ -13,6 +13,9 @@
          hypothesis that the phone's screen timing out/locking during an idle session destabilizes
          the pairing TCP connection. Normal (non-dangerous) permission, no runtime prompt. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Ask (once, after pairing) to be exempt from battery optimization: otherwise Samsung's
+         Freecess can freeze Bridgey in the background and the Mac connection drops repeatedly. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- BRIDGEY KVM KEYBOARD V1 (switch shortcut): lets KvmKeyboardSwitcher write
          Settings.Secure.DEFAULT_INPUT_METHOD directly (the same mechanism `adb shell ime set` uses) so
          the Mac's Command+K shortcut can toggle the active keyboard with no manual Settings trip. A

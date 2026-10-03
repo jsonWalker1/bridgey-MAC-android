@@ -112,6 +112,7 @@ class MainActivity : ComponentActivity() {
     private var appNotificationsEnabled by mutableStateOf(false)
     private var mediaPermissionGranted by mutableStateOf(false)
     private var kvmAccessibilityEnabled by mutableStateOf(false)
+    private var backgroundUnrestricted by mutableStateOf(true)
     private var sharedContent by mutableStateOf<SharedContent?>(null)
     private var showOnboarding by mutableStateOf(false)
     private val notificationPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -172,6 +173,8 @@ class MainActivity : ComponentActivity() {
                     onDeviceNameChanged = bridgey::updateDeviceName,
                     appNotificationsEnabled = appNotificationsEnabled,
                     notificationAccessEnabled = notificationAccessEnabled,
+                    backgroundUnrestricted = backgroundUnrestricted,
+                    onAllowBackground = { BackgroundRunning.request(this) },
                     onTurnOff = {
                         startService(Intent(this, BridgeyConnectionService::class.java).setAction(BridgeyConnectionService.ACTION_TURN_OFF))
                         finishAndRemoveTask()
@@ -262,6 +265,10 @@ class MainActivity : ComponentActivity() {
         notificationAccessEnabled = NotificationAccess.isEnabled(this)
         mediaPermissionGranted = hasMediaIntegrationPermissions()
         kvmAccessibilityEnabled = BridgeyAccessibilityService.isEnabled(this)
+        backgroundUnrestricted = BackgroundRunning.isUnrestricted(this)
+        // Ask once, after the first Mac is paired: without the exemption Samsung's Freecess may
+        // freeze Bridgey in the background whenever its foreground service is not running.
+        if (::pairing.isInitialized && pairing.trustedDevices.value.isNotEmpty()) BackgroundRunning.askOnce(this)
         if (
             ::bridgeySettings.isInitialized && bridgeySettings.state.value.directCallsEnabled &&
             !hasCallIntegrationPermissions()
@@ -439,6 +446,8 @@ private fun BridgeyApp(
     onDeviceNameChanged: (String) -> Unit,
     appNotificationsEnabled: Boolean,
     notificationAccessEnabled: Boolean,
+    backgroundUnrestricted: Boolean,
+    onAllowBackground: () -> Unit,
     onTurnOff: () -> Unit,
     onRequestAppNotifications: () -> Unit,
     onOpenAppNotificationSettings: () -> Unit,
@@ -577,6 +586,8 @@ private fun BridgeyApp(
                 pairing = pairing,
                 appNotificationsEnabled = appNotificationsEnabled,
                 notificationAccessEnabled = notificationAccessEnabled,
+                backgroundUnrestricted = backgroundUnrestricted,
+                onAllowBackground = onAllowBackground,
                 onAppNotifications = {
                     if (appNotificationsEnabled) onOpenAppNotificationSettings()
                     else permissionPrompt = PermissionPrompt.BridgeyNotifications
@@ -1053,6 +1064,8 @@ private fun DeviceScreen(
     pairing: PairingCoordinator,
     appNotificationsEnabled: Boolean,
     notificationAccessEnabled: Boolean,
+    backgroundUnrestricted: Boolean,
+    onAllowBackground: () -> Unit,
     onAppNotifications: () -> Unit,
     onNotificationForwarding: () -> Unit,
     onTurnOff: () -> Unit,
@@ -1165,6 +1178,17 @@ private fun DeviceScreen(
                 action = if (appNotificationsEnabled) "Manage" else "Enable",
                 onClick = onAppNotifications,
             )
+        }
+        if (!backgroundUnrestricted) {
+            item {
+                ServiceCard(
+                    enabled = false,
+                    title = "Background running",
+                    detail = "Let Bridgey run without battery restrictions so the phone never freezes the connection",
+                    action = "Allow",
+                    onClick = onAllowBackground,
+                )
+            }
         }
         if (enabledFeatures[BridgeyFeature.NOTIFICATIONS] != false) {
             item {

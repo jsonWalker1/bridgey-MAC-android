@@ -87,6 +87,13 @@ class WebHandoffPocService : AccessibilityService() {
             log = ::log,
         ).also { it.requestUpdate(0) }
         current = java.lang.ref.WeakReference(this)
+        // When Android starts the Bridgey process only to bind this service (after an update or a
+        // reboot), nothing else starts the connection's foreground service, and Samsung's Freecess
+        // then freezes the app in the background - the connection drops every few seconds and never
+        // settles. A bound accessibility service may start a foreground service from the background;
+        // BridgeyConnectionService itself stops again if Bridgey is turned off.
+        runCatching { startForegroundService(Intent(this, BridgeyConnectionService::class.java)) }
+            .onFailure { log("could not start the connection service: ${it.javaClass.simpleName}") }
         // The chip needs a connected Mac; connection changes produce no accessibility event.
         // The Mac's feature list (Web links on/off) arrives shortly after the connection itself.
         connectionWatch = stateScope.launch {
@@ -115,6 +122,7 @@ class WebHandoffPocService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         chip?.requestUpdate()
+        if (event.packageName?.toString() in READERS) return rememberReaderPosition()
         val browser = event.packageName?.toString() ?: return
         if (browser !in BROWSERS) return
         if (event.eventType != AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED) {
@@ -272,7 +280,7 @@ class WebHandoffPocService : AccessibilityService() {
      * ("CHAPTER X. …, stránka 64 z 91"; the scrub label "64 / 91" when the toolbar is shown).
      * Only the position/title strings are kept; page text is not collected.
      */
-    internal fun readerSource(): BookSource? {
+    private fun readerSourceOnScreen(): BookSource? {
         val window = windows.firstOrNull { w ->
             w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION &&
                 w.root?.packageName?.toString() in READERS
@@ -298,6 +306,27 @@ class WebHandoffPocService : AccessibilityService() {
         w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION &&
             w.root?.let { it.packageName?.toString() in BROWSERS && urlField(it) != null } == true
     }
+
+    // The Quick Settings shade covers the reader when the tile is tapped, and a fully covered app
+    // window is not reported to accessibility - so the last position seen while the reader was on
+    // screen is remembered (only title/chapter/page strings, at most every 1.5 s).
+    private var lastReader: BookSource? = null
+    private var lastReaderAt = 0L
+    private var readerCheckQueued = false
+
+    private fun rememberReaderPosition() {
+        if (readerCheckQueued) return
+        readerCheckQueued = true
+        android.os.Handler(mainLooper).postDelayed({
+            readerCheckQueued = false
+            readerSourceOnScreen()?.let { lastReader = it; lastReaderAt = android.os.SystemClock.elapsedRealtime() }
+        }, 1_500)
+    }
+
+    /** The reader on screen, else the position remembered from it in the last five minutes. */
+    internal fun readerSource(): BookSource? =
+        readerSourceOnScreen() ?: lastReader?.takeIf { android.os.SystemClock.elapsedRealtime() - lastReaderAt < 5 * 60_000 }
+            ?.also { log("READER using remembered position") }
 
     /** Browser chip: the page in front, a fresh selection, else the reading position. */
     private fun chipSource(): WebHandoffSource? {
