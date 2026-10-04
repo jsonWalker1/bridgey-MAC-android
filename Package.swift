@@ -4,10 +4,16 @@ import PackageDescription
 
 // DOMAIN SOURCE TREE (see ARCHITECTURE.md). SwiftPM only accepts target paths inside the package
 // root, so the package lives at the repository root while macos/ stays the app shell (resources,
-// build and release scripts). Sources are the legacy macos/Sources/BridgeyMac plus every
-// features/<feature>/macos; tests are macos/Tests/BridgeyMacTests plus every
-// features/<feature>/tests/macos. Everything else in the repository (docs, android/, *.md next to
-// the sources, ...) is excluded so the build stays warning-free.
+// build and release scripts). Sources are the legacy macos/Sources/BridgeyMac plus
+// features/<feature>/macos for every feature listed below; tests are macos/Tests/BridgeyMacTests
+// plus features/<feature>/tests/macos. Everything else in the repository (docs, android/, *.md
+// next to the sources, ...) is excluded so the build stays warning-free.
+//
+// The list is explicit on purpose: SwiftPM caches this manifest and re-evaluates it only when this
+// file changes, so directories discovered at evaluation time would go unnoticed after a move.
+
+/// Feature domains that have moved into features/<name>/ (keep in sync with android/app/build.gradle.kts).
+let features = ["telemetry"]
 
 let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 let fileManager = FileManager.default
@@ -24,7 +30,7 @@ func isDirectory(_ relative: String) -> Bool {
 }
 
 func featureDirectories(_ subdirectory: String) -> [String] {
-    children("features").map { "\($0)/\(subdirectory)" }.filter(isDirectory)
+    features.map { "features/\($0)/\(subdirectory)" }.filter(isDirectory)
 }
 
 /// Every path under `relative` that is not a Swift file inside one of `sources`.

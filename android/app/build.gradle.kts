@@ -12,11 +12,10 @@ val releaseKeyPassword = System.getenv("BRIDGEY_ANDROID_KEY_PASSWORD")
 // and its JVM unit tests in <repo>/features/<feature>/tests/android. This module stays the Android
 // build shell (manifest, resources, build configuration) and compiles those directories as well.
 val repositoryRoot: File = rootDir.parentFile
+/** Feature domains that have moved into features/<name>/ (keep in sync with the root Package.swift). */
+val features = listOf("telemetry")
 fun featureDirectories(subdirectory: String): List<File> =
-    repositoryRoot.resolve("features").listFiles().orEmpty()
-        .sortedBy { it.name }
-        .map { it.resolve(subdirectory) }
-        .filter { it.isDirectory }
+    features.map { repositoryRoot.resolve("features/$it/$subdirectory") }.filter { it.isDirectory }
 
 android {
     namespace = "dev.bridgey.android"
