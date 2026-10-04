@@ -33,9 +33,8 @@ Moved features live in `features/<name>/`; the others are still in the platform 
 | find, ping | handlers in `PairingCoordinator.kt` | handlers in `Pairing.swift` | |
 | [screen-share](screen-share/README.md) | `screen-share/android/` (`VideoFrameFraming.kt` pending) | `screen-share/macos/` (`ScreenShareWindow.swift`, `VideoFrameFraming.swift` pending) | partly moved |
 | kvm | `KvmInputInjector.kt`, `KvmCoordinateMapper.kt`, `KvmCursorOverlay.kt`, `KvmKeyboardSwitcher.kt`, `ScrollGestureAccumulator.kt`, `BridgeyAccessibilityService.kt`, `BridgeyInputMethodService.kt`, codec in `InputTransport.kt` | `KvmGestureRecognizer.swift`, `KvmKeyMapping.swift`, `KvmPointerCalibration.swift`, codec in `InputTransport.swift` | **frozen**; state: [BRIDGEY_KVM_STATE.md](../BRIDGEY_KVM_STATE.md) |
-| handoff/web | `WebHandoff.kt`, `WebHandoffShareActivity.kt`, `WebHandoffToolbarChip.kt`, `WebHandoffPocService.kt` (production despite the name) | — | state: [BRIDGEY_WEB_HANDOFF_STATE.md](../BRIDGEY_WEB_HANDOFF_STATE.md) |
-| handoff/books | `BooksHandoff.kt`, `BooksHandoffTileService.kt` | `BooksAutomation.swift` | |
-| handoff/links | `QuickActions.kt`, `QuickActionsView.kt` | `QuickActions.swift`, `QuickActionsView.swift` | |
+| [handoff](handoff/README.md) | `handoff/android/` (web + books) | `handoff/macos/` (`BooksAutomation`) | moved; not yet split into web/books; state: [BRIDGEY_WEB_HANDOFF_STATE.md](../BRIDGEY_WEB_HANDOFF_STATE.md) |
+| quick actions (links, book cards, media requests) | `QuickActions.kt`, `QuickActionsView.kt` | `QuickActions.swift`, `QuickActionsView.swift` | not moved: shared quick-action transport, ownership undecided |
 | sharing | — | — | nearby/ephemeral sharing, designed, not implemented |
 
 Feature dependencies today (must stay explicit): photos → files, calls → notifications,

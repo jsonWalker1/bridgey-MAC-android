@@ -36,4 +36,4 @@ access it does not have.
 
 ## Related
 [WebHandoffToolbarChip](WebHandoffToolbarChip.md) · `WebHandoffPocService.kt` · `QuickActions.kt` ·
-[BRIDGEY_WEB_HANDOFF_STATE.md](../../../../../../../../BRIDGEY_WEB_HANDOFF_STATE.md)
+[BRIDGEY_WEB_HANDOFF_STATE.md](../../../BRIDGEY_WEB_HANDOFF_STATE.md)

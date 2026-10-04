@@ -29,4 +29,4 @@ or read page content.
 Browsers that rename the `url_bar` node lose the chip (Share still works).
 
 ## Related
-[WebHandoff](WebHandoff.md) · `WebHandoffPocService.kt` · [BRIDGEY_WEB_HANDOFF_STATE.md](../../../../../../../../BRIDGEY_WEB_HANDOFF_STATE.md)
+[WebHandoff](WebHandoff.md) · `WebHandoffPocService.kt` · [BRIDGEY_WEB_HANDOFF_STATE.md](../../../BRIDGEY_WEB_HANDOFF_STATE.md)

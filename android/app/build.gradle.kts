@@ -13,7 +13,7 @@ val releaseKeyPassword = System.getenv("BRIDGEY_ANDROID_KEY_PASSWORD")
 // build shell (manifest, resources, build configuration) and compiles those directories as well.
 val repositoryRoot: File = rootDir.parentFile
 /** Feature domains that have moved into features/<name>/ (keep in sync with the root Package.swift). */
-val features = listOf("calls", "clipboard", "files", "media", "notifications", "photos", "screen-share", "telemetry")
+val features = listOf("calls", "clipboard", "files", "handoff", "media", "notifications", "photos", "screen-share", "telemetry")
 fun featureDirectories(subdirectory: String): List<File> =
     features.map { repositoryRoot.resolve("features/$it/$subdirectory") }.filter { it.isDirectory }
 
