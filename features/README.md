@@ -31,7 +31,7 @@ Moved features live in `features/<name>/`; the others are still in the platform 
 | [media](media/README.md) | `media/android/` | `media/macos/` | moved; media quick actions still in `QuickActions.*` |
 | [telemetry](telemetry/README.md) | `telemetry/android/` | `telemetry/macos/` | moved; samples only while the panel is open |
 | find, ping | handlers in `PairingCoordinator.kt` | handlers in `Pairing.swift` | |
-| screen-share | `ScreenCaptureManager.kt`, `ScreenCaptureService.kt`, `PocketGuard.kt`, `VideoFrameFraming.kt` | `ScreenShareWindow.swift`, `ScreenStreamDecoder.swift`, `VideoFrameFraming.swift`, `VideoContentGeometry.swift` | |
+| [screen-share](screen-share/README.md) | `screen-share/android/` (`VideoFrameFraming.kt` pending) | `screen-share/macos/` (`ScreenShareWindow.swift`, `VideoFrameFraming.swift` pending) | partly moved |
 | kvm | `KvmInputInjector.kt`, `KvmCoordinateMapper.kt`, `KvmCursorOverlay.kt`, `KvmKeyboardSwitcher.kt`, `ScrollGestureAccumulator.kt`, `BridgeyAccessibilityService.kt`, `BridgeyInputMethodService.kt`, codec in `InputTransport.kt` | `KvmGestureRecognizer.swift`, `KvmKeyMapping.swift`, `KvmPointerCalibration.swift`, codec in `InputTransport.swift` | **frozen**; state: [BRIDGEY_KVM_STATE.md](../BRIDGEY_KVM_STATE.md) |
 | handoff/web | `WebHandoff.kt`, `WebHandoffShareActivity.kt`, `WebHandoffToolbarChip.kt`, `WebHandoffPocService.kt` (production despite the name) | — | state: [BRIDGEY_WEB_HANDOFF_STATE.md](../BRIDGEY_WEB_HANDOFF_STATE.md) |
 | handoff/books | `BooksHandoff.kt`, `BooksHandoffTileService.kt` | `BooksAutomation.swift` | |
