@@ -23,7 +23,7 @@ Kotlin files keep the package `dev.bridgey.android` while they move, so the move
 Moved features live in `features/<name>/`; the others are still in the platform folders.
 | Feature | Android | macOS | Notes |
 |---|---|---|---|
-| clipboard | `ClipboardPayload.kt`, `ClipboardTileService.kt`, handlers in `PairingCoordinator.kt` | `ClipboardPayload.swift`, handlers in `Pairing.swift` | KVM paste depends on it |
+| [clipboard](clipboard/README.md) | `clipboard/android/` | `clipboard/macos/` | moved; handlers still in the coordinators; KVM paste depends on it |
 | [files](files/README.md) | `files/android/` | `files/macos/` | moved (UI and notifier); transfer engines still in the coordinators |
 | [photos](photos/README.md) | `photos/android/` | `photos/macos/` | moved; uses the Files API (`sendSyncAsset`) |
 | [notifications](notifications/README.md) | `notifications/android/` | `notifications/macos/` | moved; presenter and handlers still in the coordinators; state: [BRIDGEY_NOTIFICATIONS_STATE.md](../BRIDGEY_NOTIFICATIONS_STATE.md) |
