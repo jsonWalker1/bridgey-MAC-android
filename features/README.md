@@ -26,7 +26,7 @@ Moved features live in `features/<name>/`; the others are still in the platform 
 | clipboard | `ClipboardPayload.kt`, `ClipboardTileService.kt`, handlers in `PairingCoordinator.kt` | `ClipboardPayload.swift`, handlers in `Pairing.swift` | KVM paste depends on it |
 | files | `ReceivedFileNotifier.kt`, transfer engine in `PairingCoordinator.kt` | `FileTransferWindow.swift`, `FileDropWindow.swift`, transfer engine in `Pairing.swift` | |
 | photos | `PhotoSync.kt`, `PhotoSyncManager.kt` | `PhotosImport.swift` | uses the Files API (`sendSyncAsset`) |
-| notifications | `BridgeyNotificationListenerService.kt` | `NotificationActionRouting.swift`, `NotificationClearAllDetector.swift`, `NotificationIdentity.swift`, `NotificationHistory.swift`, presenter in `Pairing.swift` | state: [BRIDGEY_NOTIFICATIONS_STATE.md](../BRIDGEY_NOTIFICATIONS_STATE.md) |
+| [notifications](notifications/README.md) | `notifications/android/` | `notifications/macos/` | moved; presenter and handlers still in the coordinators; state: [BRIDGEY_NOTIFICATIONS_STATE.md](../BRIDGEY_NOTIFICATIONS_STATE.md) |
 | [calls](calls/README.md) | `calls/android/` | `calls/macos/` | moved; handlers still in the coordinators; detects calls from notifications (dependency) |
 | [media](media/README.md) | `media/android/` | `media/macos/` | moved; media quick actions still in `QuickActions.*` |
 | [telemetry](telemetry/README.md) | `telemetry/android/` | `telemetry/macos/` | moved; samples only while the panel is open |
