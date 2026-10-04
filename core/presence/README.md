@@ -13,8 +13,8 @@ advertise (Mode/Visibility decides).
 | | Where |
 |---|---|
 | Grouping, planning | `DevicePresence`, `ReconnectPlanner` in `DeviceCore.swift` / `DeviceCore.kt` |
-| TXT parsing | `DiscoveryTXTRecord` (`macos/.../Discovery.swift`), `DiscoveryTxtRecord` (`android/core/discovery/.../DiscoveredPeer.kt`) |
-| Adapters | `BonjourDiscovery` (`Discovery.swift`), `NsdDiscoveryService` (`android/core/discovery`) — see [platform](../../platform/README.md) |
+| TXT parsing | `DiscoveryTXTRecord` (`macos/.../Discovery.swift`), `DiscoveryTxtRecord` (`platform/android/discovery/.../DiscoveredPeer.kt`) |
+| Adapters | `BonjourDiscovery` (`Discovery.swift`), `NsdDiscoveryService` (`platform/android/discovery`) — see [platform](../../platform/README.md) |
 | Backoff | `reconnectDelay` / `reconnectDelayMillis` in `Reliability.*` |
 
 Advert (`_bridgey._tcp`, TXT): `id`, `name`, `version`, `platform`, optional `type` (descriptive

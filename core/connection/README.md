@@ -19,7 +19,7 @@ payload meaning (features), routing (app).
 | Outbox (Android) | `SessionWriter` in `DeviceCore.kt` |
 | Crypto | `ProtocolCrypto.swift`, `Crypto` object in `PairingCoordinator.kt` |
 | Framing helpers | `decodeProtocolMessage` / `readProtocolLine` in `Reliability.*` |
-| Auxiliary channels | `ChannelSecurity.*`, `ChannelLifecycle.*`, `TCPChannelSupport.swift`, `TCP*Transport.*`, `VideoTransport.*`, `VideoChannelController.swift`, `VideoChannelManager.kt` |
+| Auxiliary channels | `ChannelSecurity.*`, `ChannelLifecycle.*`, `TCPChannelSupport.swift` (`platform/macos/transport`), `TCP*Transport.*`, `VideoTransport.*`, `VideoChannelController.swift`, `VideoChannelManager.kt` |
 
 ## Invariants
 - One session per `deviceId`; a connected session always wins over a new one; a simultaneous dial
