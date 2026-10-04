@@ -6,7 +6,11 @@ never on sockets, session keys, framing or reconnect — and on other features o
 explicit, documented API. Core never knows a feature exists. All features are compiled in and
 composed at startup (no plugin loader, no DI framework).
 
-Target layout per feature: `README.md`, `PROTOCOL.md` (payloads), `android/`, `macos/`, tests.
+Layout per feature: `README.md`, `PROTOCOL.md` (payloads), `android/` and `macos/` (sources),
+`tests/android/` and `tests/macos/` (unit tests). The builds pick these folders up automatically:
+the root `Package.swift` adds every `features/*/macos` and `features/*/tests/macos`, and
+`android/app/build.gradle.kts` adds every `features/*/android` and `features/*/tests/android`.
+Kotlin files keep the package `dev.bridgey.android` while they move, so the move changes no visibility.
 
 ## Adding a feature
 1. Define its message kinds and payloads (`PROTOCOL.md`); register a permission key.

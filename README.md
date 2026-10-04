@@ -39,7 +39,8 @@ notifications, calls, media, screen share, KVM, handoff — is a **feature** bui
 
 The source is being migrated from the platform folders (`android/`, `macos/`) into this domain
 layout; each domain README says where its code lives today. Build and test commands:
-`cd macos && swift test`, `cd android && ./gradlew :app:testDebugUnitTest :app:assembleDebug`.
+`swift test` (repository root), `cd macos && ./build-app.sh` (app bundle),
+`cd android && ./gradlew :app:testDebugUnitTest :app:assembleDebug`.
 
 ## Since forking from singeol/bridgey
 

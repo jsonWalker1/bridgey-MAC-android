@@ -8,6 +8,16 @@ val releaseStorePassword = System.getenv("BRIDGEY_ANDROID_STORE_PASSWORD")
 val releaseKeyAlias = System.getenv("BRIDGEY_ANDROID_KEY_ALIAS")
 val releaseKeyPassword = System.getenv("BRIDGEY_ANDROID_KEY_PASSWORD")
 
+// DOMAIN SOURCE TREE (see ARCHITECTURE.md): feature code lives in <repo>/features/<feature>/android
+// and its JVM unit tests in <repo>/features/<feature>/tests/android. This module stays the Android
+// build shell (manifest, resources, build configuration) and compiles those directories as well.
+val repositoryRoot: File = rootDir.parentFile
+fun featureDirectories(subdirectory: String): List<File> =
+    repositoryRoot.resolve("features").listFiles().orEmpty()
+        .sortedBy { it.name }
+        .map { it.resolve(subdirectory) }
+        .filter { it.isDirectory }
+
 android {
     namespace = "dev.bridgey.android"
     compileSdk = 36
@@ -45,6 +55,11 @@ android {
         resources {
             excludes += setOf("META-INF/AL2.0", "META-INF/LGPL2.1", "META-INF/DEPENDENCIES", "META-INF/LICENSE.md", "META-INF/NOTICE.md")
         }
+    }
+
+    sourceSets {
+        getByName("main").java.srcDirs(featureDirectories("android"))
+        getByName("test").java.srcDirs(featureDirectories("tests/android"))
     }
 
     buildFeatures { compose = true }

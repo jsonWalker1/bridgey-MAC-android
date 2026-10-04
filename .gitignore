@@ -5,6 +5,7 @@ DerivedData/
 xcuserdata/
 .swiftpm/
 macos/.build/
+/.build/
 macos/dist/
 macos/Resources/Bridgey.tiff
 __pycache__/

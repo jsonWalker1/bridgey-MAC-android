@@ -206,7 +206,8 @@ domain's code has moved, its README lists where the code lives today.
 | Multi-device Core (sessions per device, routing seam) | done — [HW1 report](docs/status/hw1-multi-device-2026-10-04.md) |
 | P0 #1 per-session outbox (Android), R1 identity on Keychain errors (Mac) | done |
 | Documentation (this file, domain READMEs, component docs) | in progress |
-| Domain source tree, feature moves | planned |
+| Domain source tree: build skeleton (root `Package.swift`, Gradle source dirs for `features/*`) | done |
+| Feature moves into `features/` | in progress |
 | Core extraction: identity/trust/presence → connection → messaging + authorization → lifecycle | planned |
 | `Pairing.swift` / `PairingCoordinator.kt` reduced to a thin runtime | planned |
 | `DeviceCore`, `Reliability`, `BridgeySettings` split by ownership | planned |

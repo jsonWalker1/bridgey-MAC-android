@@ -70,7 +70,6 @@ jobs:
       - run: chmod +x build-app.sh package-release.sh
         working-directory: macos
       - run: swift test -c release
-        working-directory: macos
       - name: Sign, notarize, and package
         working-directory: macos
         env:

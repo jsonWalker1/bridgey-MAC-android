@@ -5,16 +5,18 @@ SDK_PATH="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
 CACHE_ROOT="${TMPDIR:-/private/tmp}/bridgey-swift-build"
 CONFIGURATION="${CONFIGURATION:-debug}"
 APP_PATH=".build/$CONFIGURATION/Bridgey.app"
+# The SwiftPM package lives at the repository root (domain source tree); this script runs in macos/.
+PACKAGE_ROOT=".."
 
 env \
   SDKROOT="$SDK_PATH" \
   CLANG_MODULE_CACHE_PATH="$CACHE_ROOT/clang" \
   SWIFTPM_MODULECACHE_OVERRIDE="$CACHE_ROOT/swift" \
-  swift build -c "$CONFIGURATION"
+  swift build -c "$CONFIGURATION" --package-path "$PACKAGE_ROOT"
 
 mkdir -p "$APP_PATH/Contents/MacOS"
 mkdir -p "$APP_PATH/Contents/Resources"
-cp ".build/$CONFIGURATION/BridgeyMac" "$APP_PATH/Contents/MacOS/BridgeyMac"
+cp "$PACKAGE_ROOT/.build/$CONFIGURATION/BridgeyMac" "$APP_PATH/Contents/MacOS/BridgeyMac"
 cp "Resources/Info.plist" "$APP_PATH/Contents/Info.plist"
 for localization in Resources/*.lproj; do
   [ -d "$localization" ] || continue
