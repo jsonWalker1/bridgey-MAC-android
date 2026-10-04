@@ -19,15 +19,17 @@ Kotlin files keep the package `dev.bridgey.android` while they move, so the move
 4. Put Android/macOS integrations in the feature's own folders.
 
 ## Features and where they live today
+
+Moved features live in `features/<name>/`; the others are still in the platform folders.
 | Feature | Android | macOS | Notes |
 |---|---|---|---|
 | clipboard | `ClipboardPayload.kt`, `ClipboardTileService.kt`, handlers in `PairingCoordinator.kt` | `ClipboardPayload.swift`, handlers in `Pairing.swift` | KVM paste depends on it |
 | files | `ReceivedFileNotifier.kt`, transfer engine in `PairingCoordinator.kt` | `FileTransferWindow.swift`, `FileDropWindow.swift`, transfer engine in `Pairing.swift` | |
 | photos | `PhotoSync.kt`, `PhotoSyncManager.kt` | `PhotosImport.swift` | uses the Files API (`sendSyncAsset`) |
 | notifications | `BridgeyNotificationListenerService.kt` | `NotificationActionRouting.swift`, `NotificationClearAllDetector.swift`, `NotificationIdentity.swift`, `NotificationHistory.swift`, presenter in `Pairing.swift` | state: [BRIDGEY_NOTIFICATIONS_STATE.md](../BRIDGEY_NOTIFICATIONS_STATE.md) |
-| calls | `CallsController.kt`, `RemoteCallRequest.kt` | `Calls.swift`, `CallRequest.swift`, `CallOverlayWindow.swift`, `PhoneURLHandler.swift` | detects calls from notifications (dependency); policy: [sms-call-policy](../docs/sms-call-policy.md) |
-| media | `MediaContinuityManager.kt` | `MediaController.swift`, `MediaRemoteController.swift`, `MediaRemoteView.swift`, `GlobalMediaCommandCenter.swift` | |
-| telemetry | `AndroidCpu/Memory/Storage/Temperature.kt` | `MacBattery/Cpu/Memory/Storage/Temperature.swift` | samples only while the panel is open; state: [BRIDGEY_TELEMETRY_STATE.md](../BRIDGEY_TELEMETRY_STATE.md) |
+| [calls](calls/README.md) | `calls/android/` | `calls/macos/` | moved; handlers still in the coordinators; detects calls from notifications (dependency) |
+| [media](media/README.md) | `media/android/` | `media/macos/` | moved; media quick actions still in `QuickActions.*` |
+| [telemetry](telemetry/README.md) | `telemetry/android/` | `telemetry/macos/` | moved; samples only while the panel is open |
 | find, ping | handlers in `PairingCoordinator.kt` | handlers in `Pairing.swift` | |
 | screen-share | `ScreenCaptureManager.kt`, `ScreenCaptureService.kt`, `PocketGuard.kt`, `VideoFrameFraming.kt` | `ScreenShareWindow.swift`, `ScreenStreamDecoder.swift`, `VideoFrameFraming.swift`, `VideoContentGeometry.swift` | |
 | kvm | `KvmInputInjector.kt`, `KvmCoordinateMapper.kt`, `KvmCursorOverlay.kt`, `KvmKeyboardSwitcher.kt`, `ScrollGestureAccumulator.kt`, `BridgeyAccessibilityService.kt`, `BridgeyInputMethodService.kt`, codec in `InputTransport.kt` | `KvmGestureRecognizer.swift`, `KvmKeyMapping.swift`, `KvmPointerCalibration.swift`, codec in `InputTransport.swift` | **frozen**; state: [BRIDGEY_KVM_STATE.md](../BRIDGEY_KVM_STATE.md) |

@@ -13,7 +13,7 @@ import PackageDescription
 // file changes, so directories discovered at evaluation time would go unnoticed after a move.
 
 /// Feature domains that have moved into features/<name>/ (keep in sync with android/app/build.gradle.kts).
-let features = ["media", "telemetry"]
+let features = ["calls", "media", "telemetry"]
 
 let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 let fileManager = FileManager.default

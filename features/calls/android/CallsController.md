@@ -36,7 +36,7 @@ notifications), call UI on the Mac (`Calls.swift`, `CallOverlayWindow.swift`), o
 ## Security
 Call controls are executed only when the user enabled call integration
 (`isCallIntegrationEnabled`) and only for authenticated, authorised action tokens. Policy:
-[docs/sms-call-policy.md](../../../../../../../../docs/sms-call-policy.md).
+[docs/sms-call-policy.md](../../../docs/sms-call-policy.md).
 
 ## Tests
 `android/app/src/test/java/dev/bridgey/android/CallsControllerTest.kt`.
