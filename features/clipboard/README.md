@@ -12,7 +12,7 @@ Quick Settings tile, and the send status shown in the UI.
 | | |
 |---|---|
 | `macos/` | `ClipboardPayload` |
-| `android/` | `ClipboardPayload`, `ClipboardTileService` |
+| `android/` | `ClipboardPayload`, `ClipboardTileService`, `ClipboardCaptureActivity` (foreground read for the tile and the notification action) |
 | still elsewhere | `sendClipboard` / `clipboard.*` handlers in the coordinators |
 
 Payloads: `clipboard.v1` in [docs/protocol.md](../../docs/protocol.md).

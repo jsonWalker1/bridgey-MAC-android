@@ -1,19 +1,15 @@
 package dev.bridgey.android
 
-import android.app.Activity
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Intent
-import android.os.Bundle
 import android.os.IBinder
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.widget.Toast
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -379,43 +375,6 @@ class BridgeyConnectionService : Service() {
         private const val ACTION_CANCEL_TRANSFER = "dev.bridgey.android.CANCEL_TRANSFER"
         private const val ACTION_STOP_FINDING = "dev.bridgey.android.STOP_FINDING"
         private const val EXTRA_TRANSFER_ID = "dev.bridgey.android.extra.TRANSFER_ID"
-    }
-}
-
-class ClipboardCaptureActivity : Activity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        window.setDimAmount(0f)
-    }
-
-    override fun onResume() {
-        super.onResume()
-        Handler(Looper.getMainLooper()).postDelayed({
-            // Clipboard access is allowed only once this user-initiated activity is foreground.
-            val clipboard = getSystemService(ClipboardManager::class.java)
-            val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this@ClipboardCaptureActivity)?.toString()
-            if (text.isNullOrEmpty()) {
-                Toast.makeText(this@ClipboardCaptureActivity, "Clipboard is empty", Toast.LENGTH_SHORT).show()
-            } else {
-                val appContext = applicationContext
-                (application as BridgeyApplication).pairing.sendText(text) { result ->
-                    Handler(Looper.getMainLooper()).post {
-                        val message = when (result) {
-                            ClipboardSendResult.DELIVERED -> "Clipboard sent to Mac"
-                            ClipboardSendResult.EMPTY -> "Clipboard is empty"
-                            ClipboardSendResult.DISABLED -> "Clipboard is turned off on one of your devices"
-                            ClipboardSendResult.NOT_CONNECTED -> "Not connected — clipboard not sent"
-                            ClipboardSendResult.CONNECTION_LOST -> "Send failed — connection lost"
-                            ClipboardSendResult.NO_ACKNOWLEDGEMENT -> "Mac did not confirm delivery"
-                            ClipboardSendResult.TOO_LARGE -> "Clipboard exceeds 32 KiB. Send it as a file."
-                        }
-                        Toast.makeText(appContext, message, Toast.LENGTH_SHORT).show()
-                    }
-                }
-            }
-            finishAndRemoveTask()
-            overridePendingTransition(0, 0)
-        }, 150)
     }
 }
 
