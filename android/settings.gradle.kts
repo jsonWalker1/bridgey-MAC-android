@@ -41,3 +41,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "Bridgey"
 include(":app", ":core:discovery")
+project(":core").projectDir = file("../platform/android")
+project(":core:discovery").projectDir = file("../platform/android/discovery")
