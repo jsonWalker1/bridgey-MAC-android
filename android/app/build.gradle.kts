@@ -58,8 +58,8 @@ android {
     }
 
     sourceSets {
-        getByName("main").java.srcDirs(featureDirectories("android"))
-        getByName("test").java.srcDirs(featureDirectories("tests/android"))
+        getByName("main").kotlin.directories.addAll(featureDirectories("android").map { it.path })
+        getByName("test").kotlin.directories.addAll(featureDirectories("tests/android").map { it.path })
     }
 
     buildFeatures { compose = true }
