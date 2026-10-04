@@ -409,6 +409,28 @@ enum DevicePlatform: String, Equatable {
     }
 }
 
+/// Device kind hint (TXT `type` / trust metadata). Descriptive only, like `DevicePlatform`.
+enum DeviceKind: String, Equatable {
+    case phone
+    case tablet
+    case computer
+    case unknown
+
+    init(hint: String?) {
+        self = hint.flatMap { DeviceKind(rawValue: $0.lowercased()) } ?? .unknown
+    }
+}
+
+/// What a device appears to be: platform + kind, and the roles derived from them. Never identity,
+/// trust or authorization; used only to decide what Bridgey offers.
+struct DeviceProfile: Equatable {
+    let platform: DevicePlatform
+    let kind: DeviceKind
+
+    /// The device that owns a cellular line (places and receives phone calls): an Android phone.
+    var ownsCellularLine: Bool { platform == .android && kind == .phone }
+}
+
 /// One device as routing and UI see it. A read-only projection of Trust (name, metadata),
 /// Presence (hints) and the session table (state, capabilities); never a source of truth.
 struct DeviceDirectoryEntry: Equatable {
@@ -420,9 +442,11 @@ struct DeviceDirectoryEntry: Equatable {
     /// knows the feature, value = the peer grants it to us). Nil until it arrives.
     let capabilities: [String: Bool]?
     let platform: DevicePlatform
-    let deviceType: String?
+    let kind: DeviceKind
     /// The device today's single-peer features use (`activePeer`). Routing only.
     let isRouted: Bool
+
+    var profile: DeviceProfile { DeviceProfile(platform: platform, kind: kind) }
 }
 
 enum DeviceDirectory {
@@ -456,7 +480,7 @@ enum DeviceDirectory {
                 connection: state(id),
                 capabilities: capabilities(id),
                 platform: DevicePlatform(hint: record?.platform ?? hints?.platform),
-                deviceType: record?.deviceType ?? hints?.deviceType,
+                kind: DeviceKind(hint: record?.deviceType ?? hints?.deviceType),
                 isRouted: id == routedDeviceID
             )
         }.sorted { ($0.name.lowercased(), $0.deviceID) < ($1.name.lowercased(), $1.deviceID) }

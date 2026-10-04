@@ -490,6 +490,29 @@ enum class DevicePlatform(val key: String) {
     }
 }
 
+/** Device kind hint (TXT `type` / trust metadata). Descriptive only, like [DevicePlatform]. */
+enum class DeviceKind(val key: String) {
+    PHONE("phone"),
+    TABLET("tablet"),
+    COMPUTER("computer"),
+    UNKNOWN("unknown"),
+    ;
+
+    companion object {
+        fun fromHint(hint: String?): DeviceKind =
+            entries.firstOrNull { it != UNKNOWN && it.key == hint?.lowercase() } ?: UNKNOWN
+    }
+}
+
+/**
+ * What a device appears to be: platform + kind, and the roles derived from them. Never identity,
+ * trust or authorization; used only to decide what Bridgey offers.
+ */
+data class DeviceProfile(val platform: DevicePlatform, val kind: DeviceKind) {
+    /** The device that owns a cellular line (places and receives phone calls): an Android phone. */
+    val ownsCellularLine: Boolean get() = platform == DevicePlatform.ANDROID && kind == DeviceKind.PHONE
+}
+
 /**
  * One device as routing and UI see it. A read-only projection of Trust (name, metadata), Presence
  * (hints) and the session table (state, capabilities); never a source of truth.
@@ -505,10 +528,12 @@ internal data class DeviceDirectoryEntry(
      */
     val capabilities: Map<String, Boolean>?,
     val platform: DevicePlatform,
-    val deviceType: String?,
+    val kind: DeviceKind,
     /** The device today's single-peer features use (activePeer). Routing only. */
     val isRouted: Boolean,
-)
+) {
+    val profile: DeviceProfile get() = DeviceProfile(platform, kind)
+}
 
 internal object DeviceDirectory {
     data class TrustedDevice(val deviceId: String, val name: String, val platform: String?, val deviceType: String?)
@@ -537,7 +562,7 @@ internal object DeviceDirectory {
                 connection = state(id),
                 capabilities = capabilities(id),
                 platform = DevicePlatform.fromHint(record?.platform ?: hints?.platform),
-                deviceType = record?.deviceType ?: hints?.deviceType,
+                kind = DeviceKind.fromHint(record?.deviceType ?: hints?.deviceType),
                 isRouted = id == routedDeviceId,
             )
         }.sortedWith(compareBy({ it.name.lowercase() }, { it.deviceId }))
@@ -583,21 +608,25 @@ class PeerLifecycle {
     fun startedDeviceIds(): Set<String> = synchronized(lock) { startedSessions.keys.toSet() }
 
     /** [isCurrent] must confirm, under this lock, that [session] is still the connected session of [deviceId]. */
-    fun sessionStarted(deviceId: String, session: Any, isCurrent: () -> Boolean = { true }) = synchronized(lock) {
-        if (!isCurrent() || startedSessions[deviceId] === session) return
-        if (startedSessions.containsKey(deviceId)) notify { it.sessionEnded(deviceId) }
-        startedSessions[deviceId] = session
-        notify { it.sessionStarted(deviceId) }
+    fun sessionStarted(deviceId: String, session: Any, isCurrent: () -> Boolean = { true }) {
+        synchronized(lock) {
+            if (!isCurrent() || startedSessions[deviceId] === session) return
+            if (startedSessions.containsKey(deviceId)) notify { it.sessionEnded(deviceId) }
+            startedSessions[deviceId] = session
+            notify { it.sessionStarted(deviceId) }
+        }
     }
 
-    fun sessionEnded(deviceId: String, session: Any) = synchronized(lock) {
-        if (startedSessions[deviceId] !== session) return
-        startedSessions.remove(deviceId)
-        notify { it.sessionEnded(deviceId) }
+    fun sessionEnded(deviceId: String, session: Any) {
+        synchronized(lock) {
+            if (startedSessions[deviceId] !== session) return
+            startedSessions.remove(deviceId)
+            notify { it.sessionEnded(deviceId) }
+        }
     }
 
-    fun authorizationChanged(deviceIds: Set<String>) = synchronized(lock) {
-        deviceIds.sorted().forEach { id -> notify { it.authorizationChanged(id) } }
+    fun authorizationChanged(deviceIds: Set<String>) {
+        synchronized(lock) { deviceIds.sorted().forEach { id -> notify { it.authorizationChanged(id) } } }
     }
 
     private inline fun notify(event: (PeerLifecycleObserver) -> Unit) {

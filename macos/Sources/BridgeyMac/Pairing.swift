@@ -300,8 +300,7 @@ final class PairingCoordinator: ObservableObject {
     private var activeSession: Session? { activePeerID.flatMap { peers.session(for: $0) } }
     /// MD-1: per-device lifecycle events (session started/ended, authorization changed).
     let peerLifecycle = PeerLifecycle()
-    private let localPlatform: DevicePlatform
-    private let localDeviceType: String
+    private let localProfile: DeviceProfile
     private var authorizationSnapshot: (global: [BridgeyFeature: Bool], perDevice: [String: [BridgeyFeature: Bool]])
     private var failureMessage: String?
     private var discoveryCancellable: AnyCancellable?
@@ -372,8 +371,7 @@ final class PairingCoordinator: ObservableObject {
         self.deviceName = local.name
         self.settings = settings
         authorizationSnapshot = (settings.globalFeatures, settings.deviceFeatures)
-        localPlatform = DevicePlatform(hint: local.platform)
-        localDeviceType = local.deviceType
+        localProfile = DeviceProfile(platform: DevicePlatform(hint: local.platform), kind: DeviceKind(hint: local.deviceType))
         let notificationHistoryStore = NotificationHistoryStore()
         self.notificationHistoryStore = notificationHistoryStore
         if settings.notificationHistoryEnabled {
@@ -2509,17 +2507,22 @@ final class PairingCoordinator: ObservableObject {
         )
     }
 
-    /// Whether `feature` can be offered from this Mac to `deviceID` (platform, direction,
-    /// capability and the local per-device grant).
-    func applicability(of feature: BridgeyFeature, for deviceID: String) -> FeatureApplicabilityResult {
-        guard let peer = deviceDirectory.first(where: { $0.deviceID == deviceID }) else { return .peerLacksCapability }
-        return FeatureApplicability.evaluate(
-            feature,
-            localPlatform: localPlatform,
-            localDeviceType: localDeviceType,
-            peer: peer,
-            locallyAuthorized: settings.isEnabled(feature, for: deviceID)
-        )
+    /// One device of the directory, or nil if it is neither trusted nor connected.
+    func device(_ deviceID: String) -> DeviceDirectoryEntry? {
+        deviceDirectory.first { $0.deviceID == deviceID }
+    }
+
+    /// Whether `feature` is offered between this Mac and `deviceID` in the given direction
+    /// (applicability, the peer's capability, the local per-device grant). Unknown device: not offered.
+    func applicability(
+        of feature: FeatureApplicability.Feature,
+        with deviceID: String,
+        localIsSource: Bool
+    ) -> FeatureApplicabilityResult {
+        guard let peer = device(deviceID) else { return .notApplicable }
+        return FeatureApplicability.evaluate(feature, local: localProfile, peer: peer, localIsSource: localIsSource) { [settings] key in
+            BridgeyFeature(rawValue: key).map { settings.isEnabled($0, for: deviceID) } ?? true
+        }
     }
 
     /// Addressed messaging: sends an encrypted feature message to exactly this device's connected

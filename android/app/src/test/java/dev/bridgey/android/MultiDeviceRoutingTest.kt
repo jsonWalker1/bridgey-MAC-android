@@ -10,8 +10,8 @@ import org.junit.Test
 
 /**
  * MD-1 routing foundation: addressed delivery, receive identity, per-device lifecycle, device-
- * scoped authorization changes, the device directory and feature applicability. In-memory peers
- * against the same Core components PairingCoordinator uses; no network.
+ * scoped authorization changes and the device directory (applicability: DeviceApplicabilityTest).
+ * In-memory peers against the same Core components PairingCoordinator uses; no network.
  */
 class MultiDeviceRoutingTest {
     private class FakeSession(val label: String) {
@@ -314,7 +314,7 @@ class MultiDeviceRoutingTest {
             routedDeviceId = null,
         )
         assertEquals(DevicePlatform.ANDROID, entries[0].platform)
-        assertEquals("phone", entries[0].deviceType)
+        assertEquals(DeviceKind.PHONE, entries[0].kind)
     }
 
     @Test
@@ -323,104 +323,6 @@ class MultiDeviceRoutingTest {
         assertEquals(DevicePlatform.UNKNOWN, DevicePlatform.fromHint("windows"))
         assertEquals(DevicePlatform.UNKNOWN, DevicePlatform.fromHint("unknown"))
         assertEquals(DevicePlatform.MACOS, DevicePlatform.fromHint("macOS"))
-    }
-
-    // endregion
-
-    // region Applicability
-
-    private fun peer(
-        platform: DevicePlatform,
-        deviceType: String? = null,
-        capabilities: Map<String, Boolean>? = BridgeyFeature.entries.associate { it.key to true },
-    ) = DeviceDirectoryEntry(b, "peer", true, PeerConnectionState.CONNECTED, capabilities, platform, deviceType, false)
-
-    private fun offer(
-        feature: BridgeyFeature,
-        from: DevicePlatform,
-        to: DeviceDirectoryEntry,
-        localType: String? = null,
-        authorized: Boolean = true,
-    ) = FeatureApplicability.evaluate(feature, from, localType, to, authorized)
-
-    @Test
-    fun webLinksAreOfferedAndroidToMacButNotMacToMac() {
-        assertEquals(FeatureApplicabilityResult.OFFERED, offer(BridgeyFeature.LINKS, DevicePlatform.ANDROID, peer(DevicePlatform.MACOS)))
-        assertEquals(FeatureApplicabilityResult.OFFERED, offer(BridgeyFeature.LINKS, DevicePlatform.MACOS, peer(DevicePlatform.ANDROID)))
-        assertEquals(FeatureApplicabilityResult.NOT_APPLICABLE, offer(BridgeyFeature.LINKS, DevicePlatform.MACOS, peer(DevicePlatform.MACOS)))
-        assertEquals(FeatureApplicabilityResult.NOT_APPLICABLE, offer(BridgeyFeature.LINKS, DevicePlatform.ANDROID, peer(DevicePlatform.ANDROID)))
-    }
-
-    @Test
-    fun callsAreNeverOfferedBetweenMacsAndNeedAPhone() {
-        assertEquals(FeatureApplicabilityResult.OFFERED, offer(BridgeyFeature.CALLS, DevicePlatform.MACOS, peer(DevicePlatform.ANDROID, "phone")))
-        assertEquals(FeatureApplicabilityResult.NOT_APPLICABLE, offer(BridgeyFeature.CALLS, DevicePlatform.MACOS, peer(DevicePlatform.MACOS)))
-        assertEquals(FeatureApplicabilityResult.NOT_APPLICABLE, offer(BridgeyFeature.CALLS, DevicePlatform.MACOS, peer(DevicePlatform.ANDROID, "tablet")))
-        assertEquals(FeatureApplicabilityResult.OFFERED, offer(BridgeyFeature.CALLS, DevicePlatform.ANDROID, peer(DevicePlatform.MACOS), localType = "phone"))
-        assertEquals(FeatureApplicabilityResult.NOT_APPLICABLE, offer(BridgeyFeature.CALLS, DevicePlatform.ANDROID, peer(DevicePlatform.MACOS), localType = "tablet"))
-        assertEquals(FeatureApplicabilityResult.NOT_APPLICABLE, offer(BridgeyFeature.CALLS, DevicePlatform.ANDROID, peer(DevicePlatform.ANDROID)))
-    }
-
-    @Test
-    fun notificationsFlowOnlyFromAndroidToMac() {
-        assertEquals(FeatureApplicabilityResult.OFFERED, offer(BridgeyFeature.NOTIFICATIONS, DevicePlatform.ANDROID, peer(DevicePlatform.MACOS)))
-        assertEquals(FeatureApplicabilityResult.NOT_APPLICABLE, offer(BridgeyFeature.NOTIFICATIONS, DevicePlatform.MACOS, peer(DevicePlatform.ANDROID)))
-        assertEquals(FeatureApplicabilityResult.NOT_APPLICABLE, offer(BridgeyFeature.NOTIFICATIONS, DevicePlatform.MACOS, peer(DevicePlatform.MACOS)))
-        assertEquals(FeatureApplicabilityResult.NOT_APPLICABLE, offer(BridgeyFeature.NOTIFICATIONS, DevicePlatform.ANDROID, peer(DevicePlatform.ANDROID)))
-    }
-
-    @Test
-    fun filesFindAndPingAreOfferedInEveryDirection() {
-        val platforms = listOf(DevicePlatform.ANDROID, DevicePlatform.MACOS)
-        for (feature in listOf(BridgeyFeature.FILES, BridgeyFeature.FIND_DEVICE, BridgeyFeature.PING)) {
-            for (from in platforms) for (to in platforms) {
-                assertEquals("$feature $from → $to", FeatureApplicabilityResult.OFFERED, offer(feature, from, peer(to)))
-            }
-        }
-    }
-
-    @Test
-    fun clipboardIsNotOfferedMacToMac() {
-        assertEquals(FeatureApplicabilityResult.NOT_APPLICABLE, offer(BridgeyFeature.CLIPBOARD, DevicePlatform.MACOS, peer(DevicePlatform.MACOS)))
-        assertEquals(FeatureApplicabilityResult.OFFERED, offer(BridgeyFeature.CLIPBOARD, DevicePlatform.ANDROID, peer(DevicePlatform.ANDROID)))
-    }
-
-    @Test
-    fun remoteStartAndKvmAreMacToAndroidOnly() {
-        for (feature in listOf(BridgeyFeature.REMOTE_SCREEN_SHARE, BridgeyFeature.KVM_INPUT)) {
-            assertEquals(FeatureApplicabilityResult.OFFERED, offer(feature, DevicePlatform.MACOS, peer(DevicePlatform.ANDROID)))
-            assertEquals(FeatureApplicabilityResult.NOT_APPLICABLE, offer(feature, DevicePlatform.ANDROID, peer(DevicePlatform.MACOS)))
-            assertEquals(FeatureApplicabilityResult.NOT_APPLICABLE, offer(feature, DevicePlatform.ANDROID, peer(DevicePlatform.ANDROID)))
-        }
-    }
-
-    @Test
-    fun capabilityAndAuthorizationAreSeparateFromPlatform() {
-        val android = DevicePlatform.ANDROID
-        assertEquals(FeatureApplicabilityResult.PEER_LACKS_CAPABILITY,
-            offer(BridgeyFeature.CLIPBOARD, DevicePlatform.MACOS, peer(android, capabilities = mapOf("clipboard" to false))))
-        assertEquals(FeatureApplicabilityResult.PEER_LACKS_CAPABILITY,
-            offer(BridgeyFeature.CLIPBOARD, DevicePlatform.MACOS, peer(android, capabilities = null)))
-        assertEquals(FeatureApplicabilityResult.NOT_AUTHORIZED,
-            offer(BridgeyFeature.CLIPBOARD, DevicePlatform.MACOS, peer(android), authorized = false))
-    }
-
-    @Test
-    fun unknownPlatformNeverHidesAFeatureButSecurityStillApplies() {
-        val unknown = DevicePlatform.UNKNOWN
-        assertEquals("a missing hint never restricts", FeatureApplicabilityResult.OFFERED,
-            offer(BridgeyFeature.LINKS, DevicePlatform.ANDROID, peer(unknown)))
-        assertEquals(FeatureApplicabilityResult.NOT_AUTHORIZED,
-            offer(BridgeyFeature.LINKS, DevicePlatform.ANDROID, peer(unknown), authorized = false))
-        assertEquals(FeatureApplicabilityResult.PEER_LACKS_CAPABILITY,
-            offer(BridgeyFeature.LINKS, DevicePlatform.ANDROID, peer(unknown, capabilities = emptyMap())))
-    }
-
-    @Test
-    fun everyFeatureHasAnApplicabilityRule() {
-        for (feature in BridgeyFeature.entries) {
-            assertTrue("$feature has directions", FeatureApplicability.directions(feature).isNotEmpty())
-        }
     }
 
     // endregion

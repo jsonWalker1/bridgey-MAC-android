@@ -3,7 +3,7 @@ import XCTest
 @testable import BridgeyMac
 
 /// MD-1 routing foundation: addressed delivery, receive identity, per-device lifecycle, device-
-/// scoped authorization changes, the device directory and feature applicability. In-memory peers
+/// scoped authorization changes and the device directory (applicability: DeviceApplicabilityTests). In-memory peers
 /// against the same Core components PairingCoordinator uses; no network.
 final class MultiDeviceRoutingTests: XCTestCase {
     private final class FakeSession {
@@ -256,78 +256,12 @@ final class MultiDeviceRoutingTests: XCTestCase {
             routedDeviceID: nil
         )
         XCTAssertEqual(entries[0].platform, .android)
-        XCTAssertEqual(entries[0].deviceType, "phone")
+        XCTAssertEqual(entries[0].kind, .phone)
     }
 
     func testUnknownPlatformHintStaysUnknown() {
         XCTAssertEqual(DevicePlatform(hint: nil), .unknown)
         XCTAssertEqual(DevicePlatform(hint: "windows"), .unknown)
         XCTAssertEqual(DevicePlatform(hint: "Android"), .android)
-    }
-
-    // MARK: - Applicability
-
-    private func peer(_ platform: DevicePlatform, deviceType: String? = nil, capabilities: [String: Bool]? = nil) -> DeviceDirectoryEntry {
-        let all = Dictionary(uniqueKeysWithValues: BridgeyFeature.allCases.map { ($0.rawValue, true) })
-        return DeviceDirectoryEntry(deviceID: b, name: "peer", isTrusted: true, connection: .connected,
-                                    capabilities: capabilities ?? all, platform: platform, deviceType: deviceType, isRouted: false)
-    }
-
-    private func offer(_ feature: BridgeyFeature, from local: DevicePlatform, localType: String? = nil, to peer: DeviceDirectoryEntry, authorized: Bool = true) -> FeatureApplicabilityResult {
-        FeatureApplicability.evaluate(feature, localPlatform: local, localDeviceType: localType, peer: peer, locallyAuthorized: authorized)
-    }
-
-    func testWebLinksAreOfferedAndroidToMacButNotMacToMac() {
-        XCTAssertEqual(offer(.links, from: .android, to: peer(.macos)), .offered)
-        XCTAssertEqual(offer(.links, from: .macos, to: peer(.android)), .offered)
-        XCTAssertEqual(offer(.links, from: .macos, to: peer(.macos)), .notApplicable, "macOS Continuity covers Mac → Mac")
-        XCTAssertEqual(offer(.links, from: .android, to: peer(.android)), .notApplicable)
-    }
-
-    func testCallsAreNeverOfferedBetweenMacsAndNeedAPhone() {
-        XCTAssertEqual(offer(.calls, from: .macos, to: peer(.android, deviceType: "phone")), .offered)
-        XCTAssertEqual(offer(.calls, from: .macos, to: peer(.macos)), .notApplicable)
-        XCTAssertEqual(offer(.calls, from: .macos, to: peer(.android, deviceType: "tablet")), .notApplicable)
-        XCTAssertEqual(offer(.calls, from: .android, localType: "phone", to: peer(.macos)), .offered)
-        XCTAssertEqual(offer(.calls, from: .android, localType: "tablet", to: peer(.macos)), .notApplicable)
-        XCTAssertEqual(offer(.calls, from: .android, to: peer(.android)), .notApplicable)
-    }
-
-    func testNotificationsFlowOnlyFromAndroidToMac() {
-        XCTAssertEqual(offer(.notifications, from: .android, to: peer(.macos)), .offered)
-        XCTAssertEqual(offer(.notifications, from: .macos, to: peer(.android)), .notApplicable)
-        XCTAssertEqual(offer(.notifications, from: .macos, to: peer(.macos)), .notApplicable)
-        XCTAssertEqual(offer(.notifications, from: .android, to: peer(.android)), .notApplicable)
-    }
-
-    func testFilesFindAndPingAreOfferedInEveryDirection() {
-        for feature in [BridgeyFeature.files, .findDevice, .ping] {
-            for (from, to) in [(DevicePlatform.android, DevicePlatform.macos), (.macos, .android), (.macos, .macos), (.android, .android)] {
-                XCTAssertEqual(offer(feature, from: from, to: peer(to)), .offered, "\(feature) \(from) → \(to)")
-            }
-        }
-    }
-
-    func testClipboardIsNotOfferedMacToMac() {
-        XCTAssertEqual(offer(.clipboard, from: .macos, to: peer(.macos)), .notApplicable)
-        XCTAssertEqual(offer(.clipboard, from: .android, to: peer(.android)), .offered)
-    }
-
-    func testRemoteStartIsMacToAndroidOnly() {
-        XCTAssertEqual(offer(.remoteScreenShare, from: .macos, to: peer(.android)), .offered)
-        XCTAssertEqual(offer(.remoteScreenShare, from: .android, to: peer(.macos)), .notApplicable)
-        XCTAssertEqual(offer(.remoteScreenShare, from: .macos, to: peer(.macos)), .notApplicable)
-    }
-
-    func testCapabilityAndAuthorizationAreSeparateFromPlatform() {
-        XCTAssertEqual(offer(.clipboard, from: .macos, to: peer(.android, capabilities: ["clipboard": false])), .peerLacksCapability)
-        XCTAssertEqual(offer(.clipboard, from: .macos, to: peer(.android, capabilities: [:])), .peerLacksCapability)
-        XCTAssertEqual(offer(.clipboard, from: .macos, to: peer(.android), authorized: false), .notAuthorized)
-    }
-
-    func testUnknownPlatformNeverHidesAFeatureButSecurityStillApplies() {
-        XCTAssertEqual(offer(.links, from: .macos, to: peer(.unknown)), .offered, "a missing hint never restricts")
-        XCTAssertEqual(offer(.links, from: .macos, to: peer(.unknown), authorized: false), .notAuthorized)
-        XCTAssertEqual(offer(.links, from: .macos, to: peer(.unknown, capabilities: [:])), .peerLacksCapability)
     }
 }

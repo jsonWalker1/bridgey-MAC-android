@@ -177,7 +177,10 @@ class PairingCoordinator(
     private val activeSession: Session? get() = activePeerId?.let(peers::session)
     /** MD-1: per-device lifecycle events (session started/ended, authorization changed). */
     val peerLifecycle = PeerLifecycle()
-    private val localDeviceType = LocalDevice.deviceTypeFor(appContext.resources.configuration.smallestScreenWidthDp)
+    private val localProfile = DeviceProfile(
+        DevicePlatform.ANDROID,
+        DeviceKind.fromHint(LocalDevice.deviceTypeFor(appContext.resources.configuration.smallestScreenWidthDp)),
+    )
     @Volatile private var authorizationSnapshot: Pair<Map<BridgeyFeature, Boolean>, Map<String, Map<BridgeyFeature, Boolean>>> =
         settings.state.value.globalFeatures to settings.state.value.deviceFeatures
     private val coreLock = Any()
@@ -2491,20 +2494,22 @@ class PairingCoordinator(
         )
     }
 
+    /** One device of the directory, or null if it is neither trusted nor connected. */
+    internal fun device(deviceId: String): DeviceDirectoryEntry? = deviceDirectory().firstOrNull { it.deviceId == deviceId }
+
     /**
-     * Whether [feature] can be offered from this device to [deviceId] (platform, direction,
-     * capability and the local per-device grant).
+     * Whether [feature] is offered between this device and [deviceId] in the given direction
+     * (applicability, the peer's capability, the local per-device grant). Unknown device: not offered.
      */
-    internal fun applicability(feature: BridgeyFeature, deviceId: String): FeatureApplicabilityResult {
-        val peer = deviceDirectory().firstOrNull { it.deviceId == deviceId }
-            ?: return FeatureApplicabilityResult.PEER_LACKS_CAPABILITY
-        return FeatureApplicability.evaluate(
-            feature,
-            localPlatform = DevicePlatform.ANDROID,
-            localDeviceType = localDeviceType,
-            peer = peer,
-            locallyAuthorized = settings.isEnabled(feature, deviceId),
-        )
+    internal fun applicability(
+        feature: FeatureApplicability.Feature,
+        deviceId: String,
+        localIsSource: Boolean,
+    ): FeatureApplicabilityResult {
+        val peer = device(deviceId) ?: return FeatureApplicabilityResult.NOT_APPLICABLE
+        return FeatureApplicability.evaluate(feature, localProfile, peer, localIsSource) { key ->
+            BridgeyFeature.entries.firstOrNull { it.key == key }?.let { settings.isEnabled(it, deviceId) } ?: true
+        }
     }
 
     /**

@@ -25,19 +25,36 @@ the product behaves exactly as before.
 | Addressed send | `PairingCoordinator.send(to:kind:payload:)` | `PairingCoordinator.send(to, kind, payload)` | encrypted with that session's key, queued on that session only (Android: its outbox); false if the device is not connected; never falls back to another device |
 | Addressed session (Core) | `PeerSessionManager.connectedSession(for:)`, `deliver(to:_:)` | `connectedSession(deviceId)`, `deliver(deviceId, …)` | only an authenticated (connected) session; independent of the routed peer |
 | Receive identity (Core) | `PeerSessionManager.connectedDeviceID(of:)` | `connectedDeviceId(session)` | the sender of a message on that session; nil for pending/handshaking sockets |
-| Device directory | `PairingCoordinator.deviceDirectory` | `deviceDirectory()` | read-only projection (`DeviceDirectoryEntry`: deviceId, name, trusted, connection, capabilities, platform/deviceType hints, routed); not a source of identity or trust |
+| Device directory | `PairingCoordinator.deviceDirectory`, `device(_:)` | `deviceDirectory()`, `device(id)` | read-only projection (`DeviceDirectoryEntry`: deviceId, name, trusted, connection, capabilities, platform + kind hints → `profile`, routed); not a source of identity or trust |
 | Lifecycle | `peerLifecycle` (`PeerLifecycle`, `PeerLifecycleObserver`) | same | see [lifecycle](../lifecycle/README.md) |
-| Applicability (app layer) | `applicability(of:for:)`, `FeatureApplicability` | `applicability(feature, deviceId)` | see below |
+| Applicability (app layer) | `applicability(of:with:localIsSource:)`, `FeatureApplicability` | `applicability(feature, deviceId, localIsSource)` | see below |
 
-**Applicability** (`FeatureApplicability.swift` / `.kt`, app layer, not Core) answers "can feature
-X be offered from this device to that peer?" and keeps four inputs apart: platform/device-type
-*hints* (discovery TXT or trust metadata; an unknown platform never hides a feature), direction
-(a static per-feature table of `from → to` platforms), capability (the peer's `features.update`
-for this session, which on the wire also carries the peer's grant) and the local per-device
-authorization. Result: `offered` / `notApplicable` / `peerLacksCapability` / `notAuthorized`.
-Security still rests on identity, trust and authorization only; the hints are not authenticated.
-Mac → Mac is not offered for web links, clipboard, calls, notifications, media, Remote Start
-(and KVM on Android); a known Android *tablet* is not offered calls.
+**Device profile (MD-2).** `DeviceProfile` = `DevicePlatform` (android / macos / unknown) +
+`DeviceKind` (phone / tablet / computer / unknown), taken from discovery TXT or the trust record's
+metadata (recorded metadata wins over live hints). Roles derive from it, e.g. `ownsCellularLine`
+(an Android phone). These are unverified **hints**: never identity, trust or authorization.
+
+**Applicability** (`FeatureApplicability.swift` / `.kt`, app layer, not Core) answers "should
+Bridgey offer this product feature from this source device to this target device?". It is
+decided per **product feature** of the readiness audit (Web Handoff, Books Handoff, link to
+phone, notification mirror / actions, call state / control, media remote, Mac player control,
+telemetry, screen share, Remote Start, KVM, clipboard, files, photo sync, find, ping), because one
+capability key can carry several of them (`links`, `media`, `notifications`, `calls`). Each rule
+names its allowed `source → target` platforms, its capability keys, an optional role requirement
+(which end must own the cellular line) and whether it needs explicit (opt-in) authorization.
+- `isApplicable(feature, source, target)` — product, platform and role only. An unknown platform
+  or kind matches nothing, so it never makes a feature available; only deliberately
+  platform-independent features (files, find, ping) ignore the platform.
+- `evaluate(feature, local, peer, localIsSource, isLocallyAuthorized)` — then the peer's
+  capability (its `features.update` value, which on the wire also carries the peer's grant to us)
+  and the local grant for that device, each reported separately: `offered` / `notApplicable` /
+  `peerLacksCapability` / `notAuthorized`. A key the local catalog does not have (KVM on macOS)
+  has no local grant; the peer's opt-in grant still decides.
+
+Mac → Mac is not offered for Web/Books Handoff, links, clipboard (Universal Clipboard), calls,
+notifications, media, screen share, Remote Start or KVM; files, find and ping are offered in every
+direction (the audit's open product decision). Mode and Context are not part of applicability.
+Nothing uses it yet; no feature changes behaviour.
 
 `send(to:)` is a raw Core primitive: it does **no** authorization or capability check — a migrated
 feature must check `applicability` (or its existing `featureEnabled` / `isFeatureAvailable`) before

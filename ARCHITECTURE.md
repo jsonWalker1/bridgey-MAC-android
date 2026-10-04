@@ -206,6 +206,7 @@ domain's code has moved, its README lists where the code lives today.
 | Multi-device Core (sessions per device, routing seam) | done — [HW1 report](docs/status/hw1-multi-device-2026-10-04.md) |
 | P0 #1 per-session outbox (Android), R1 identity on Keychain errors (Mac) | done |
 | MD-1 routing foundation (addressed send, receive identity, per-device lifecycle, device directory, applicability) | done — no feature migrated yet, see [messaging](core/messaging/README.md) |
+| MD-2 device profiles and directional applicability per product feature | done — not used by features yet |
 | Documentation (this file, domain READMEs, component docs) | in progress |
 | Domain source tree: build skeleton (root `Package.swift`, Gradle source dirs for `features/*`) | done |
 | Feature moves into `features/` | in progress |
