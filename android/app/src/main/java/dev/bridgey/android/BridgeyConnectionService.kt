@@ -35,7 +35,7 @@ class BridgeyConnectionService : Service() {
     override fun onCreate() {
         super.onCreate()
         val bridgey = application as BridgeyApplication
-        if (!bridgey.isPrimaryUser || !bridgey.isBridgeyEnabled) {
+        if (!shouldStartConnectionService(bridgey.isPrimaryUser, bridgey.isBridgeyEnabled)) {
             supportedProfile = false
             stopSelf()
             return
@@ -432,3 +432,11 @@ internal fun connectionStatusText(state: PairingState, wifiAvailable: Boolean, h
         else -> "Not connected · waiting for paired device"
     }
 }
+
+/**
+ * Whether the connection foreground service may run. Callers that start it from the background
+ * must check this first: the service stops itself when this is false, and a service started with
+ * startForegroundService() that stops before startForeground() crashes the process.
+ */
+internal fun shouldStartConnectionService(isPrimaryUser: Boolean, isBridgeyEnabled: Boolean): Boolean =
+    isPrimaryUser && isBridgeyEnabled

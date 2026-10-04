@@ -91,9 +91,15 @@ class WebHandoffPocService : AccessibilityService() {
         // reboot), nothing else starts the connection's foreground service, and Samsung's Freecess
         // then freezes the app in the background - the connection drops every few seconds and never
         // settles. A bound accessibility service may start a foreground service from the background;
-        // BridgeyConnectionService itself stops again if Bridgey is turned off.
-        runCatching { startForegroundService(Intent(this, BridgeyConnectionService::class.java)) }
-            .onFailure { log("could not start the connection service: ${it.javaClass.simpleName}") }
+        // Only while Bridgey is on: the service stops itself when Bridgey is off, and a foreground
+        // service that stops before calling startForeground() crashes the app
+        // (ForegroundServiceDidNotStartInTimeException, seen after Bridgey was turned off and
+        // Android rebound this service in a fresh process).
+        val app = application as BridgeyApplication
+        if (shouldStartConnectionService(app.isPrimaryUser, app.isBridgeyEnabled)) {
+            runCatching { startForegroundService(Intent(this, BridgeyConnectionService::class.java)) }
+                .onFailure { log("could not start the connection service: ${it.javaClass.simpleName}") }
+        }
         // The chip needs a connected Mac; connection changes produce no accessibility event.
         // The Mac's feature list (Web links on/off) arrives shortly after the connection itself.
         connectionWatch = stateScope.launch {
