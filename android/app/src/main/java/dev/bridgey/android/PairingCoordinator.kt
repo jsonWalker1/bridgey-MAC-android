@@ -58,6 +58,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -205,8 +206,22 @@ class PairingCoordinator(
     val fileTransfers: StateFlow<Map<String, FileTransferState>> = mutableFileTransfers.asStateFlow()
     private val mutablePhoneRinging = MutableStateFlow(false)
     val phoneRinging: StateFlow<Boolean> = mutablePhoneRinging.asStateFlow()
-    private val mutableMacRinging = MutableStateFlow(false)
-    val macRinging: StateFlow<Boolean> = mutableMacRinging.asStateFlow()
+    /** MD-3: Find Device state per device; [remoteRinging] = peers confirmed ringing for us. */
+    private val find = FindDeviceState()
+    /**
+     * Serializes every Find decision with the ring sound and the published state: sessions run
+     * their read loops in parallel, so a state change, the sound start/stop and the publish must
+     * happen as one step.
+     */
+    private val findLock = Any()
+    private val mutableRemoteRinging = MutableStateFlow<Set<String>>(emptySet())
+    val remoteRinging: StateFlow<Set<String>> = mutableRemoteRinging.asStateFlow()
+    /**
+     * Bumped whenever any device's session, capabilities or grants change, so device pickers
+     * (Ping/Find targets) refresh even for devices that are not the routed one.
+     */
+    private val mutableDeviceDirectoryRevision = MutableStateFlow(0)
+    val deviceDirectoryRevision: StateFlow<Int> = mutableDeviceDirectoryRevision.asStateFlow()
     private val mutableRemoteBattery = MutableStateFlow<RemoteBatteryStatus?>(null)
     val remoteBattery: StateFlow<RemoteBatteryStatus?> = mutableRemoteBattery.asStateFlow()
     private val mutableRemoteStorage = MutableStateFlow<RemoteStorageStatus?>(null)
@@ -230,7 +245,8 @@ class PairingCoordinator(
     private var localWantsRemoteTelemetryUpdates = false
     private val mutablePingStatus = MutableStateFlow<String?>(null)
     val pingStatus: StateFlow<String?> = mutablePingStatus.asStateFlow()
-    private var pendingPingId: String? = null
+    /** MD-3: Ping requests per device. */
+    private val pings = PingRequests()
     // Advanced Screen Continuity - Remote Start: peer name of a trusted Mac's remote-start request
     // that still needs the user to complete Android's mandatory MediaProjection consent (Case B).
     // Non-null exactly while BridgeyConnectionService's notification is showing; cleared once the
@@ -315,6 +331,12 @@ class PairingCoordinator(
     }
 
     init {
+        // MD-3: device-addressed features drop a device's state only when that device's session ends.
+        peerLifecycle.addObserver(object : PeerLifecycleObserver {
+            override fun sessionStarted(deviceId: String) = mutableDeviceDirectoryRevision.update { it + 1 }
+            override fun sessionEnded(deviceId: String) = deviceSessionEnded(deviceId)
+            override fun authorizationChanged(deviceId: String) = deviceAuthorizationChanged(deviceId)
+        })
         mediaRemote.start()
         scope.launch {
             settings.state.collect {
@@ -324,7 +346,7 @@ class PairingCoordinator(
                 if (!featureEnabled(BridgeyFeature.MEMORY)) mutableRemoteMemory.value = null
                 if (!featureEnabled(BridgeyFeature.CPU)) mutableRemoteCpu.value = null
                 if (!featureEnabled(BridgeyFeature.TEMPERATURE)) mutableRemoteTemperature.value = null
-                if (!featureEnabled(BridgeyFeature.PING)) clearPingStatus()
+                if (!settings.isEnabled(BridgeyFeature.PING, null)) clearPingStatus()
                 quickActions.policyChanged()
                 mediaRemote.policyChanged()
                 sendFeatureState()
@@ -829,43 +851,46 @@ class PairingCoordinator(
         }
     }
 
+    /** Compatibility path without an explicit target: the routed device. */
     fun sendPing() {
-        val current = activeSession
-        if (current == null || mutableState.value !is PairingState.Connected) {
-            mutablePingStatus.value = "Mac is not connected"
+        val deviceId = activePeerId
+        if (deviceId == null) {
+            mutablePingStatus.value = "No device is connected"
             return
         }
-        if (!isFeatureAvailable(BridgeyFeature.PING)) {
-            mutablePingStatus.value = "Ping requires Bridgey 0.6 on both devices"
+        sendPing(deviceId)
+    }
+
+    /**
+     * MD-3: pings exactly [deviceId]. The request is tracked as (deviceId, requestId), so its
+     * acknowledgement, timeout or disconnect never touches another device's request.
+     */
+    fun sendPing(deviceId: String) {
+        val name = displayName(deviceId)
+        if (applicability(FeatureApplicability.Feature.PING, deviceId, localIsSource = true) != FeatureApplicabilityResult.OFFERED) {
+            mutablePingStatus.value = if (peers.connectedSession(deviceId) == null) "$name is not connected"
+            else "Ping is turned off or not supported on $name"
             return
         }
-        val messageId = UUID.randomUUID().toString()
-        val encrypted = Crypto.encrypt(current.pairingKey!!, JSONObject().put("version", 1).toString().toByteArray())
-        pendingPingId = messageId
-        mutablePingStatus.value = "Pinging Mac…"
+        val requestId = UUID.randomUUID().toString()
+        pings.begin(deviceId, requestId)
+        if (!send(deviceId, "ping.request", JSONObject().put("version", 1).toString().toByteArray(), requestId)) {
+            pings.failed(deviceId, requestId)
+            mutablePingStatus.value = "Ping could not be sent to $name"
+            return
+        }
+        mutablePingStatus.value = "Pinging $name…"
         scope.launch {
-            if (activeSession !== current || !current.send(
-                    Message(
-                        kind = "ping.request",
-                        sessionId = current.id,
-                        messageId = messageId,
-                        nonce = encrypted.nonce,
-                        ciphertext = encrypted.ciphertext,
-                    ),
-                )
-            ) {
-                if (pendingPingId == messageId) {
-                    pendingPingId = null
-                    mutablePingStatus.value = "Ping could not be sent"
-                }
-                return@launch
-            }
             delay(5_000)
-            if (pendingPingId == messageId) {
-                pendingPingId = null
-                mutablePingStatus.value = "Mac did not acknowledge the ping"
-            }
+            if (pings.timeOut(deviceId, requestId)) mutablePingStatus.value = "$name did not acknowledge the ping"
         }
+    }
+
+    private fun receivePingAcknowledgement(current: Session, message: Message) {
+        val sender = peers.connectedDeviceId(current) ?: return
+        if (message.sessionId != current.id) return
+        val requestId = message.messageId ?: return
+        if (pings.acknowledge(requestId, sender)) mutablePingStatus.value = "Ping delivered to ${displayName(sender)}"
     }
 
     private fun receivePing(current: Session, message: Message) {
@@ -873,7 +898,7 @@ class PairingCoordinator(
             sendFeatureState()
             return
         }
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        if (peers.connectedDeviceId(current) == null || message.sessionId != current.id) return
         val messageId = message.messageId ?: return
         if (!current.acceptMessageId(messageId)) return
         val plaintext = Crypto.decrypt(
@@ -982,7 +1007,7 @@ class PairingCoordinator(
     }
 
     private fun clearPingStatus() {
-        pendingPingId = null
+        pings.reset()
         mutablePingStatus.value = null
     }
 
@@ -1215,37 +1240,75 @@ class PairingCoordinator(
         }
     }
 
+    /** Compatibility path without an explicit target: the routed device. */
     fun findMac() {
-        if (!isFeatureAvailable(BridgeyFeature.FIND_DEVICE)) return
-        if (mutableState.value !is PairingState.Connected) return
-        scope.launch { sendFindCommand("find.start") }
+        activePeerId?.let(::startFinding)
     }
 
+    /** MD-3: asks exactly [deviceId] to ring. */
+    fun startFinding(deviceId: String): Boolean {
+        if (applicability(FeatureApplicability.Feature.FIND_DEVICE, deviceId, localIsSource = true) != FeatureApplicabilityResult.OFFERED) {
+            return false
+        }
+        return sendFindCommand("find.start", deviceId)
+    }
+
+    /** MD-3: asks exactly [deviceId] to stop ringing; other devices keep ringing. */
+    fun stopFinding(deviceId: String): Boolean = sendFindCommand("find.stop", deviceId)
+
+    /**
+     * Stop everything this device knows about: silence this phone (telling every peer that asked)
+     * and stop every peer we made ring. Used by the Stop button, the notification action and when
+     * the feature is turned off.
+     */
     fun stopFinding() {
-        stopPhoneRinging()
-        scope.launch { sendFindCommand("find.stop") }
+        stopLocalRinging()
+        find.remoteRinging().forEach { stopFinding(it) }
     }
 
-    private fun sendFindCommand(kind: String): Boolean {
-        val current = activeSession ?: return false
-        if (kind == "find.start" && !isFeatureAvailable(BridgeyFeature.FIND_DEVICE)) return false
-        if (mutableState.value !is PairingState.Connected) return false
-        val payload = JSONObject().put("alertId", "active").toString().toByteArray()
-        val encrypted = Crypto.encrypt(current.pairingKey!!, payload)
-        return current.send(
-            Message(
-                kind = kind,
-                sessionId = current.id,
-                messageId = UUID.randomUUID().toString(),
-                nonce = encrypted.nonce,
-                ciphertext = encrypted.ciphertext,
-            ),
-        )
+    /** Silences this phone and tells each peer that asked for it that it stopped. */
+    fun stopLocalRinging() = synchronized(findLock) {
+        val requesters = find.stopLocalRinging()
+        stopPhoneRinging()
+        requesters.forEach { sendFindCommand("find.stopped", it) }
     }
+
+    private fun sendFindCommand(kind: String, deviceId: String): Boolean =
+        send(deviceId, kind, JSONObject().put("alertId", "active").toString().toByteArray())
+
+    /** MD-3: a device's session ended - drop only that device's Ping and Find state. */
+    private fun deviceSessionEnded(deviceId: String) {
+        if (pings.deviceEnded(deviceId)) mutablePingStatus.value = "${displayName(deviceId)} disconnected"
+        synchronized(findLock) {
+            if (find.deviceEnded(deviceId)) stopPhoneRinging()
+            mutableRemoteRinging.value = find.remoteRinging()
+        }
+        mutableDeviceDirectoryRevision.update { it + 1 }
+    }
+
+    /** MD-3: the local Find grant for this device was revoked - it may no longer make this phone ring. */
+    private fun deviceAuthorizationChanged(deviceId: String) {
+        mutableDeviceDirectoryRevision.update { it + 1 }
+        if (settings.isEnabled(BridgeyFeature.FIND_DEVICE, deviceId)) return
+        synchronized(findLock) {
+            if (deviceId !in find.localRequesters()) return
+            if (find.peerStopped(deviceId)) stopPhoneRinging()
+            sendFindCommand("find.stopped", deviceId)
+        }
+    }
+
+    /** Connected devices to which [feature] is offered from this device (MD-3 target picker). */
+    internal fun targets(feature: FeatureApplicability.Feature): List<DeviceDirectoryEntry> = deviceDirectory().filter {
+        it.connection == PeerConnectionState.CONNECTED &&
+            applicability(feature, it.deviceId, localIsSource = true) == FeatureApplicabilityResult.OFFERED
+    }
+
+    private fun displayName(deviceId: String): String = device(deviceId)?.name ?: "The device"
 
     private fun receiveFindCommand(current: Session, message: Message, start: Boolean) {
         if (start && !settings.isEnabled(BridgeyFeature.FIND_DEVICE, current.remoteDeviceId)) return
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        val sender = peers.connectedDeviceId(current) ?: return
+        if (message.sessionId != current.id) return
         val messageId = message.messageId ?: return
         if (!current.acceptMessageId(messageId)) return
         val plaintext = Crypto.decrypt(
@@ -1256,13 +1319,19 @@ class PairingCoordinator(
         if (runCatching { JSONObject(plaintext.toString(Charsets.UTF_8)).getString("alertId") }.isFailure) {
             return failSession(current, "Invalid find-device message")
         }
-        if (start) {
-            startPhoneRinging()
-            sendFindCommand(if (mutablePhoneRinging.value) "find.started" else "find.stopped")
-        } else {
-            stopPhoneRinging()
-            mutableMacRinging.value = false
-            sendFindCommand("find.stopped")
+        synchronized(findLock) {
+            // Re-checked under the lock: a session that ended meanwhile must not leave state behind.
+            if (peers.connectedSession(sender) !== current) return
+            if (start) {
+                if (find.localRingRequested(sender)) {
+                    startPhoneRinging()
+                    if (!mutablePhoneRinging.value) find.peerStopped(sender) // no sound could start: not served
+                }
+                sendFindCommand(if (mutablePhoneRinging.value) "find.started" else "find.stopped", sender)
+            } else {
+                if (find.peerStopped(sender)) stopPhoneRinging()
+                sendFindCommand("find.stopped", sender)
+            }
         }
         android.util.Log.i("Bridgey", "PLUGIN find-device ${if (start) "started" else "stopped"}")
     }
@@ -1524,8 +1593,11 @@ class PairingCoordinator(
         reconnectJobs.clear()
         (peers.identifiedSessions() + peers.pendingSessions()).forEach { endSession(it, Reconnect.NONE) }
         failureMessage = null
-        stopPhoneRinging()
-        mutableMacRinging.value = false
+        synchronized(findLock) {
+            find.reset()
+            mutableRemoteRinging.value = emptySet()
+            stopPhoneRinging()
+        }
         mutableRemoteBattery.value = null
         mutableRemoteStorage.value = null
         lastSentStorage = null
@@ -1743,14 +1815,11 @@ class PairingCoordinator(
         // (4) Transfers and acknowledgements bound to the previous peer cannot complete through the
         // feature layer any more; finish them now instead of letting them time out.
         if (previous != null) interruptFeatureTransfers()
-        stopPhoneRinging()
-        mutableMacRinging.value = false
         mutableRemoteBattery.value = null
         mutableRemoteStorage.value = null
         lastSentStorage = null
         resetRemoteMemoryState()
         resetTelemetrySubscriptionState()
-        clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
         videoChannel.reset()
@@ -1817,10 +1886,15 @@ class PairingCoordinator(
         "heartbeat.ping", "heartbeat.pong", "features.update",
     )
 
+    /** MD-3: features that address devices explicitly; consumed from every connected session. */
+    private val deviceAddressedMessageKinds = setOf(
+        "ping.request", "ping.ack", "find.start", "find.stop", "find.started", "find.stopped",
+    )
+
     private fun receive(current: Session, message: Message) {
         // COMPATIBILITY SEAM: features consume only the routed session. An inactive session stays
         // connected; its feature messages are received by the Core but not consumed yet.
-        if (message.kind !in coreMessageKinds && current !== activeSession) {
+        if (message.kind !in coreMessageKinds && message.kind !in deviceAddressedMessageKinds && current !== activeSession) {
             if (peers.phase(current) == PeerSessionPhase.CONNECTED && current.unconsumedFeatureMessages++ == 0) {
                 android.util.Log.i("Bridgey", "ROUTING feature messages from inactive peer=${current.deviceIdForLog()} not consumed (kind=${message.kind})")
                 diagnostics.record("routing", "inactive_peer_feature_message", "not_consumed")
@@ -1931,14 +2005,7 @@ class PairingCoordinator(
             "screenshare.remoteStop" -> receiveRemoteScreenShareStop(current, message)
             "kvm.switchKeyboard" -> receiveSwitchKeyboard(current, message)
             "ping.request" -> receivePing(current, message)
-            "ping.ack" -> {
-                if (activeSession !== current || message.sessionId != current.id || mutableState.value !is PairingState.Connected) return
-                val messageId = message.messageId ?: return
-                if (pendingPingId == messageId) {
-                    pendingPingId = null
-                    mutablePingStatus.value = "Ping delivered"
-                }
-            }
+            "ping.ack" -> receivePingAcknowledgement(current, message)
             "battery.update" -> receiveBattery(current, message)
             "telemetry.update" -> receiveStorageTelemetry(current, message)
             "telemetry.subscribe" -> receiveTelemetrySubscribe(current, message)
@@ -2227,7 +2294,8 @@ class PairingCoordinator(
     }
 
     private fun receiveFindAcknowledgement(current: Session, message: Message, started: Boolean) {
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        val sender = peers.connectedDeviceId(current) ?: return
+        if (message.sessionId != current.id) return
         val messageId = message.messageId ?: return
         if (!current.acceptMessageId(messageId)) return
         val plaintext = Crypto.decrypt(
@@ -2238,7 +2306,11 @@ class PairingCoordinator(
         if (runCatching { JSONObject(plaintext.toString(Charsets.UTF_8)).getString("alertId") }.getOrNull() != "active") {
             return failSession(current, "Invalid find-device acknowledgement")
         }
-        mutableMacRinging.value = started
+        synchronized(findLock) {
+            if (peers.connectedSession(sender) !== current) return
+            find.remoteReported(sender, started)
+            mutableRemoteRinging.value = find.remoteRinging()
+        }
     }
 
     private fun receiveFileOffer(current: Session, message: Message) {
@@ -2517,7 +2589,8 @@ class PairingCoordinator(
      * session (its own outbox), independent of the routed (active) peer. False when that device is
      * not connected.
      */
-    fun send(to: String, kind: String, payload: ByteArray): Boolean = peers.deliver(to) { session ->
+    fun send(to: String, kind: String, payload: ByteArray, messageId: String = UUID.randomUUID().toString()): Boolean =
+        peers.deliver(to) { session ->
         val key = session.pairingKey ?: return@deliver false
         session.outbox.enqueue {
             val encrypted = Crypto.encrypt(key, payload)
@@ -2525,7 +2598,7 @@ class PairingCoordinator(
                 Message(
                     kind = kind,
                     sessionId = session.id,
-                    messageId = UUID.randomUUID().toString(),
+                    messageId = messageId,
                     nonce = encrypted.nonce,
                     ciphertext = encrypted.ciphertext,
                 ),
@@ -2606,6 +2679,17 @@ class PairingCoordinator(
         // Features: only the routed session's capabilities drive today's single-peer features.
         if (current === activeSession) applyRemoteFeatures(received)
         if (previousCapabilities != capabilities) peerLifecycle.authorizationChanged(setOf(current.remoteDeviceId))
+        // MD-3: Ping/Find state of exactly this device follows its own grant.
+        if (received[BridgeyFeature.PING] == false && pings.deviceEnded(current.remoteDeviceId)) {
+            mutablePingStatus.value = "Ping is turned off on ${current.peerName}"
+        }
+        if (received[BridgeyFeature.FIND_DEVICE] == false) {
+            synchronized(findLock) {
+                if (find.deviceEnded(current.remoteDeviceId)) stopPhoneRinging()
+                mutableRemoteRinging.value = find.remoteRinging()
+            }
+        }
+        mutableDeviceDirectoryRevision.update { it + 1 }
     }
 
     /** Mirrors the routed session's capabilities into today's single-peer feature state. */
@@ -2620,11 +2704,6 @@ class PairingCoordinator(
         if (received[BridgeyFeature.MEMORY] == false) mutableRemoteMemory.value = null
         if (received[BridgeyFeature.CPU] == false) mutableRemoteCpu.value = null
         if (received[BridgeyFeature.TEMPERATURE] == false) mutableRemoteTemperature.value = null
-        if (received[BridgeyFeature.PING] == false) clearPingStatus()
-        if (received[BridgeyFeature.FIND_DEVICE] == false) {
-            stopPhoneRinging()
-            mutableMacRinging.value = false
-        }
     }
 
     private fun receiveBattery(current: Session, message: Message) {

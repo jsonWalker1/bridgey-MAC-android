@@ -66,11 +66,17 @@ with `connectedDeviceID(of:)` and let it through the inactive-peer gate in `rece
 keyed by `deviceId` and reset it from `PeerLifecycleObserver`, and offer it per device through
 `applicability`.
 
-**Still on `activeSession` (all production features):** clipboard, files, photo sync, notifications
-(forwarding, actions, dismiss, Clear All), calls, media (both directions), quick actions / links /
-Web and Books Handoff, telemetry and battery, find, ping, screen share / Remote Start (video
-channel providers) and KVM (input channel, frozen). The inactive-peer gate in `receive` still
-drops their messages from non-routed devices.
+**Migrated (MD-3):** [ping](../../features/ping/README.md) and
+[find](../../features/find/README.md) address devices explicitly; their message kinds pass the
+inactive-peer gate from every connected session (`deviceAddressedMessageKinds`). Their
+target-less entry points (`sendPing()` from the keyboard shortcut, `findAndroid()` / `findMac()`)
+remain as compatibility paths that name the routed device explicitly.
+
+**Still on `activeSession`:** clipboard, files, photo sync, notifications (forwarding, actions,
+dismiss, Clear All), calls, media (both directions), quick actions / links / Web and Books Handoff,
+telemetry and battery, screen share / Remote Start (video channel providers) and KVM (input
+channel, frozen). The inactive-peer gate in `receive` still drops their messages from non-routed
+devices.
 
 ## Invariants (target)
 - Features never see sockets, session keys, framing or reconnect.

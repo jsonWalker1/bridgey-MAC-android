@@ -41,6 +41,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -475,7 +477,7 @@ private fun BridgeyApp(
     val clipboardStatus by pairing.clipboardStatus.collectAsStateWithLifecycle()
     val fileTransfers by pairing.fileTransfers.collectAsStateWithLifecycle()
     val phoneRinging by pairing.phoneRinging.collectAsStateWithLifecycle()
-    val macRinging by pairing.macRinging.collectAsStateWithLifecycle()
+    val remoteRinging by pairing.remoteRinging.collectAsStateWithLifecycle()
     val remoteBattery by pairing.remoteBattery.collectAsStateWithLifecycle()
     val remoteStorage by pairing.remoteStorage.collectAsStateWithLifecycle()
     val remoteMemory by pairing.remoteMemory.collectAsStateWithLifecycle()
@@ -484,6 +486,11 @@ private fun BridgeyApp(
     val pingStatus by pairing.pingStatus.collectAsStateWithLifecycle()
     val trustedDevices by pairing.trustedDevices.collectAsStateWithLifecycle()
     val remoteFeatures by pairing.remoteFeatures.collectAsStateWithLifecycle()
+    // MD-3: Ping/Find targets are explicit connected devices (display names from the directory).
+    // Reading the directory revision recomposes on any device's session, capability or grant change.
+    val directoryRevision by pairing.deviceDirectoryRevision.collectAsStateWithLifecycle()
+    val pingTargets = directoryRevision.let { pairing.targets(FeatureApplicability.Feature.PING).map { it.deviceId to it.name } }
+    val findTargets = directoryRevision.let { pairing.targets(FeatureApplicability.Feature.FIND_DEVICE).map { it.deviceId to it.name } }
     val settingsState by settings.state.collectAsStateWithLifecycle()
     var permissionPrompt by remember { mutableStateOf<PermissionPrompt?>(null) }
     var showingSettings by remember { mutableStateOf(false) }
@@ -539,10 +546,7 @@ private fun BridgeyApp(
                 },
                 onDeviceFeatureChanged = { deviceId, feature, enabled ->
                     settings.setForDevice(deviceId, feature, enabled)
-                    if (
-                        feature == BridgeyFeature.FIND_DEVICE && !enabled &&
-                        (pairingState as? PairingState.Connected)?.deviceId == deviceId
-                    ) pairing.stopFinding()
+                    if (feature == BridgeyFeature.FIND_DEVICE && !enabled) pairing.stopFinding(deviceId)
                 },
                 onNotificationApplicationChanged = { packageName, enabled ->
                     settings.setNotificationApplicationEnabled(packageName, enabled)
@@ -572,7 +576,9 @@ private fun BridgeyApp(
                 clipboardStatus = clipboardStatus,
                 fileTransfers = fileTransfers,
                 phoneRinging = phoneRinging,
-                macRinging = macRinging,
+                remoteRinging = remoteRinging,
+                pingTargets = pingTargets,
+                findTargets = findTargets,
                 remoteBattery = remoteBattery,
                 remoteStorage = remoteStorage,
                 remoteMemory = remoteMemory,
@@ -1053,7 +1059,9 @@ private fun DeviceScreen(
     clipboardStatus: String?,
     fileTransfers: Map<String, FileTransferState>,
     phoneRinging: Boolean,
-    macRinging: Boolean,
+    remoteRinging: Set<String>,
+    pingTargets: List<Pair<String, String>>,
+    findTargets: List<Pair<String, String>>,
     remoteBattery: RemoteBatteryStatus?,
     remoteStorage: RemoteStorageStatus?,
     remoteMemory: RemoteMemoryStatus?,
@@ -1089,7 +1097,9 @@ private fun DeviceScreen(
                     name = connected.peerName,
                     clipboardStatus = clipboardStatus,
                     phoneRinging = phoneRinging,
-                    macRinging = macRinging,
+                    remoteRinging = remoteRinging,
+                    pingTargets = pingTargets,
+                    findTargets = findTargets,
                     remoteBattery = remoteBattery,
                     remoteStorage = remoteStorage,
                     remoteMemory = remoteMemory,
@@ -1102,13 +1112,11 @@ private fun DeviceScreen(
                     pingStatus = pingStatus,
                     clipboardEnabled = enabledFeatures[BridgeyFeature.CLIPBOARD] != false,
                     filesEnabled = enabledFeatures[BridgeyFeature.FILES] != false,
-                    findEnabled = enabledFeatures[BridgeyFeature.FIND_DEVICE] != false,
-                    pingEnabled = enabledFeatures[BridgeyFeature.PING] != false,
                     onClipboard = pairing::sendClipboard,
                     onFile = { filePicker.launch(arrayOf("*/*")) },
-                    onRing = pairing::findMac,
+                    onRing = { pairing.startFinding(it) },
                     onStopRing = pairing::stopFinding,
-                    onPing = pairing::sendPing,
+                    onPing = { pairing.sendPing(it) },
                 )
             }
             if (enabledFeatures[BridgeyFeature.LINKS] == true || enabledFeatures[BridgeyFeature.MEDIA] == true) {
@@ -1224,7 +1232,9 @@ private fun ConnectedDeviceCard(
     name: String,
     clipboardStatus: String?,
     phoneRinging: Boolean,
-    macRinging: Boolean,
+    remoteRinging: Set<String>,
+    pingTargets: List<Pair<String, String>>,
+    findTargets: List<Pair<String, String>>,
     remoteBattery: RemoteBatteryStatus?,
     remoteStorage: RemoteStorageStatus?,
     remoteMemory: RemoteMemoryStatus?,
@@ -1237,13 +1247,11 @@ private fun ConnectedDeviceCard(
     pingStatus: String?,
     clipboardEnabled: Boolean,
     filesEnabled: Boolean,
-    findEnabled: Boolean,
-    pingEnabled: Boolean,
     onClipboard: () -> Unit,
     onFile: () -> Unit,
-    onRing: () -> Unit,
+    onRing: (String) -> Unit,
     onStopRing: () -> Unit,
-    onPing: () -> Unit,
+    onPing: (String) -> Unit,
 ) {
     var showingStorageDetails by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -1322,15 +1330,18 @@ private fun ConnectedDeviceCard(
                 if (filesEnabled) QuickAction("File", "Send", Modifier.weight(1f), onFile)
                 if (clipboardEnabled.xor(filesEnabled)) Spacer(Modifier.weight(1f))
             }
+            // MD-3: Ping and Ring address a device explicitly; several eligible devices open a picker.
+            val anyRinging = phoneRinging || remoteRinging.isNotEmpty()
+            val pingEnabled = pingTargets.isNotEmpty()
+            val findEnabled = findTargets.isNotEmpty() || anyRinging
             if (pingEnabled || findEnabled) Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                if (pingEnabled) QuickAction("Ping", "Mac", Modifier.weight(1f), onPing)
+                if (pingEnabled) DeviceQuickAction("Ping", pingTargets, Modifier.weight(1f), onPing)
                 if (findEnabled) {
-                    QuickAction(
-                        if (phoneRinging || macRinging) "Stop" else "Ring",
-                        if (phoneRinging) "Phone" else "Mac",
-                        Modifier.weight(1f),
-                        if (phoneRinging || macRinging) onStopRing else onRing,
-                    )
+                    if (anyRinging) {
+                        QuickAction("Stop", if (phoneRinging) "This phone" else "Ringing", Modifier.weight(1f), onStopRing)
+                    } else {
+                        DeviceQuickAction("Ring", findTargets, Modifier.weight(1f), onRing)
+                    }
                 }
                 if (pingEnabled.xor(findEnabled)) Spacer(Modifier.weight(1f))
             }
@@ -1437,6 +1448,31 @@ private fun ConnectedDeviceCard(
 }
 
 private fun formattedByteCount(context: Context, bytes: Long): String = Formatter.formatShortFileSize(context, bytes)
+
+/** One target: acts on it directly (subtitle = its name). Several: opens a menu of their names. */
+@Composable
+private fun DeviceQuickAction(
+    title: String,
+    targets: List<Pair<String, String>>,
+    modifier: Modifier,
+    action: (String) -> Unit,
+) {
+    var choosing by remember { mutableStateOf(false) }
+    Box(modifier) {
+        val single = targets.singleOrNull()
+        QuickAction(title, single?.second ?: "Choose device", Modifier.fillMaxWidth()) {
+            if (single != null) action(single.first) else choosing = true
+        }
+        DropdownMenu(expanded = choosing, onDismissRequest = { choosing = false }) {
+            targets.forEach { (deviceId, name) ->
+                DropdownMenuItem(text = { Text(name) }, onClick = {
+                    choosing = false
+                    action(deviceId)
+                })
+            }
+        }
+    }
+}
 
 @Composable
 private fun QuickAction(title: String, subtitle: String, modifier: Modifier, action: () -> Unit) {

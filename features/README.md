@@ -30,7 +30,8 @@ Moved features live in `features/<name>/`; the others are still in the platform 
 | [calls](calls/README.md) | `calls/android/` | `calls/macos/` | moved; handlers still in the coordinators; detects calls from notifications (dependency) |
 | [media](media/README.md) | `media/android/` | `media/macos/` | moved; media quick actions still in `QuickActions.*` |
 | [telemetry](telemetry/README.md) | `telemetry/android/` | `telemetry/macos/` | moved; samples only while the panel is open |
-| find, ping | handlers in `PairingCoordinator.kt` | handlers in `Pairing.swift` | |
+| [find](find/README.md) | `find/android/` | `find/macos/` | per-device state; first multi-device migration (MD-3), handlers still in the coordinators |
+| [ping](ping/README.md) | `ping/android/` | `ping/macos/` | per-device requests; first multi-device migration (MD-3), handlers still in the coordinators |
 | [screen-share](screen-share/README.md) | `screen-share/android/` (`VideoFrameFraming.kt` pending) | `screen-share/macos/` (`ScreenShareWindow.swift`, `VideoFrameFraming.swift` pending) | partly moved |
 | kvm | `KvmInputInjector.kt`, `KvmCoordinateMapper.kt`, `KvmCursorOverlay.kt`, `KvmKeyboardSwitcher.kt`, `ScrollGestureAccumulator.kt`, `BridgeyAccessibilityService.kt`, `BridgeyInputMethodService.kt`, codec in `InputTransport.kt` | `KvmGestureRecognizer.swift`, `KvmKeyMapping.swift`, `KvmPointerCalibration.swift`, codec in `InputTransport.swift` | **frozen**; state: [BRIDGEY_KVM_STATE.md](../BRIDGEY_KVM_STATE.md) |
 | [handoff](handoff/README.md) | `handoff/android/` (web + books) | `handoff/macos/` (`BooksAutomation`) | moved; not yet split into web/books; state: [BRIDGEY_WEB_HANDOFF_STATE.md](../BRIDGEY_WEB_HANDOFF_STATE.md) |

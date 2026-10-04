@@ -243,18 +243,12 @@ private struct BridgeyPanel: View {
                 if pairing.isFeatureAvailable(.files) {
                     actionButton("File", icon: "paperplane") { pairing.chooseAndSendFile() }
                 }
-                if pairing.isFeatureAvailable(.findDevice) {
-                    actionButton(
-                        pairing.macRinging || pairing.androidRinging ? "Stop" : "Ring",
-                        icon: pairing.macRinging || pairing.androidRinging ? "stop.circle" : "bell"
-                    ) {
-                        if pairing.macRinging || pairing.androidRinging { pairing.stopFinding() }
-                        else { pairing.findAndroid() }
-                    }
+                if !findTargets.isEmpty || pairing.macRinging || !pairing.find.remoteRinging.isEmpty {
+                    findButton
                 }
-                if pairing.isFeatureAvailable(.ping) {
-                    actionButton("Ping", icon: "wave.3.right") { pairing.sendPing() }
-                        .help("Play a short alert on Android")
+                if !pingTargets.isEmpty {
+                    devicePicker("Ping", icon: "wave.3.right", targets: pingTargets) { pairing.sendPing(to: $0) }
+                        .help("Play a short alert on a connected device")
                 }
                 if pairing.isFeatureAvailable(.calls) {
                     actionButton("Call", icon: "phone.arrow.up.right") { pairing.sendCallFromClipboard() }
@@ -293,8 +287,8 @@ private struct BridgeyPanel: View {
             }
             if !pairing.isFeatureAvailable(.clipboard) &&
                 !pairing.isFeatureAvailable(.files) &&
-                !pairing.isFeatureAvailable(.findDevice) &&
-                !pairing.isFeatureAvailable(.ping) &&
+                findTargets.isEmpty &&
+                pingTargets.isEmpty &&
                 !pairing.isFeatureAvailable(.links) &&
                 !pairing.isFeatureAvailable(.calls) {
                 Text("Quick actions are turned off in Settings on one of your devices.")
@@ -312,7 +306,7 @@ private struct BridgeyPanel: View {
                     .foregroundStyle(.secondary)
             }
             if let status = pairing.pingStatus {
-                Label(status, systemImage: status == "Ping delivered" ? "checkmark.circle.fill" : "wave.3.right")
+                Label(status, systemImage: status.hasPrefix("Ping delivered") ? "checkmark.circle.fill" : "wave.3.right")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -350,6 +344,72 @@ private struct BridgeyPanel: View {
         }
         .padding(14)
         .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    // MD-3: Ping and Find address a device explicitly. One eligible device: a plain button; several:
+    // a menu of their display names.
+    private var findTargets: [DeviceDirectoryEntry] { pairing.targets(for: .findDevice) }
+    private var pingTargets: [DeviceDirectoryEntry] { pairing.targets(for: .ping) }
+
+    @ViewBuilder
+    private var findButton: some View {
+        let anyRinging = pairing.macRinging || !pairing.find.remoteRinging.isEmpty
+        if findTargets.count <= 1 {
+            actionButton(anyRinging ? "Stop" : "Ring", icon: anyRinging ? "stop.circle" : "bell") {
+                if anyRinging { pairing.stopFinding() } else if let target = findTargets.first { pairing.startFinding(target.deviceID) }
+            }
+        } else {
+            Menu {
+                if pairing.macRinging {
+                    Button("Silence this Mac") { pairing.stopLocalRinging() }
+                }
+                ForEach(findTargets, id: \.deviceID) { target in
+                    if pairing.find.isRinging(target.deviceID) {
+                        Button("Stop \(target.name)") { pairing.stopFinding(target.deviceID) }
+                    } else {
+                        Button("Ring \(target.name)") { pairing.startFinding(target.deviceID) }
+                    }
+                }
+            } label: {
+                actionLabel(anyRinging ? "Stop" : "Ring", icon: anyRinging ? "stop.circle" : "bell")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .background(.background.opacity(0.8), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+    }
+
+    @ViewBuilder
+    private func devicePicker(
+        _ title: String,
+        icon: String,
+        targets: [DeviceDirectoryEntry],
+        action: @escaping (String) -> Void
+    ) -> some View {
+        if targets.count == 1, let target = targets.first {
+            actionButton(title, icon: icon) { action(target.deviceID) }
+        } else {
+            Menu {
+                ForEach(targets, id: \.deviceID) { target in
+                    Button(target.name) { action(target.deviceID) }
+                }
+            } label: {
+                actionLabel(title, icon: icon)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .background(.background.opacity(0.8), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+    }
+
+    private func actionLabel(_ title: String, icon: String) -> some View {
+        VStack(spacing: 5) {
+            Image(systemName: icon).font(.system(size: 16, weight: .medium))
+            Text(title).font(.caption2)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 9)
+        .contentShape(Rectangle())
     }
 
     private func actionButton(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
@@ -693,9 +753,7 @@ private struct SettingsView: View {
                                 },
                                 set: {
                                     settings.setForDevice(device.id, feature: feature, enabled: $0)
-                                    if feature == .findDevice && !$0,
-                                       case let .connected(connectedID, _) = pairing.state,
-                                       connectedID == device.id { pairing.stopFinding() }
+                                    if feature == .findDevice && !$0 { pairing.stopFinding(device.id) }
                                 }
                             )) {
                                 VStack(alignment: .leading, spacing: 1) {

@@ -207,6 +207,7 @@ domain's code has moved, its README lists where the code lives today.
 | P0 #1 per-session outbox (Android), R1 identity on Keychain errors (Mac) | done |
 | MD-1 routing foundation (addressed send, receive identity, per-device lifecycle, device directory, applicability) | done — no feature migrated yet, see [messaging](core/messaging/README.md) |
 | MD-2 device profiles and directional applicability per product feature | done — not used by features yet |
+| MD-3 Ping and Find Device addressed by deviceId (first feature migration) | done — see [ping](features/ping/README.md), [find](features/find/README.md) |
 | Documentation (this file, domain READMEs, component docs) | in progress |
 | Domain source tree: build skeleton (root `Package.swift`, Gradle source dirs for `features/*`) | done |
 | Feature moves into `features/` | in progress |

@@ -248,8 +248,15 @@ final class PairingCoordinator: ObservableObject {
     @Published private(set) var fileTransferStatus: String? = nil
     @Published private(set) var fileTransferActive = false
     @Published private(set) var fileTransfers: [String: FileTransferRow] = [:]
+    /// This Mac is ringing (Find Device), while at least one peer that asked for it remains.
     @Published private(set) var macRinging = false
-    @Published private(set) var androidRinging = false
+    /// MD-3: Find Device state per device (who rings for us, who asked us to ring).
+    @Published private(set) var find = FindDeviceState()
+    /// MD-3: Ping requests per device.
+    @Published private(set) var pings = PingRequests()
+    /// Bumped whenever any device's session, capabilities or grants change, so device pickers
+    /// (Ping/Find targets) refresh even for devices that are not the routed one.
+    @Published private(set) var deviceDirectoryRevision = 0
     @Published private(set) var remoteFeatures = defaultRemoteFeatureState()
     @Published private(set) var notificationHistory: [NotificationHistoryItem] = []
     @Published var remoteCall: RemoteCallStatus?
@@ -300,6 +307,8 @@ final class PairingCoordinator: ObservableObject {
     private var activeSession: Session? { activePeerID.flatMap { peers.session(for: $0) } }
     /// MD-1: per-device lifecycle events (session started/ended, authorization changed).
     let peerLifecycle = PeerLifecycle()
+    /// Device-addressed features (MD-3) drop a device's state only when that device's session ends.
+    private var featureLifecycle: FeatureLifecycleHandler?
     private let localProfile: DeviceProfile
     private var authorizationSnapshot: (global: [BridgeyFeature: Bool], perDevice: [String: [BridgeyFeature: Bool]])
     private var failureMessage: String?
@@ -312,7 +321,6 @@ final class PairingCoordinator: ObservableObject {
     private var callRequestID: String?
     private var callTimeoutWorkItem: DispatchWorkItem?
     private var callStatusClearWorkItem: DispatchWorkItem?
-    private var pingRequestID: String?
     private var pingStatusClearWorkItem: DispatchWorkItem?
     private var pendingCallNumber: String?
     private var pendingCallExpiryWorkItem: DispatchWorkItem?
@@ -450,6 +458,13 @@ final class PairingCoordinator: ObservableObject {
             }
         }
         shortcuts.register()
+        let featureLifecycle = FeatureLifecycleHandler(
+            started: { [weak self] _ in self?.deviceDirectoryRevision += 1 },
+            ended: { [weak self] deviceID in self?.deviceSessionEnded(deviceID) },
+            authorizationChanged: { [weak self] deviceID in self?.deviceAuthorizationChanged(deviceID) }
+        )
+        self.featureLifecycle = featureLifecycle
+        peerLifecycle.addObserver(featureLifecycle)
         settingsCancellable = Publishers.CombineLatest3(
             settings.$globalFeatures,
             settings.$deviceFeatures,
@@ -464,7 +479,7 @@ final class PairingCoordinator: ObservableObject {
                     if !self.featureEnabled(.memory) { self.resetRemoteMemoryState() }
                     if !self.featureEnabled(.cpu) { self.remoteCpu = nil }
                     if !self.featureEnabled(.temperature) { self.remoteTemperature = nil }
-                    if !self.featureEnabled(.ping) { self.clearPingStatus() }
+                    if !self.settings.isEnabled(.ping, for: nil) { self.clearPingStatus() }
                     if !self.isFeatureAvailable(.links) { self.quickActions.reset() }
                     self.mediaController.reset()
                     self.mediaRemote.reset()
@@ -911,38 +926,46 @@ final class PairingCoordinator: ObservableObject {
         completion?(false)
     }
 
+    /// Compatibility path without an explicit target (keyboard shortcut): the routed device.
     func sendPing() {
-        guard let current = activeSession, case .connected = state else {
-            setTransientPingStatus("Android is not connected")
+        guard let deviceID = activePeerID else {
+            setTransientPingStatus("No device is connected")
             return
         }
-        guard isFeatureAvailable(.ping) else {
-            setTransientPingStatus("Ping requires Bridgey 0.6 on both devices")
+        sendPing(to: deviceID)
+    }
+
+    /// MD-3: pings exactly `deviceID`. The request is tracked as (deviceID, requestID), so its
+    /// acknowledgement, timeout or disconnect never touches another device's request.
+    func sendPing(to deviceID: String) {
+        let name = displayName(deviceID)
+        guard applicability(of: .ping, with: deviceID, localIsSource: true) == .offered else {
+            setTransientPingStatus(peers.connectedSession(for: deviceID) == nil
+                ? "\(name) is not connected" : "Ping is turned off or not supported on \(name)")
             return
         }
-        guard let plaintext = try? JSONEncoder().encode(PingPayload(version: 1)),
-              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else {
-            setTransientPingStatus("Ping could not be encrypted")
+        guard let plaintext = try? JSONEncoder().encode(PingPayload(version: 1)) else { return }
+        let requestID = UUID().uuidString.lowercased()
+        pings.begin(deviceID: deviceID, requestID: requestID)
+        guard send(to: deviceID, kind: "ping.request", payload: plaintext, messageID: requestID) else {
+            pings.failed(deviceID: deviceID, requestID: requestID)
+            setTransientPingStatus("Ping could not be sent to \(name)")
             return
         }
-        let messageID = UUID().uuidString.lowercased()
-        pingRequestID = messageID
         pingStatusClearWorkItem?.cancel()
-        pingStatus = "Pinging Android…"
-        current.send(PairingMessage(
-            kind: "ping.request",
-            sessionId: current.id,
-            messageId: messageID,
-            nonce: encrypted.nonce,
-            ciphertext: encrypted.ciphertext
-        ))
-        let timeout = DispatchWorkItem { [weak self] in
-            guard self?.pingRequestID == messageID else { return }
-            self?.pingRequestID = nil
-            self?.setTransientPingStatus("Android did not acknowledge the ping")
+        pingStatus = "Pinging \(name)…"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self, self.pings.timeOut(deviceID: deviceID, requestID: requestID) else { return }
+            self.setTransientPingStatus("\(name) did not acknowledge the ping")
         }
-        pingStatusClearWorkItem = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: timeout)
+    }
+
+    private func receivePingAcknowledgement(_ message: PairingMessage, in current: Session) {
+        guard let sender = peers.connectedDeviceID(of: current),
+              message.sessionId == current.id,
+              let requestID = message.messageId,
+              pings.acknowledge(requestID: requestID, from: sender) else { return }
+        setTransientPingStatus("Ping delivered to \(displayName(sender))")
     }
 
     private func receivePing(_ message: PairingMessage, in current: Session) throws {
@@ -950,7 +973,7 @@ final class PairingCoordinator: ObservableObject {
             sendFeatureState()
             return
         }
-        guard case .connected = state,
+        guard peers.connectedDeviceID(of: current) != nil,
               message.sessionId == current.id,
               let messageID = message.messageId,
               current.acceptMessageID(messageID),
@@ -977,7 +1000,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func clearPingStatus() {
-        pingRequestID = nil
+        pings.reset()
         pingStatusClearWorkItem?.cancel()
         pingStatusClearWorkItem = nil
         pingStatus = nil
@@ -1243,33 +1266,48 @@ final class PairingCoordinator: ObservableObject {
         NSLog("PLUGIN temperature sent")
     }
 
+    /// Compatibility path without an explicit target: the routed device.
     func findAndroid() {
-        _ = sendFindCommand(kind: "find.start")
+        if let deviceID = activePeerID { startFinding(deviceID) }
     }
 
+    /// MD-3: asks exactly `deviceID` to ring.
+    @discardableResult
+    func startFinding(_ deviceID: String) -> Bool {
+        guard applicability(of: .findDevice, with: deviceID, localIsSource: true) == .offered else { return false }
+        return sendFindCommand(kind: "find.start", to: deviceID)
+    }
+
+    /// MD-3: asks exactly `deviceID` to stop ringing; other devices keep ringing.
+    @discardableResult
+    func stopFinding(_ deviceID: String) -> Bool {
+        sendFindCommand(kind: "find.stop", to: deviceID)
+    }
+
+    /// Stop everything this Mac knows about: silence this Mac (telling every peer that asked) and
+    /// stop every peer we made ring. Used by the panel's Stop button and when the feature is
+    /// turned off.
     func stopFinding() {
-        stopMacSound()
-        _ = sendFindCommand(kind: "find.stop")
+        stopLocalRinging()
+        find.remoteRinging.forEach { stopFinding($0) }
     }
 
-    private func sendFindCommand(kind: String) -> Bool {
-        guard let current = activeSession, case .connected = state,
-              (kind != "find.start" || isFeatureAvailable(.findDevice)),
-              let payload = try? JSONEncoder().encode(FindDevicePayload(alertId: "active")),
-              let encrypted = try? encrypt(payload, key: current.pairingKey!) else { return false }
-        current.send(PairingMessage(
-            kind: kind,
-            sessionId: current.id,
-            messageId: UUID().uuidString.lowercased(),
-            nonce: encrypted.nonce,
-            ciphertext: encrypted.ciphertext
-        ))
-        return true
+    /// Silences this Mac and tells each peer that asked for it that it stopped.
+    func stopLocalRinging() {
+        let requesters = find.stopLocalRinging()
+        stopMacSound()
+        requesters.forEach { sendFindCommand(kind: "find.stopped", to: $0) }
+    }
+
+    @discardableResult
+    private func sendFindCommand(kind: String, to deviceID: String) -> Bool {
+        guard let payload = try? JSONEncoder().encode(FindDevicePayload(alertId: "active")) else { return false }
+        return send(to: deviceID, kind: kind, payload: payload)
     }
 
     private func receiveFindCommand(_ message: PairingMessage, in current: Session, start: Bool) throws {
         if start && !featureEnabled(.findDevice, current: current) { return }
-        guard case .connected = state,
+        guard let sender = peers.connectedDeviceID(of: current),
               message.sessionId == current.id,
               let messageID = message.messageId,
               current.acceptMessageID(messageID),
@@ -1279,12 +1317,14 @@ final class PairingCoordinator: ObservableObject {
               let payload = try? JSONDecoder().decode(FindDevicePayload.self, from: plaintext),
               payload.alertId == "active" else { throw PairingError.invalidMessage }
         if start {
-            startMacSound()
-            _ = sendFindCommand(kind: macRinging ? "find.started" : "find.stopped")
+            if find.localRingRequested(by: sender) {
+                startMacSound()
+                if !macRinging { find.peerStopped(sender) } // no sound could start: this request is not served
+            }
+            sendFindCommand(kind: macRinging ? "find.started" : "find.stopped", to: sender)
         } else {
-            stopMacSound()
-            androidRinging = false
-            _ = sendFindCommand(kind: "find.stopped")
+            if find.peerStopped(sender) { stopMacSound() }
+            sendFindCommand(kind: "find.stopped", to: sender)
         }
         NSLog("PLUGIN find-device %@", start ? "started" : "stopped")
     }
@@ -1294,7 +1334,7 @@ final class PairingCoordinator: ObservableObject {
         in current: Session,
         started: Bool
     ) throws {
-        guard case .connected = state,
+        guard let sender = peers.connectedDeviceID(of: current),
               message.sessionId == current.id,
               let messageID = message.messageId,
               current.acceptMessageID(messageID),
@@ -1303,7 +1343,33 @@ final class PairingCoordinator: ObservableObject {
               let plaintext = try? decrypt(nonce: nonce, ciphertext: ciphertext, key: current.pairingKey!),
               let payload = try? JSONDecoder().decode(FindDevicePayload.self, from: plaintext),
               payload.alertId == "active" else { throw PairingError.invalidMessage }
-        androidRinging = started
+        find.remoteReported(sender, ringing: started)
+    }
+
+    /// MD-3: a device's session ended - drop only that device's Ping and Find state.
+    private func deviceSessionEnded(_ deviceID: String) {
+        if pings.deviceEnded(deviceID) { setTransientPingStatus("\(displayName(deviceID)) disconnected") }
+        if find.deviceEnded(deviceID) { stopMacSound() }
+        deviceDirectoryRevision += 1
+    }
+
+    /// MD-3: the local Find grant for this device was revoked - it may no longer make this Mac ring.
+    private func deviceAuthorizationChanged(_ deviceID: String) {
+        deviceDirectoryRevision += 1
+        guard !settings.isEnabled(.findDevice, for: deviceID), find.localRequesters.contains(deviceID) else { return }
+        if find.peerStopped(deviceID) { stopMacSound() }
+        sendFindCommand(kind: "find.stopped", to: deviceID)
+    }
+
+    /// Connected devices to which `feature` is offered from this Mac (MD-3 target picker).
+    func targets(for feature: FeatureApplicability.Feature) -> [DeviceDirectoryEntry] {
+        deviceDirectory.filter {
+            $0.connection == .connected && applicability(of: feature, with: $0.deviceID, localIsSource: true) == .offered
+        }
+    }
+
+    private func displayName(_ deviceID: String) -> String {
+        device(deviceID)?.name ?? "The device"
     }
 
     private func startMacSound() {
@@ -1796,11 +1862,8 @@ final class PairingCoordinator: ObservableObject {
         }
         // Transfers bound to the previous peer cannot complete through the feature layer any more.
         if previous != nil { interruptFeatureTransfers() }
-        stopMacSound()
-        androidRinging = false
         remoteBattery = nil
         remoteStorage = nil
-        clearPingStatus()
         quickActions.reset()
         mediaController.reset()
         mediaRemote.reset()
@@ -1845,10 +1908,16 @@ final class PairingCoordinator: ObservableObject {
         "heartbeat.ping", "heartbeat.pong", "features.update",
     ]
 
+    /// MD-3: features that address devices explicitly; consumed from every connected session.
+    private static let deviceAddressedMessageKinds: Set<String> = [
+        "ping.request", "ping.ack", "find.start", "find.stop", "find.started", "find.stopped",
+    ]
+
     private func receive(_ message: PairingMessage, in current: Session) {
         // COMPATIBILITY SEAM: features consume only the routed session. An inactive session stays
         // connected; its feature messages are received by the Core but not consumed yet.
-        guard Self.coreMessageKinds.contains(message.kind) || current === activeSession else {
+        guard Self.coreMessageKinds.contains(message.kind) || Self.deviceAddressedMessageKinds.contains(message.kind)
+                || current === activeSession else {
             if peers.phase(of: current) == .connected {
                 current.unconsumedFeatureMessages += 1
                 if current.unconsumedFeatureMessages == 1 {
@@ -1951,15 +2020,19 @@ final class PairingCoordinator: ObservableObject {
                 if previousCapabilities != capabilities {
                     peerLifecycle.authorizationChanged(deviceIDs: [current.remoteDeviceID])
                 }
+                // MD-3: Ping/Find state of exactly this device follows its own grant.
+                if capabilities[BridgeyFeature.ping.rawValue] == false, pings.deviceEnded(current.remoteDeviceID) {
+                    setTransientPingStatus("Ping is turned off on \(current.peerName)")
+                }
+                if capabilities[BridgeyFeature.findDevice.rawValue] == false, find.deviceEnded(current.remoteDeviceID) {
+                    stopMacSound()
+                }
             case "screenshare.remoteStartResult":
                 NSLog("REMOTE_START result from Android: %@", message.status ?? "unknown")
             case "ping.request":
                 try receivePing(message, in: current)
             case "ping.ack":
-                guard message.sessionId == current.id,
-                      message.messageId == pingRequestID else { return }
-                pingRequestID = nil
-                setTransientPingStatus("Ping delivered")
+                receivePingAcknowledgement(message, in: current)
             case "clipboard.update", "clipboard.rich":
                 guard featureEnabled(.clipboard, current: current) else {
                     current.send(PairingMessage(
@@ -2439,7 +2512,6 @@ final class PairingCoordinator: ObservableObject {
         if remoteFeatures[.memory] == false { remoteMemory = nil }
         if remoteFeatures[.cpu] == false { remoteCpu = nil }
         if remoteFeatures[.temperature] == false { remoteTemperature = nil }
-        if remoteFeatures[.ping] == false { clearPingStatus() }
         if remoteFeatures[.clipboard] == false { clearClipboardSendStatus() }
         if remoteFeatures[.notifications] == false {
             clearRemoteCall()
@@ -2450,10 +2522,6 @@ final class PairingCoordinator: ObservableObject {
         if remoteFeatures[.files] == false && fileTransferActive {
             cancelFileTransfer()
             fileTransferStatus = nil
-        }
-        if remoteFeatures[.findDevice] == false {
-            stopMacSound()
-            androidRinging = false
         }
         flushPendingCallIfPossible()
         publishLocalBattery(force: true)
@@ -2528,13 +2596,13 @@ final class PairingCoordinator: ObservableObject {
     /// Addressed messaging: sends an encrypted feature message to exactly this device's connected
     /// session, independent of the routed (active) peer. False when that device is not connected.
     @discardableResult
-    func send(to deviceID: String, kind: String, payload: Data) -> Bool {
+    func send(to deviceID: String, kind: String, payload: Data, messageID: String = UUID().uuidString.lowercased()) -> Bool {
         peers.deliver(to: deviceID) { session in
             guard let key = session.pairingKey, let encrypted = try? encrypt(payload, key: key) else { return false }
             session.send(PairingMessage(
                 kind: kind,
                 sessionId: session.id,
-                messageId: UUID().uuidString.lowercased(),
+                messageId: messageID,
                 nonce: encrypted.nonce,
                 ciphertext: encrypted.ciphertext
             ))
@@ -3751,4 +3819,20 @@ final class MacIdentity {
     static func deleteForTesting(service: String, account: String = MacIdentity.defaultAccount) {
         SecItemDelete(baseQuery(service: service, account: account) as CFDictionary)
     }
+}
+
+
+/// Bridges per-device lifecycle events to the coordinator's device-addressed features (MD-3).
+private final class FeatureLifecycleHandler: PeerLifecycleObserver {
+    private let started: (String) -> Void
+    private let ended: (String) -> Void
+    private let changed: (String) -> Void
+    init(started: @escaping (String) -> Void, ended: @escaping (String) -> Void, authorizationChanged: @escaping (String) -> Void) {
+        self.started = started
+        self.ended = ended
+        self.changed = authorizationChanged
+    }
+    func sessionStarted(deviceID: String) { started(deviceID) }
+    func sessionEnded(deviceID: String) { ended(deviceID) }
+    func authorizationChanged(deviceID: String) { changed(deviceID) }
 }
