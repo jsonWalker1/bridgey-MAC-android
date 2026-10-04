@@ -1,0 +1,38 @@
+# Features (addons)
+
+A feature is a **package + platform-independent contract**: its protocol payloads, its state
+(including its Peer State), its platform integrations and its UI. It depends on Core APIs only —
+never on sockets, session keys, framing or reconnect — and on other features only through an
+explicit, documented API. Core never knows a feature exists. All features are compiled in and
+composed at startup (no plugin loader, no DI framework).
+
+Target layout per feature: `README.md`, `PROTOCOL.md` (payloads), `android/`, `macos/`, tests.
+
+## Adding a feature
+1. Define its message kinds and payloads (`PROTOCOL.md`); register a permission key.
+2. Use Core messaging (`deviceId`-addressed), never a session object.
+3. Keep remote state keyed by `deviceId`; drop it on Lifecycle events.
+4. Put Android/macOS integrations in the feature's own folders.
+
+## Features and where they live today
+| Feature | Android | macOS | Notes |
+|---|---|---|---|
+| clipboard | `ClipboardPayload.kt`, `ClipboardTileService.kt`, handlers in `PairingCoordinator.kt` | `ClipboardPayload.swift`, handlers in `Pairing.swift` | KVM paste depends on it |
+| files | `ReceivedFileNotifier.kt`, transfer engine in `PairingCoordinator.kt` | `FileTransferWindow.swift`, `FileDropWindow.swift`, transfer engine in `Pairing.swift` | |
+| photos | `PhotoSync.kt`, `PhotoSyncManager.kt` | `PhotosImport.swift` | uses the Files API (`sendSyncAsset`) |
+| notifications | `BridgeyNotificationListenerService.kt` | `NotificationActionRouting.swift`, `NotificationClearAllDetector.swift`, `NotificationIdentity.swift`, `NotificationHistory.swift`, presenter in `Pairing.swift` | state: [BRIDGEY_NOTIFICATIONS_STATE.md](../BRIDGEY_NOTIFICATIONS_STATE.md) |
+| calls | `CallsController.kt`, `RemoteCallRequest.kt` | `Calls.swift`, `CallRequest.swift`, `CallOverlayWindow.swift`, `PhoneURLHandler.swift` | detects calls from notifications (dependency); policy: [sms-call-policy](../docs/sms-call-policy.md) |
+| media | `MediaContinuityManager.kt` | `MediaController.swift`, `MediaRemoteController.swift`, `MediaRemoteView.swift`, `GlobalMediaCommandCenter.swift` | |
+| telemetry | `AndroidCpu/Memory/Storage/Temperature.kt` | `MacBattery/Cpu/Memory/Storage/Temperature.swift` | samples only while the panel is open; state: [BRIDGEY_TELEMETRY_STATE.md](../BRIDGEY_TELEMETRY_STATE.md) |
+| find, ping | handlers in `PairingCoordinator.kt` | handlers in `Pairing.swift` | |
+| screen-share | `ScreenCaptureManager.kt`, `ScreenCaptureService.kt`, `PocketGuard.kt`, `VideoFrameFraming.kt` | `ScreenShareWindow.swift`, `ScreenStreamDecoder.swift`, `VideoFrameFraming.swift`, `VideoContentGeometry.swift` | |
+| kvm | `KvmInputInjector.kt`, `KvmCoordinateMapper.kt`, `KvmCursorOverlay.kt`, `KvmKeyboardSwitcher.kt`, `ScrollGestureAccumulator.kt`, `BridgeyAccessibilityService.kt`, `BridgeyInputMethodService.kt`, codec in `InputTransport.kt` | `KvmGestureRecognizer.swift`, `KvmKeyMapping.swift`, `KvmPointerCalibration.swift`, codec in `InputTransport.swift` | **frozen**; state: [BRIDGEY_KVM_STATE.md](../BRIDGEY_KVM_STATE.md) |
+| handoff/web | `WebHandoff.kt`, `WebHandoffShareActivity.kt`, `WebHandoffToolbarChip.kt`, `WebHandoffPocService.kt` (production despite the name) | — | state: [BRIDGEY_WEB_HANDOFF_STATE.md](../BRIDGEY_WEB_HANDOFF_STATE.md) |
+| handoff/books | `BooksHandoff.kt`, `BooksHandoffTileService.kt` | `BooksAutomation.swift` | |
+| handoff/links | `QuickActions.kt`, `QuickActionsView.kt` | `QuickActions.swift`, `QuickActionsView.swift` | |
+| sharing | — | — | nearby/ephemeral sharing, designed, not implemented |
+
+Feature dependencies today (must stay explicit): photos → files, calls → notifications,
+kvm → clipboard.
+
+Related: [ARCHITECTURE](../ARCHITECTURE.md) · [core](../core/README.md)

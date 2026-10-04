@@ -19,6 +19,28 @@ client can later implement the same public protocol without Android changes.
 > phone call from macOS over the local network. Discovery data is intentionally
 > treated as untrusted.
 
+## Repository guide
+
+Bridgey is a local-first fabric of peer devices: every installation (Mac, Android, future
+platforms) is an equal peer. A small, feature-blind **Core** handles identity, trust, presence,
+secure connections, messaging and authorization; everything users see — clipboard, files,
+notifications, calls, media, screen share, KVM, handoff — is a **feature** built on top.
+
+| Start here | |
+|---|---|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | the system contract: layers, Core boundaries, security model, dependency rules, where new code belongs |
+| [core/](core/README.md) | identity, trust, presence, connection, messaging, authorization, lifecycle |
+| [features/](features/README.md) | every feature, what it owns and where its code lives today |
+| [platform/](platform/README.md) · [app/](app/README.md) · [ui/](ui/README.md) | OS adapters, composition and lifecycle, shell UI |
+| [context/](context/README.md) · [modes/](modes/README.md) | observed facts and user intent (application inputs) |
+| [protocol/](protocol/README.md) | wire contract and test vectors |
+| [docs/](docs/README.md) | cross-cutting docs, status and test reports |
+| [experiments/](experiments/README.md) | research code, never shipped |
+
+The source is being migrated from the platform folders (`android/`, `macos/`) into this domain
+layout; each domain README says where its code lives today. Build and test commands:
+`cd macos && swift test`, `cd android && ./gradlew :app:testDebugUnitTest :app:assembleDebug`.
+
 ## Since forking from singeol/bridgey
 
 This repository diverged from [singeol/bridgey](https://github.com/singeol/bridgey)

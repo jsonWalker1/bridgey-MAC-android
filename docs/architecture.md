@@ -1,5 +1,8 @@
 # Architecture
 
+> **Historical document.** This was the original target design (WebSocket/TLS, plugin registry) plus
+> feature behaviour notes. The authoritative architecture is [ARCHITECTURE.md](../ARCHITECTURE.md).
+
 ## Decisions
 
 **Implementation note (0.6):** the WebSocket/TLS transport and generalized plugin
