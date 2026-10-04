@@ -13,6 +13,8 @@ import Foundation
 //                      said who they are. Sessions are fully independent of each other.
 //   DeviceRouting      the routing/compatibility seam: which connected device today's
 //                      single-peer features use (activePeer). Not a property of any session.
+//   MD-1               addressed delivery (connectedSession/deliver), receive identity
+//                      (connectedDeviceID), DeviceDirectory, PeerLifecycle, DeviceAuthorization.
 //
 // Identity is deviceId + the pinned identity key. Bonjour service name, hostname, IP address, port,
 // platform and deviceType are discovery hints and never identify, trust, route or reconnect a
@@ -312,6 +314,28 @@ final class PeerSessionManager<Session: AnyObject> {
 
     var identifiedSessions: [Session] { entries.values.map(\.session) }
     var pendingSessions: [Session] { pending.map(\.session) }
+
+    /// MD-1 addressing: the session of this device only while it is connected (authenticated).
+    /// Never falls back to another device and never consults the routed (active) peer.
+    func connectedSession(for deviceID: String) -> Session? {
+        guard let entry = entries[deviceID], entry.phase == .connected else { return nil }
+        return entry.session
+    }
+
+    /// MD-1 receive identity: the device a message on this session comes from, only while the
+    /// session is connected. Pending or handshaking sessions have no sender identity yet.
+    func connectedDeviceID(of session: Session) -> String? {
+        guard let id = deviceID(of: session), entries[id]?.phase == .connected else { return nil }
+        return id
+    }
+
+    /// MD-1 addressed delivery: hands exactly the connected session of `deviceID` to `deliver`.
+    /// Returns false (nothing delivered) when that device is not connected.
+    @discardableResult
+    func deliver(to deviceID: String, _ deliver: (Session) -> Bool) -> Bool {
+        guard let session = connectedSession(for: deviceID) else { return false }
+        return deliver(session)
+    }
 }
 
 // MARK: - Routing compatibility seam
@@ -368,6 +392,144 @@ enum ReconnectPlanner {
             // Retries rotate through a device's endpoints, so a stale advert cannot pin every attempt.
             return (id, endpoints[endpointIndex(id) % endpoints.count])
         }
+    }
+}
+
+// MARK: - Device directory (MD-1)
+
+/// Platform hint of a device. Comes from discovery adverts or the trust record's metadata, so it is
+/// descriptive only: it may decide what is *offered*, never who is trusted or what is authorized.
+enum DevicePlatform: String, Equatable {
+    case android
+    case macos
+    case unknown
+
+    init(hint: String?) {
+        self = hint.flatMap { DevicePlatform(rawValue: $0.lowercased()) } ?? .unknown
+    }
+}
+
+/// One device as routing and UI see it. A read-only projection of Trust (name, metadata),
+/// Presence (hints) and the session table (state, capabilities); never a source of truth.
+struct DeviceDirectoryEntry: Equatable {
+    let deviceID: String
+    let name: String
+    let isTrusted: Bool
+    let connection: PeerConnectionState
+    /// The peer's last features.update for the current session (key present = the peer's software
+    /// knows the feature, value = the peer grants it to us). Nil until it arrives.
+    let capabilities: [String: Bool]?
+    let platform: DevicePlatform
+    let deviceType: String?
+    /// The device today's single-peer features use (`activePeer`). Routing only.
+    let isRouted: Bool
+}
+
+enum DeviceDirectory {
+    struct TrustedDevice {
+        let deviceID: String
+        let name: String
+        let platform: String?
+        let deviceType: String?
+    }
+
+    /// Every trusted device plus every connected device, sorted by name. Metadata recorded on an
+    /// authenticated connection wins over live discovery hints (anyone can advertise those); the
+    /// session's announced name wins over the stored name.
+    static func entries(
+        trusted: [TrustedDevice],
+        presence: [String: PeerPresence],
+        connectedNames: [String: String],
+        state: (String) -> PeerConnectionState,
+        capabilities: (String) -> [String: Bool]?,
+        routedDeviceID: String?
+    ) -> [DeviceDirectoryEntry] {
+        let trustedByID = Dictionary(trusted.map { ($0.deviceID, $0) }, uniquingKeysWith: { first, _ in first })
+        let ids = Set(trustedByID.keys).union(connectedNames.keys)
+        return ids.map { id in
+            let record = trustedByID[id]
+            let hints = presence[id]
+            return DeviceDirectoryEntry(
+                deviceID: id,
+                name: connectedNames[id] ?? record?.name ?? hints?.name ?? "Bridgey device",
+                isTrusted: record != nil,
+                connection: state(id),
+                capabilities: capabilities(id),
+                platform: DevicePlatform(hint: record?.platform ?? hints?.platform),
+                deviceType: record?.deviceType ?? hints?.deviceType,
+                isRouted: id == routedDeviceID
+            )
+        }.sorted { ($0.name.lowercased(), $0.deviceID) < ($1.name.lowercased(), $1.deviceID) }
+    }
+}
+
+// MARK: - Per-device lifecycle (MD-1)
+
+/// Per-device lifecycle events for code that keeps per-device state. Explicit methods, no bus.
+protocol PeerLifecycleObserver: AnyObject {
+    func sessionStarted(deviceID: String)
+    func sessionEnded(deviceID: String)
+    /// The local grant for this device or the peer's grant to us (features.update) changed.
+    func authorizationChanged(deviceID: String)
+}
+
+/// Emits per-device lifecycle events, driven by the session table. Events are bound to the session
+/// object: `sessionEnded` is emitted only by the session whose `sessionStarted` was emitted, exactly
+/// once, so an old session ending can never end a newer one and one device never ends another.
+/// If a device's previous session was never reported ended, starting a new one reports it first.
+/// Main thread (PairingCoordinator is @MainActor).
+final class PeerLifecycle {
+    private struct WeakObserver { weak var value: PeerLifecycleObserver? }
+    private var observers: [WeakObserver] = []
+    private var startedSessions: [String: ObjectIdentifier] = [:]
+
+    var startedDeviceIDs: Set<String> { Set(startedSessions.keys) }
+
+    func addObserver(_ observer: PeerLifecycleObserver) {
+        observers.removeAll { $0.value == nil || $0.value === observer }
+        observers.append(WeakObserver(value: observer))
+    }
+
+    func removeObserver(_ observer: PeerLifecycleObserver) {
+        observers.removeAll { $0.value == nil || $0.value === observer }
+    }
+
+    /// `isCurrent` must confirm that `session` is still the connected session of `deviceID`.
+    func sessionStarted(deviceID: String, session: AnyObject, isCurrent: () -> Bool = { true }) {
+        let token = ObjectIdentifier(session)
+        guard isCurrent(), startedSessions[deviceID] != token else { return }
+        if startedSessions[deviceID] != nil { live.forEach { $0.sessionEnded(deviceID: deviceID) } }
+        startedSessions[deviceID] = token
+        live.forEach { $0.sessionStarted(deviceID: deviceID) }
+    }
+
+    func sessionEnded(deviceID: String, session: AnyObject) {
+        guard startedSessions[deviceID] == ObjectIdentifier(session) else { return }
+        startedSessions[deviceID] = nil
+        live.forEach { $0.sessionEnded(deviceID: deviceID) }
+    }
+
+    func authorizationChanged(deviceIDs: Set<String>) {
+        for id in deviceIDs.sorted() { live.forEach { $0.authorizationChanged(deviceID: id) } }
+    }
+
+    private var live: [PeerLifecycleObserver] { observers.compactMap(\.value) }
+}
+
+enum DeviceAuthorization {
+    /// Devices whose local grants changed between two settings snapshots. A global change affects
+    /// every device in `devices`; a per-device change affects only that device. Devices outside
+    /// `devices` (e.g. just forgotten) are never reported.
+    static func changedDevices<Feature: Hashable>(
+        oldGlobal: [Feature: Bool],
+        newGlobal: [Feature: Bool],
+        oldPerDevice: [String: [Feature: Bool]],
+        newPerDevice: [String: [Feature: Bool]],
+        devices: Set<String>
+    ) -> Set<String> {
+        if oldGlobal != newGlobal { return devices }
+        let candidates = Set(oldPerDevice.keys).union(newPerDevice.keys).intersection(devices)
+        return Set(candidates.filter { oldPerDevice[$0] != newPerDevice[$0] })
     }
 }
 

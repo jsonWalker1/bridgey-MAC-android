@@ -294,9 +294,15 @@ final class PairingCoordinator: ObservableObject {
     /// COMPATIBILITY SEAM. Today's features are single-peer, so they use `activeSession`: the session
     /// of the routed device (`DeviceRouting.activePeer`). This is routing only - inactive sessions
     /// stay connected and authenticated and keep their own capabilities. Migrating a feature to
-    /// multi-device means replacing its `activeSession` with `peers.session(for: deviceID)`.
+    /// multi-device means replacing its `activeSession` with `send(to:kind:payload:)` /
+    /// `peers.connectedSession(for:)` and reading the sender with `peers.connectedDeviceID(of:)`.
     private(set) var activePeerID: String?
     private var activeSession: Session? { activePeerID.flatMap { peers.session(for: $0) } }
+    /// MD-1: per-device lifecycle events (session started/ended, authorization changed).
+    let peerLifecycle = PeerLifecycle()
+    private let localPlatform: DevicePlatform
+    private let localDeviceType: String
+    private var authorizationSnapshot: (global: [BridgeyFeature: Bool], perDevice: [String: [BridgeyFeature: Bool]])
     private var failureMessage: String?
     private var discoveryCancellable: AnyCancellable?
     private var settingsCancellable: AnyCancellable?
@@ -365,6 +371,9 @@ final class PairingCoordinator: ObservableObject {
         self.deviceID = local.deviceID
         self.deviceName = local.name
         self.settings = settings
+        authorizationSnapshot = (settings.globalFeatures, settings.deviceFeatures)
+        localPlatform = DevicePlatform(hint: local.platform)
+        localDeviceType = local.deviceType
         let notificationHistoryStore = NotificationHistoryStore()
         self.notificationHistoryStore = notificationHistoryStore
         if settings.notificationHistoryEnabled {
@@ -485,6 +494,7 @@ final class PairingCoordinator: ObservableObject {
                     self.publishLocalBattery(force: true)
                     self.publishLocalStorage(force: true)
                     self.publishLocalMemory(force: true)
+                    self.emitLocalAuthorizationChanges(global: value.0, perDevice: value.1)
                 }
             }
         routingCancellable = settings.$preferredDeviceID.combineLatest(settings.$deviceRoutingMode)
@@ -1714,10 +1724,14 @@ final class PairingCoordinator: ObservableObject {
         current.heartbeatWork?.cancel()
         current.timeoutWork?.cancel()
         let wasActive = current === activeSession
+        // Lifecycle is bound to this session object: only the session that was started ends its
+        // device (a failed pending dial or an older session never ends a newer one).
+        let identifiedDeviceID = peers.deviceID(of: current)
         let deviceID = peers.remove(current)
         current.close()
         if wasActive { interruptFeatureTransfers() }
         recomputeActivePeer()
+        if let identifiedDeviceID { peerLifecycle.sessionEnded(deviceID: identifiedDeviceID, session: current) }
         if scheduleReconnect, let deviceID, registry.trustedDeviceIDs.contains(deviceID) {
             self.scheduleReconnect(deviceID)
         }
@@ -1728,7 +1742,9 @@ final class PairingCoordinator: ObservableObject {
         let (result, displaced) = peers.identify(current, as: remoteID)
         guard result == .identified else {
             NSLog("CONNECT rejecting connection for peer=%@: %@", String(remoteID.prefix(8)), String(describing: result))
+            let identifiedDeviceID = peers.deviceID(of: current)
             peers.remove(current)
+            if let identifiedDeviceID { peerLifecycle.sessionEnded(deviceID: identifiedDeviceID, session: current) }
             current.timeoutWork?.cancel()
             current.close()
             refreshState()
@@ -1930,9 +1946,13 @@ final class PairingCoordinator: ObservableObject {
                 let capabilities = Dictionary(uniqueKeysWithValues: BridgeyFeature.allCases.map {
                     ($0.rawValue, payload.features[$0.rawValue] ?? false)
                 })
+                let previousCapabilities = peers.capabilities(for: current.remoteDeviceID)
                 peers.setCapabilities(capabilities, for: current)
                 // Features: only the routed session's capabilities drive today's single-peer features.
                 if current === activeSession { applyRemoteFeatures(capabilities) }
+                if previousCapabilities != capabilities {
+                    peerLifecycle.authorizationChanged(deviceIDs: [current.remoteDeviceID])
+                }
             case "screenshare.remoteStartResult":
                 NSLog("REMOTE_START result from Android: %@", message.status ?? "unknown")
             case "ping.request":
@@ -2463,8 +2483,72 @@ final class PairingCoordinator: ObservableObject {
             scheduleHeartbeat(for: current)
             if settings.preferredDeviceID == nil { settings.setPreferredDevice(id) }
             recomputeActivePeer()
+            peerLifecycle.sessionStarted(deviceID: id, session: current) { [peers] in peers.connectedSession(for: id) === current }
             NSLog("PAIRING verified peer=%@", current.peerName)
         }
+    }
+
+    // MARK: MD-1 routing foundation (see core/messaging/README.md)
+
+    /// Read-only projection of trusted and connected devices for routing and UI. Identity and trust
+    /// stay in the registry; nothing here can change them.
+    var deviceDirectory: [DeviceDirectoryEntry] {
+        var connectedNames: [String: String] = [:]
+        for session in peers.identifiedSessions {
+            if let id = peers.connectedDeviceID(of: session) { connectedNames[id] = session.peerName }
+        }
+        return DeviceDirectory.entries(
+            trusted: registry.devices.map {
+                DeviceDirectory.TrustedDevice(deviceID: $0.id, name: $0.name, platform: $0.platform, deviceType: $0.deviceType)
+            },
+            presence: registry.presence,
+            connectedNames: connectedNames,
+            state: { [peers] in peers.state(of: $0) },
+            capabilities: { [peers] in peers.capabilities(for: $0) },
+            routedDeviceID: activePeerID
+        )
+    }
+
+    /// Whether `feature` can be offered from this Mac to `deviceID` (platform, direction,
+    /// capability and the local per-device grant).
+    func applicability(of feature: BridgeyFeature, for deviceID: String) -> FeatureApplicabilityResult {
+        guard let peer = deviceDirectory.first(where: { $0.deviceID == deviceID }) else { return .peerLacksCapability }
+        return FeatureApplicability.evaluate(
+            feature,
+            localPlatform: localPlatform,
+            localDeviceType: localDeviceType,
+            peer: peer,
+            locallyAuthorized: settings.isEnabled(feature, for: deviceID)
+        )
+    }
+
+    /// Addressed messaging: sends an encrypted feature message to exactly this device's connected
+    /// session, independent of the routed (active) peer. False when that device is not connected.
+    @discardableResult
+    func send(to deviceID: String, kind: String, payload: Data) -> Bool {
+        peers.deliver(to: deviceID) { session in
+            guard let key = session.pairingKey, let encrypted = try? encrypt(payload, key: key) else { return false }
+            session.send(PairingMessage(
+                kind: kind,
+                sessionId: session.id,
+                messageId: UUID().uuidString.lowercased(),
+                nonce: encrypted.nonce,
+                ciphertext: encrypted.ciphertext
+            ))
+            return true
+        }
+    }
+
+    private func emitLocalAuthorizationChanges(global: [BridgeyFeature: Bool], perDevice: [String: [BridgeyFeature: Bool]]) {
+        let changed = DeviceAuthorization.changedDevices(
+            oldGlobal: authorizationSnapshot.global,
+            newGlobal: global,
+            oldPerDevice: authorizationSnapshot.perDevice,
+            newPerDevice: perDevice,
+            devices: registry.trustedDeviceIDs.union(peers.connectedInOrder.map(\.deviceID))
+        )
+        authorizationSnapshot = (global, perDevice)
+        peerLifecycle.authorizationChanged(deviceIDs: changed)
     }
 
     /// Sends every connected session its real local feature state (per-device settings). Never

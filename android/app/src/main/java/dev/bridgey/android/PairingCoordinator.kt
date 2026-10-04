@@ -170,10 +170,16 @@ class PairingCoordinator(
      * COMPATIBILITY SEAM. Today's features are single-peer, so they use [activeSession]: the session
      * of the routed device ([DeviceRouting.activePeer]). This is routing only - inactive sessions
      * stay connected and authenticated and keep their own capabilities. Migrating a feature to
-     * multi-device means replacing its `activeSession` with `peers.session(deviceId)`.
+     * multi-device means replacing its `activeSession` with [send] (to: deviceId) /
+     * `peers.connectedSession(deviceId)` and reading the sender with `peers.connectedDeviceId(session)`.
      */
     @Volatile private var activePeerId: String? = null
     private val activeSession: Session? get() = activePeerId?.let(peers::session)
+    /** MD-1: per-device lifecycle events (session started/ended, authorization changed). */
+    val peerLifecycle = PeerLifecycle()
+    private val localDeviceType = LocalDevice.deviceTypeFor(appContext.resources.configuration.smallestScreenWidthDp)
+    @Volatile private var authorizationSnapshot: Pair<Map<BridgeyFeature, Boolean>, Map<String, Map<BridgeyFeature, Boolean>>> =
+        settings.state.value.globalFeatures to settings.state.value.deviceFeatures
     private val coreLock = Any()
     @Volatile private var running = false
     @Volatile private var failureMessage: String? = null
@@ -323,6 +329,7 @@ class PairingCoordinator(
                 publishLocalStorage(force = true)
                 publishLocalMemory(force = true)
                 publishLocalTemperature()
+                emitLocalAuthorizationChanges(it)
             }
         }
         // Connectivity locks follow the Core (any connected peer), not the routed feature peer.
@@ -1656,6 +1663,9 @@ class PairingCoordinator(
      */
     private fun endSession(current: Session, reconnect: Reconnect) {
         val wasActive = current === activeSession
+        // Lifecycle is bound to this session object: only the session that was started ends its
+        // device (a failed pending dial or an older session never ends a newer one).
+        val identifiedDeviceId = peers.deviceId(current)
         val deviceId = peers.remove(current)
         current.close()
         if (wasActive) {
@@ -1663,6 +1673,7 @@ class PairingCoordinator(
             mutableFileTransfers.value = recoverInterruptedTransfers(mutableFileTransfers.value)
         }
         recomputeActivePeer()
+        identifiedDeviceId?.let { peerLifecycle.sessionEnded(it, current) }
         if (deviceId == null || deviceId !in registry.trustedDeviceIds()) return
         when (reconnect) {
             Reconnect.NONE -> Unit
@@ -1684,7 +1695,9 @@ class PairingCoordinator(
         val outcome = peers.identify(current, remoteId)
         if (outcome.result != PeerIdentifyResult.IDENTIFIED) {
             android.util.Log.i("Bridgey", "CONNECT rejecting connection for peer=${remoteId.take(8)}: ${outcome.result}")
+            val identifiedDeviceId = peers.deviceId(current)
             peers.remove(current)
+            identifiedDeviceId?.let { peerLifecycle.sessionEnded(it, current) }
             current.close()
             refreshState()
             return false
@@ -2450,9 +2463,86 @@ class PairingCoordinator(
             sendFeatureState(current)
             if (settings.state.value.preferredDeviceId == null) settings.setPreferredDevice(id)
             recomputeActivePeer()
+            peerLifecycle.sessionStarted(id, current) { peers.connectedSession(id) === current }
             android.util.Log.i("Bridgey", "PAIRING verified peer=${current.peerName}")
         }
     }
+
+    // region MD-1 routing foundation (see core/messaging/README.md)
+
+    /**
+     * Read-only projection of trusted and connected devices for routing and UI. Identity and trust
+     * stay in the registry; nothing here can change them.
+     */
+    internal fun deviceDirectory(): List<DeviceDirectoryEntry> {
+        val connectedNames = peers.identifiedSessions().mapNotNull { session ->
+            peers.connectedDeviceId(session)?.let { it to session.peerName }
+        }.toMap()
+        val trusted = registry.trustedDeviceIds().mapNotNull { id ->
+            registry.device(id)?.let { DeviceDirectory.TrustedDevice(it.id, it.name, it.platform, it.deviceType) }
+        }
+        return DeviceDirectory.entries(
+            trusted = trusted,
+            presence = registry.presence(),
+            connectedNames = connectedNames,
+            state = peers::state,
+            capabilities = peers::capabilities,
+            routedDeviceId = activePeerId,
+        )
+    }
+
+    /**
+     * Whether [feature] can be offered from this device to [deviceId] (platform, direction,
+     * capability and the local per-device grant).
+     */
+    internal fun applicability(feature: BridgeyFeature, deviceId: String): FeatureApplicabilityResult {
+        val peer = deviceDirectory().firstOrNull { it.deviceId == deviceId }
+            ?: return FeatureApplicabilityResult.PEER_LACKS_CAPABILITY
+        return FeatureApplicability.evaluate(
+            feature,
+            localPlatform = DevicePlatform.ANDROID,
+            localDeviceType = localDeviceType,
+            peer = peer,
+            locallyAuthorized = settings.isEnabled(feature, deviceId),
+        )
+    }
+
+    /**
+     * Addressed messaging: queues an encrypted feature message on exactly this device's connected
+     * session (its own outbox), independent of the routed (active) peer. False when that device is
+     * not connected.
+     */
+    fun send(to: String, kind: String, payload: ByteArray): Boolean = peers.deliver(to) { session ->
+        val key = session.pairingKey ?: return@deliver false
+        session.outbox.enqueue {
+            val encrypted = Crypto.encrypt(key, payload)
+            session.send(
+                Message(
+                    kind = kind,
+                    sessionId = session.id,
+                    messageId = UUID.randomUUID().toString(),
+                    nonce = encrypted.nonce,
+                    ciphertext = encrypted.ciphertext,
+                ),
+            )
+        }
+        true
+    }
+
+    private fun emitLocalAuthorizationChanges(state: BridgeySettingsState) {
+        val (oldGlobal, oldPerDevice) = authorizationSnapshot
+        val changed = DeviceAuthorization.changedDevices(
+            oldGlobal = oldGlobal,
+            newGlobal = state.globalFeatures,
+            oldPerDevice = oldPerDevice,
+            newPerDevice = state.deviceFeatures,
+            devices = registry.trustedDeviceIds() + peers.connectedInOrder().map { it.deviceId },
+        )
+        authorizationSnapshot = state.globalFeatures to state.deviceFeatures
+        peerLifecycle.authorizationChanged(changed)
+    }
+
+    // endregion
 
     /** Sends every connected session its real local feature state; never depends on the active peer. */
     private fun sendFeatureState() {
@@ -2505,9 +2595,12 @@ class PairingCoordinator(
             values.getBoolean(feature.key)
         }
         // Core: every session keeps its own real negotiated capabilities.
-        peers.setCapabilities(received.mapKeys { it.key.key }, current)
+        val capabilities = received.mapKeys { it.key.key }
+        val previousCapabilities = peers.capabilities(current.remoteDeviceId)
+        peers.setCapabilities(capabilities, current)
         // Features: only the routed session's capabilities drive today's single-peer features.
         if (current === activeSession) applyRemoteFeatures(received)
+        if (previousCapabilities != capabilities) peerLifecycle.authorizationChanged(setOf(current.remoteDeviceId))
     }
 
     /** Mirrors the routed session's capabilities into today's single-peer feature state. */

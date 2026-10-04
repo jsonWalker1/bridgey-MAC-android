@@ -23,6 +23,8 @@ import kotlinx.coroutines.launch
 //                      said who they are. Sessions are fully independent of each other.
 //   DeviceRouting      the routing/compatibility seam: which connected device today's
 //                      single-peer features use (activePeer). Not a property of any session.
+//   MD-1               addressed delivery (connectedSession/deliver), receive identity
+//                      (connectedDeviceId), DeviceDirectory, PeerLifecycle, DeviceAuthorization.
 //
 // Identity is deviceId + the pinned identity key. Service name, hostname, IP address, port,
 // platform and deviceType are discovery hints and never identify, trust, route or reconnect a
@@ -354,6 +356,31 @@ internal class PeerSessionManager<S : Any>(val localDeviceId: String) {
     @Synchronized fun identifiedSessions(): List<S> = entries.values.map { it.session }
     @Synchronized fun pendingSessions(): List<S> = pending.map { it.session }
 
+    /**
+     * MD-1 addressing: the session of this device only while it is connected (authenticated).
+     * Never falls back to another device and never consults the routed (active) peer.
+     */
+    @Synchronized
+    fun connectedSession(deviceId: String): S? =
+        entries[deviceId]?.takeIf { it.phase == PeerSessionPhase.CONNECTED }?.session
+
+    /**
+     * MD-1 receive identity: the device a message on this session comes from, only while the
+     * session is connected. Pending or handshaking sessions have no sender identity yet.
+     */
+    @Synchronized
+    fun connectedDeviceId(session: S): String? =
+        deviceIdLocked(session)?.takeIf { entries[it]?.phase == PeerSessionPhase.CONNECTED }
+
+    /**
+     * MD-1 addressed delivery: hands exactly the connected session of [deviceId] to [deliver]
+     * (outside the lock). False, with nothing delivered, when that device is not connected.
+     */
+    fun deliver(deviceId: String, deliver: (S) -> Boolean): Boolean {
+        val session = connectedSession(deviceId) ?: return false
+        return deliver(session)
+    }
+
     private fun containsLocked(session: S) = pending.any { it.session === session } || entryLocked(session) != null
     private fun entryLocked(session: S) = entries.values.firstOrNull { it.session === session }
     private fun deviceIdLocked(session: S) = entries.entries.firstOrNull { it.value.session === session }?.key
@@ -440,6 +467,161 @@ object DeviceRouting {
         if (stored != null) return stored
         if (migrated || trustedDeviceIds.size != 1) return null
         return trustedDeviceIds.first()
+    }
+}
+
+// endregion
+
+// region Device directory (MD-1)
+
+/**
+ * Platform hint of a device. Comes from discovery adverts or the trust record's metadata, so it is
+ * descriptive only: it may decide what is *offered*, never who is trusted or what is authorized.
+ */
+enum class DevicePlatform(val key: String) {
+    ANDROID("android"),
+    MACOS("macos"),
+    UNKNOWN("unknown"),
+    ;
+
+    companion object {
+        fun fromHint(hint: String?): DevicePlatform =
+            entries.firstOrNull { it != UNKNOWN && it.key == hint?.lowercase() } ?: UNKNOWN
+    }
+}
+
+/**
+ * One device as routing and UI see it. A read-only projection of Trust (name, metadata), Presence
+ * (hints) and the session table (state, capabilities); never a source of truth.
+ */
+internal data class DeviceDirectoryEntry(
+    val deviceId: String,
+    val name: String,
+    val isTrusted: Boolean,
+    val connection: PeerConnectionState,
+    /**
+     * The peer's last features.update for the current session (key present = the peer's software
+     * knows the feature, value = the peer grants it to us). Null until it arrives.
+     */
+    val capabilities: Map<String, Boolean>?,
+    val platform: DevicePlatform,
+    val deviceType: String?,
+    /** The device today's single-peer features use (activePeer). Routing only. */
+    val isRouted: Boolean,
+)
+
+internal object DeviceDirectory {
+    data class TrustedDevice(val deviceId: String, val name: String, val platform: String?, val deviceType: String?)
+
+    /**
+     * Every trusted device plus every connected device, sorted by name. Metadata recorded on an
+     * authenticated connection wins over live discovery hints (anyone can advertise those); the
+     * session's announced name wins over the stored name.
+     */
+    fun entries(
+        trusted: List<TrustedDevice>,
+        presence: Map<String, PeerPresence>,
+        connectedNames: Map<String, String>,
+        state: (String) -> PeerConnectionState,
+        capabilities: (String) -> Map<String, Boolean>?,
+        routedDeviceId: String?,
+    ): List<DeviceDirectoryEntry> {
+        val trustedById = trusted.associateBy { it.deviceId }
+        return (trustedById.keys + connectedNames.keys).map { id ->
+            val record = trustedById[id]
+            val hints = presence[id]
+            DeviceDirectoryEntry(
+                deviceId = id,
+                name = connectedNames[id] ?: record?.name ?: hints?.name ?: "Bridgey device",
+                isTrusted = record != null,
+                connection = state(id),
+                capabilities = capabilities(id),
+                platform = DevicePlatform.fromHint(record?.platform ?: hints?.platform),
+                deviceType = record?.deviceType ?: hints?.deviceType,
+                isRouted = id == routedDeviceId,
+            )
+        }.sortedWith(compareBy({ it.name.lowercase() }, { it.deviceId }))
+    }
+}
+
+// endregion
+
+// region Per-device lifecycle (MD-1)
+
+/** Per-device lifecycle events for code that keeps per-device state. Explicit methods, no bus. */
+interface PeerLifecycleObserver {
+    fun sessionStarted(deviceId: String) {}
+    fun sessionEnded(deviceId: String) {}
+    /** The local grant for this device or the peer's grant to us (features.update) changed. */
+    fun authorizationChanged(deviceId: String) {}
+}
+
+/**
+ * Emits per-device lifecycle events, driven by the session table. Events are bound to the session
+ * object: [sessionEnded] is emitted only by the session whose [sessionStarted] was emitted, exactly
+ * once, so an old session ending can never end a newer one and one device never ends another. If a
+ * device's previous session was never reported ended, starting a new one reports it first.
+ *
+ * Thread-safe and serialized: sessions start and end on different threads (confirm coroutine, read
+ * loops, UI), so every check and every notification runs under one lock, in order. Observers are
+ * called on the emitting thread and must not block; an observer that throws never breaks the Core
+ * or other observers. Observers are held strongly: remove them when their owner goes away.
+ */
+class PeerLifecycle {
+    private val observers = java.util.concurrent.CopyOnWriteArrayList<PeerLifecycleObserver>()
+    private val lock = Any()
+    private val startedSessions = mutableMapOf<String, Any>()
+
+    fun addObserver(observer: PeerLifecycleObserver) {
+        observers.addIfAbsent(observer)
+    }
+
+    fun removeObserver(observer: PeerLifecycleObserver) {
+        observers -= observer
+    }
+
+    fun startedDeviceIds(): Set<String> = synchronized(lock) { startedSessions.keys.toSet() }
+
+    /** [isCurrent] must confirm, under this lock, that [session] is still the connected session of [deviceId]. */
+    fun sessionStarted(deviceId: String, session: Any, isCurrent: () -> Boolean = { true }) = synchronized(lock) {
+        if (!isCurrent() || startedSessions[deviceId] === session) return
+        if (startedSessions.containsKey(deviceId)) notify { it.sessionEnded(deviceId) }
+        startedSessions[deviceId] = session
+        notify { it.sessionStarted(deviceId) }
+    }
+
+    fun sessionEnded(deviceId: String, session: Any) = synchronized(lock) {
+        if (startedSessions[deviceId] !== session) return
+        startedSessions.remove(deviceId)
+        notify { it.sessionEnded(deviceId) }
+    }
+
+    fun authorizationChanged(deviceIds: Set<String>) = synchronized(lock) {
+        deviceIds.sorted().forEach { id -> notify { it.authorizationChanged(id) } }
+    }
+
+    private inline fun notify(event: (PeerLifecycleObserver) -> Unit) {
+        observers.forEach { observer -> runCatching { event(observer) } }
+    }
+}
+
+internal object DeviceAuthorization {
+    /**
+     * Devices whose local grants changed between two settings snapshots. A global change affects
+     * every device in [devices]; a per-device change affects only that device. Devices outside
+     * [devices] (e.g. just forgotten) are never reported.
+     */
+    fun <F> changedDevices(
+        oldGlobal: Map<F, Boolean>,
+        newGlobal: Map<F, Boolean>,
+        oldPerDevice: Map<String, Map<F, Boolean>>,
+        newPerDevice: Map<String, Map<F, Boolean>>,
+        devices: Set<String>,
+    ): Set<String> {
+        if (oldGlobal != newGlobal) return devices
+        return (oldPerDevice.keys + newPerDevice.keys).filterTo(mutableSetOf()) {
+            it in devices && oldPerDevice[it] != newPerDevice[it]
+        }
     }
 }
 
