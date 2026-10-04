@@ -5,7 +5,8 @@ import PackageDescription
 // DOMAIN SOURCE TREE (see ARCHITECTURE.md). SwiftPM only accepts target paths inside the package
 // root, so the package lives at the repository root while macos/ stays the app shell (resources,
 // build and release scripts). Sources are the legacy macos/Sources/BridgeyMac plus
-// features/<feature>/macos for every feature listed below; tests are macos/Tests/BridgeyMacTests
+// features/<feature>/macos for every feature listed below, plus the platform/macos adapter
+// directories listed below; tests are macos/Tests/BridgeyMacTests
 // plus features/<feature>/tests/macos. Everything else in the repository (docs, android/, *.md
 // next to the sources, ...) is excluded so the build stays warning-free.
 //
@@ -14,6 +15,9 @@ import PackageDescription
 
 /// Feature domains that have moved into features/<name>/ (keep in sync with android/app/build.gradle.kts).
 let features = ["calls", "clipboard", "files", "handoff", "media", "notifications", "photos", "screen-share", "telemetry"]
+
+/// Platform adapter directories that have moved into platform/macos/.
+let platformSources = ["platform/macos/transport"]
 
 let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 let fileManager = FileManager.default
@@ -47,7 +51,7 @@ func everythingExcept(_ sources: [String], under relative: String = "") -> [Stri
     }
 }
 
-let appSources = ["macos/Sources/BridgeyMac"] + featureDirectories("macos")
+let appSources = ["macos/Sources/BridgeyMac"] + featureDirectories("macos") + platformSources
 let testSources = ["macos/Tests/BridgeyMacTests"] + featureDirectories("tests/macos")
 
 let package = Package(
