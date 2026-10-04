@@ -24,7 +24,7 @@ Moved features live in `features/<name>/`; the others are still in the platform 
 | Feature | Android | macOS | Notes |
 |---|---|---|---|
 | clipboard | `ClipboardPayload.kt`, `ClipboardTileService.kt`, handlers in `PairingCoordinator.kt` | `ClipboardPayload.swift`, handlers in `Pairing.swift` | KVM paste depends on it |
-| files | `ReceivedFileNotifier.kt`, transfer engine in `PairingCoordinator.kt` | `FileTransferWindow.swift`, `FileDropWindow.swift`, transfer engine in `Pairing.swift` | |
+| [files](files/README.md) | `files/android/` | `files/macos/` | moved (UI and notifier); transfer engines still in the coordinators |
 | photos | `PhotoSync.kt`, `PhotoSyncManager.kt` | `PhotosImport.swift` | uses the Files API (`sendSyncAsset`) |
 | [notifications](notifications/README.md) | `notifications/android/` | `notifications/macos/` | moved; presenter and handlers still in the coordinators; state: [BRIDGEY_NOTIFICATIONS_STATE.md](../BRIDGEY_NOTIFICATIONS_STATE.md) |
 | [calls](calls/README.md) | `calls/android/` | `calls/macos/` | moved; handlers still in the coordinators; detects calls from notifications (dependency) |
