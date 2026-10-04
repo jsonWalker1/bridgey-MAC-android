@@ -10,6 +10,11 @@ Share → "Continue on Mac", the Play Books tile and book payload (`BooksHandoff
 "Find in Books" ([BooksAutomation](macos/BooksAutomation.md)).
 **Does not own:** the quick-action transport and the Mac link/book cards (`QuickActions.*`, still in
 the platform folders — ownership undecided), the connection.
+**Dependencies:** handoff → app on Android: `WebHandoffPocService` starts `BridgeyConnectionService`
+(guarded by `shouldStartConnectionService`) as an Android lifecycle / foreground-service
+workaround — after an update or reboot the accessibility service is the only part Android rebinds,
+and without the connection's foreground service the app is frozen in the background. Quick actions
+↔ handoff: `QuickActions.*` use `validatedWebLink`, `BOOK_PAYLOAD_MAX` and `BooksAutomation`.
 
 ## Code
 | | |

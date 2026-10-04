@@ -12,6 +12,11 @@ Two directions, two message families that never share vocabulary:
 **Owns:** session observation and command execution on each side, the Mac player UI, global
 media-key routing, and the remote player state (this feature's Peer State).
 **Does not own:** the connection, the quick-action transport (`QuickActions.*`, handoff/links).
+**Dependencies:** media → notifications on Android, required by the platform:
+`MediaSessionManager.getActiveSessions` accepts only an enabled notification listener as proof of
+access, so `MediaContinuityManager` passes the `BridgeyNotificationListenerService` component
+(Media Continuity needs notification access). Quick actions ↔ media: `QuickActionsView.swift` uses
+`MediaPlayer` / `MediaController`.
 
 ## Code
 | | |

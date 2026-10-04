@@ -43,7 +43,7 @@ positives would delete live phone notifications). A clear followed by a new noti
 second check is treated as an update.
 
 ## Tests
-`macos/Tests/BridgeyMacTests/NotificationClearAllDetectorTests.swift`.
+`features/notifications/tests/macos/NotificationClearAllDetectorTests.swift`.
 
 ## Related
 [NotificationIdentity](NotificationIdentity.md) · [NotificationActionRouting](NotificationActionRouting.md) ·

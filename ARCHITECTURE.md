@@ -188,7 +188,7 @@ transport framework.
 |---|---|
 | change how devices identify, trust or find each other | `core/identity`, `core/trust`, `core/presence` |
 | change handshake, encryption, heartbeat, reconnect | `core/connection` (+ `core/presence` for planning) |
-| add a user-facing feature | `features/<feature>/` (README + PROTOCOL + `android/` + `macos/`) |
+| add a user-facing feature | `features/<feature>/` (README + `android/` + `macos/` + `tests/android/` + `tests/macos/`; payloads are still documented in `docs/protocol.md`) |
 | add an OS permission or environment signal | `context/` |
 | add a user preference about behaviour | `modes/` (or the owning feature for feature preferences) |
 | add an Android/macOS adapter used by Core | `platform/android`, `platform/macos` |

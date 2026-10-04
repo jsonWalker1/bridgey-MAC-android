@@ -12,6 +12,11 @@ feature re-enable, after an Android Clear All). A Mac stack clear is inferred an
 reconciliation), Mac presentation in Notification Center, Clear-All inference, click routing,
 optional local history, and the mirrored notifications (this feature's Peer State).
 **Does not own:** the connection; call state (calls consumes the dialer's call notifications from here).
+**Dependencies:** notifications ↔ calls on Android — the listener calls back into the calls feature
+(`CallsController`, call-type resolution, `shouldDelayCallPost`) and builds the generic "Open"
+action with `notificationActionCandidates` / `NotificationActionCandidate`, which are defined in
+`features/calls/android/CallsController.kt` and stay there for now. On macOS only calls → notifications.
+Media (Android) uses this feature's listener component as its MediaSession permission token.
 
 ## Code
 | | |

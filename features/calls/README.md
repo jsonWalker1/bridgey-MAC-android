@@ -8,6 +8,10 @@ decline / hang up and audio routing through public telephony APIs, starting a ph
 call state shown on the Mac (this feature's Peer State).
 **Does not own:** notification forwarding — incoming calls are detected from the dialer's ongoing
 `CATEGORY_CALL` notification, so calls **depend on the notifications feature**; the connection.
+**Dependencies:** on Android the dependency is two-way (notifications ↔ calls): the notification
+listener uses `CallsController` and call-type resolution, and the notification-generic
+`notificationActionCandidates` / `NotificationActionCandidate` live in `CallsController.kt` (not
+moved yet). On macOS only calls → notifications (`remoteNotificationRequestIdentifier`).
 
 ## Code
 | | |

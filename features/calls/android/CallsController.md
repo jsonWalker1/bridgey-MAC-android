@@ -39,7 +39,7 @@ Call controls are executed only when the user enabled call integration
 [docs/sms-call-policy.md](../../../docs/sms-call-policy.md).
 
 ## Tests
-`android/app/src/test/java/dev/bridgey/android/CallsControllerTest.kt`.
+`features/calls/tests/android/CallsControllerTest.kt`.
 
 ## Related
 `BridgeyNotificationListenerService.kt` · macOS `Calls.swift` · `BRIDGEY_NOTIFICATIONS_STATE.md`

@@ -37,7 +37,13 @@ Moved features live in `features/<name>/`; the others are still in the platform 
 | quick actions (links, book cards, media requests) | `QuickActions.kt`, `QuickActionsView.kt` | `QuickActions.swift`, `QuickActionsView.swift` | not moved: shared quick-action transport, ownership undecided |
 | sharing | — | — | nearby/ephemeral sharing, designed, not implemented |
 
-Feature dependencies today (must stay explicit): photos → files, calls → notifications,
-kvm → clipboard.
+Feature dependencies today (must stay explicit):
+- photos → files
+- notifications ↔ calls (two-way on Android; calls → notifications only on macOS)
+- media → notifications (Android: notification listener as the MediaSession permission token)
+- kvm → clipboard (paste)
+- kvm → screen-share (`VideoContentGeometry` for click mapping)
+- quick actions ↔ handoff / media (`QuickActions.*` not moved; ownership undecided)
+- handoff → app (Android FGS workaround, see [handoff](handoff/README.md))
 
 Related: [ARCHITECTURE](../ARCHITECTURE.md) · [core](../core/README.md)
