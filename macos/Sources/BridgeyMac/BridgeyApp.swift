@@ -8,6 +8,8 @@ struct BridgeyApp: App {
     @StateObject private var discovery: BonjourDiscovery
     @StateObject private var pairing: PairingCoordinator
     @StateObject private var settings: BridgeySettings
+    /// MD-4: which device the user selected in the panel's device list. UI state only.
+    @StateObject private var deviceSelection = DeviceSelection()
     private let settingsWindow: SettingsWindowController
     private let callServiceProvider: CallServiceProvider
     private let globalMediaCommandCenter: GlobalMediaCommandCenter
@@ -36,6 +38,7 @@ struct BridgeyApp: App {
                 discovery: discovery,
                 pairing: pairing,
                 settings: settings,
+                deviceSelection: deviceSelection,
                 onOpenSettings: settingsWindow.show
             )
         }
@@ -53,21 +56,60 @@ private struct BridgeyPanel: View {
     @ObservedObject var discovery: BonjourDiscovery
     @ObservedObject var pairing: PairingCoordinator
     @ObservedObject var settings: BridgeySettings
+    @ObservedObject var deviceSelection: DeviceSelection
     let onOpenSettings: () -> Void
     @State private var showingDeviceDetails = false
+    /// MD-4c: telemetry is subscribed only while the panel is actually visible. A MenuBarExtra
+    /// window's view can outlive its window, so onChange alone must not resubscribe a closed panel.
+    @State private var panelVisible = false
+
+    /// MD-4: every connected peer from the directory.
+    private var deviceItems: [DeviceListItem] { DeviceList.items(pairing.deviceDirectory) }
+
+    /// MD-4b: the selected peer, kept apart from the peer legacy features are routed through.
+    private var context: SelectedDeviceContext {
+        SelectedDeviceContext.make(
+            items: deviceItems,
+            selectedDeviceID: deviceSelection.selectedDeviceID,
+            routedDeviceID: pairing.deviceDirectory.first(where: \.isRouted)?.deviceID
+        )
+    }
 
     var body: some View {
         MenuBarPanelSurface {
             panelContent
         }
         .onAppear {
+            panelVisible = true
             pairing.refreshNotificationAuthorization()
-            pairing.requestRemoteTelemetryUpdates()
+            deviceSelection.reconcile(with: deviceItems)
+            showSelectedTelemetry()
         }
-        .onDisappear { pairing.stopRequestingRemoteTelemetryUpdates() }
+        // MD-4c: telemetry is subscribed only while the panel is open, and only for the shown peer.
+        .onDisappear {
+            panelVisible = false
+            pairing.showTelemetry(for: nil)
+        }
         .onChange(of: isConnected) { connected in
             if !connected { showingDeviceDetails = false }
         }
+        .onChange(of: pairing.deviceDirectoryRevision) { _ in
+            deviceSelection.reconcile(with: deviceItems)
+            showSelectedTelemetry()
+        }
+        .onChange(of: pairing.state) { _ in
+            deviceSelection.reconcile(with: deviceItems)
+            showSelectedTelemetry()
+        }
+        .onChange(of: deviceSelection.selectedDeviceID) { _ in
+            showingDeviceDetails = false
+            showSelectedTelemetry()
+        }
+    }
+
+    /// The panel shows the selected peer's telemetry (nothing when no peer is selected).
+    private func showSelectedTelemetry() {
+        pairing.showTelemetry(for: panelVisible ? context.selected?.deviceID : nil)
     }
 
     private var panelContent: some View {
@@ -90,13 +132,18 @@ private struct BridgeyPanel: View {
             if !settings.hasCompletedOnboarding {
                 welcomeCard
             } else {
-                switch pairing.state {
-                case let .connected(_, name):
-                    if showingDeviceDetails { deviceDetailsView(name: name) } else { connectedCard(name: name) }
-                case let .connecting(name): statusCard(title: "Connecting to \(name)", detail: "Establishing a secure session…", progress: true)
-                case let .verification(name, code): verificationCard(name: name, code: code)
-                case let .failed(message): failureCard(message)
-                case .idle: nearbyDevices
+                if case let .verification(name, code) = pairing.state {
+                    verificationCard(name: name, code: code)
+                }
+                if !deviceItems.isEmpty {
+                    deviceShell
+                } else {
+                    switch pairing.state {
+                    case .connected, .verification: EmptyView()
+                    case let .connecting(name): statusCard(title: "Connecting to \(name)", detail: "Establishing a secure session…", progress: true)
+                    case let .failed(message): failureCard(message)
+                    case .idle: nearbyDevices
+                    }
                 }
             }
 
@@ -124,32 +171,83 @@ private struct BridgeyPanel: View {
         .padding(16)
     }
 
-    private var isConnected: Bool {
-        if case .connected = pairing.state { return true }
-        return false
-    }
+    /// Any peer connected (peer-centric: no single "connected device").
+    private var isConnected: Bool { !deviceItems.isEmpty }
 
     private var headerSubtitle: String {
-        if case .connected = pairing.state { return "Connected securely" }
-        return "Ready on your local network"
+        switch deviceItems.count {
+        case 0: "Ready on your local network"
+        case 1: "Connected securely"
+        default: "\(deviceItems.count) devices connected"
+        }
+    }
+
+    /// MD-4b device-centric shell: the peers, the selected peer's card, and where legacy
+    /// single-peer features currently go. The selected peer never shows another peer's state.
+    @ViewBuilder
+    private var deviceShell: some View {
+        if deviceItems.count > 1 && !showingDeviceDetails {
+            DeviceListSection(items: deviceItems, selection: deviceSelection)
+        }
+        if let selected = context.selected {
+            if showingDeviceDetails {
+                deviceDetailsView(device: selected)
+            } else {
+                connectedCard(device: selected, legacy: context.legacyFeaturesApply)
+            }
+        } else {
+            Text("Select a device to see it and act on it.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        if pairing.macRinging {
+            Button { pairing.stopLocalRinging() } label: { Label("Silence this Mac", systemImage: "speaker.slash") }
+                .buttonStyle(.plain).font(.caption).foregroundStyle(Color.accentColor)
+        }
+        if let routed = context.legacyFeaturesUseOtherPeer {
+            legacyRoutingRow(routed: routed, selected: context.selected)
+        }
+    }
+
+    /// Explains the compatibility routing of features that are not multi-device yet, and offers the
+    /// explicit switch (`setPreferredDevice`). Selection and routing stay separate.
+    private func legacyRoutingRow(routed: DeviceListItem, selected: DeviceListItem?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Files, clipboard, media, calls, links and screen share currently use \(routed.name).")
+                .font(.caption).foregroundStyle(.secondary)
+            if let selected {
+                Button("Use \(selected.name) for these features") { settings.setPreferredDevice(selected.deviceID) }
+                    .buttonStyle(.plain).font(.caption).foregroundStyle(Color.accentColor)
+                if pairing.fileTransferActive {
+                    Text("Switching stops the file transfer in progress.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 
     @ViewBuilder
-    private func connectedCard(name: String) -> some View {
+    /// The selected peer's card. Its identity comes from the directory; `legacy` sections (state of
+    /// features that still use the routed peer) appear only when this peer IS the routed peer.
+    private func connectedCard(device: DeviceListItem, legacy: Bool) -> some View {
+        // MD-4c: telemetry is this peer's own (per-device), shown whether or not it is routed.
+        let deviceTelemetry = pairing.telemetry[device.deviceID]
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .fill(Color.accentColor.gradient)
-                    Image(systemName: "smartphone")
+                    Image(systemName: device.systemImage)
                         .font(.system(size: 20, weight: .medium))
                         .foregroundStyle(.white)
                 }
                 .frame(width: 46, height: 46)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(name).font(.headline).lineLimit(1)
-                    if pairing.isFeatureAvailable(.battery) {
-                        if let battery = pairing.remoteBattery {
+                    Text(device.name).font(.headline).lineLimit(1)
+                    if !device.detail.isEmpty {
+                        Text(device.detail).font(.caption2).foregroundStyle(.secondary)
+                    }
+                    if pairing.isTelemetryAvailable(.battery, for: device.deviceID) {
+                        if let battery = deviceTelemetry?.battery {
                             Label(
                                 "\(battery.level)%\(battery.isCharging ? " · Charging" : "")",
                                 systemImage: battery.isCharging ? "battery.100percent.bolt" : batterySymbol(battery.level)
@@ -160,8 +258,8 @@ private struct BridgeyPanel: View {
                             Text("Waiting for battery status…").font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    if pairing.isFeatureAvailable(.storage) {
-                        if let storage = pairing.remoteStorage {
+                    if pairing.isTelemetryAvailable(.storage, for: device.deviceID) {
+                        if let storage = deviceTelemetry?.storage {
                             let freeBytes = max(storage.totalBytes - storage.usedBytes, 0)
                             Label(
                                 "\(formattedByteCount(freeBytes)) free",
@@ -173,18 +271,18 @@ private struct BridgeyPanel: View {
                             Text("Waiting for storage status…").font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    if pairing.isFeatureAvailable(.memory), let memory = pairing.remoteMemory {
+                    if pairing.isTelemetryAvailable(.memory, for: device.deviceID), let memory = deviceTelemetry?.memory {
                         let freeBytes = max(memory.totalBytes - memory.usedBytes, 0)
                         Text("🧠 \(formattedByteCount(freeBytes)) free")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    if pairing.isFeatureAvailable(.cpu), case .available(let percent) = pairing.remoteCpu {
+                    if pairing.isTelemetryAvailable(.cpu, for: device.deviceID), case .available(let percent) = deviceTelemetry?.cpu {
                         Text("⚙ \(percent)% CPU")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    if pairing.isFeatureAvailable(.temperature), case .known(let thermalState, let celsius) = pairing.remoteTemperature {
+                    if pairing.isTelemetryAvailable(.temperature, for: device.deviceID), case .known(let thermalState, let celsius) = deviceTelemetry?.temperature {
                         let (label, _) = thermalDisplayLabel(thermalState)
                         Text(celsius.map { "🌡 \($0)°C" } ?? "🌡 \(label)")
                             .font(.caption)
@@ -196,15 +294,15 @@ private struct BridgeyPanel: View {
                     Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
                 }
                 .buttonStyle(.plain)
-                .help("Device details")
-                Button { pairing.dismiss() } label: { Image(systemName: "xmark.circle.fill") }
+                .help("\(device.name) details")
+                Button { pairing.disconnect(deviceID: device.deviceID) } label: { Image(systemName: "xmark.circle.fill") }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
-                    .disabled(pairing.fileTransferActive)
-                    .help("Disconnect")
+                    .disabled(legacy && pairing.fileTransferActive)
+                    .help("Disconnect \(device.name)")
             }
 
-            if let call = pairing.remoteCall {
+            if legacy, let call = pairing.remoteCall {
                 VStack(alignment: .leading, spacing: 8) {
                     Label(remoteCallStatusTitle(call.type), systemImage: "phone.arrow.down.left.fill")
                         .font(.headline)
@@ -232,37 +330,43 @@ private struct BridgeyPanel: View {
                 .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
 
-            if pairing.isFeatureAvailable(.media) {
+            if legacy && pairing.isFeatureAvailable(.media) {
                 MediaRemoteCard(media: pairing.mediaRemote)
             }
 
             LazyVGrid(columns: quickActionColumns, spacing: 8) {
-                if pairing.isFeatureAvailable(.clipboard) {
+                if legacy && pairing.isFeatureAvailable(.clipboard) {
                     actionButton("Clipboard", icon: "doc.on.clipboard") { pairing.sendClipboard() }
                 }
-                if pairing.isFeatureAvailable(.files) {
+                if legacy && pairing.isFeatureAvailable(.files) {
                     actionButton("File", icon: "paperplane") { pairing.chooseAndSendFile() }
                 }
-                if !findTargets.isEmpty || pairing.macRinging || !pairing.find.remoteRinging.isEmpty {
-                    findButton
+                // MD-3/4b: Ping and Find act on this peer itself.
+                if pairing.find.isRinging(device.deviceID) {
+                    actionButton("Stop", icon: "stop.circle") { pairing.stopFinding(device.deviceID) }
+                } else if isEligible(device, for: .findDevice) {
+                    actionButton("Ring", icon: "bell") { pairing.startFinding(device.deviceID) }
+                        .help("Ring \(device.name)")
                 }
-                if !pingTargets.isEmpty {
-                    devicePicker("Ping", icon: "wave.3.right", targets: pingTargets) { pairing.sendPing(to: $0) }
-                        .help("Play a short alert on a connected device")
+                if isEligible(device, for: .ping) {
+                    actionButton("Ping", icon: "wave.3.right") { pairing.sendPing(to: device.deviceID) }
+                        .help("Play a short alert on \(device.name)")
                 }
-                if pairing.isFeatureAvailable(.calls) {
+                if legacy && pairing.isFeatureAvailable(.calls) {
                     actionButton("Call", icon: "phone.arrow.up.right") { pairing.sendCallFromClipboard() }
                         .help("Call the phone number currently in the clipboard")
                 }
-                if pairing.isFeatureAvailable(.links) {
+                if legacy && pairing.isFeatureAvailable(.links) {
                     actionButton("Link", icon: "link") { pairing.quickActions.sendClipboardLink() }
                 }
                 // M2: no BridgeyFeature gate yet (that lands in M3, matching the video channel
                 // itself) - the window shows "waiting for stream" until Android actually starts one.
-                actionButton("Screen", icon: "rectangle.on.rectangle") { pairing.showScreenShareWindow() }
+                if legacy {
+                    actionButton("Screen", icon: "rectangle.on.rectangle") { pairing.showScreenShareWindow() }
+                }
             }
-            QuickActionsPanel(actions: pairing.quickActions)
-            if pairing.isFeatureAvailable(.files) {
+            if legacy { QuickActionsPanel(actions: pairing.quickActions) }
+            if legacy && pairing.isFeatureAvailable(.files) {
                 Button { pairing.showFileDropWindow() } label: {
                     Label(
                         L10n.text("drop.open", fallback: "Open file drop window"),
@@ -285,22 +389,23 @@ private struct BridgeyPanel: View {
                     )
                     .accessibilityHint("Opens a window that stays visible while you drag a file from Finder")
             }
-            if !pairing.isFeatureAvailable(.clipboard) &&
+            if legacy &&
+                !pairing.isFeatureAvailable(.clipboard) &&
                 !pairing.isFeatureAvailable(.files) &&
-                findTargets.isEmpty &&
-                pingTargets.isEmpty &&
+                !isEligible(device, for: .findDevice) &&
+                !isEligible(device, for: .ping) &&
                 !pairing.isFeatureAvailable(.links) &&
                 !pairing.isFeatureAvailable(.calls) {
                 Text("Quick actions are turned off in Settings on one of your devices.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            if let status = pairing.clipboardStatus {
+            if legacy, let status = pairing.clipboardStatus {
                 Label(status, systemImage: status == "Delivered" ? "checkmark.circle.fill" : "clock")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if let status = pairing.callStatus {
+            if legacy, let status = pairing.callStatus {
                 Label(status, systemImage: status == "Call started on Android" ? "phone.fill" : "phone.badge.clock")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -346,70 +451,9 @@ private struct BridgeyPanel: View {
         .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
-    // MD-3: Ping and Find address a device explicitly. One eligible device: a plain button; several:
-    // a menu of their display names.
-    private var findTargets: [DeviceDirectoryEntry] { pairing.targets(for: .findDevice) }
-    private var pingTargets: [DeviceDirectoryEntry] { pairing.targets(for: .ping) }
-
-    @ViewBuilder
-    private var findButton: some View {
-        let anyRinging = pairing.macRinging || !pairing.find.remoteRinging.isEmpty
-        if findTargets.count <= 1 {
-            actionButton(anyRinging ? "Stop" : "Ring", icon: anyRinging ? "stop.circle" : "bell") {
-                if anyRinging { pairing.stopFinding() } else if let target = findTargets.first { pairing.startFinding(target.deviceID) }
-            }
-        } else {
-            Menu {
-                if pairing.macRinging {
-                    Button("Silence this Mac") { pairing.stopLocalRinging() }
-                }
-                ForEach(findTargets, id: \.deviceID) { target in
-                    if pairing.find.isRinging(target.deviceID) {
-                        Button("Stop \(target.name)") { pairing.stopFinding(target.deviceID) }
-                    } else {
-                        Button("Ring \(target.name)") { pairing.startFinding(target.deviceID) }
-                    }
-                }
-            } label: {
-                actionLabel(anyRinging ? "Stop" : "Ring", icon: anyRinging ? "stop.circle" : "bell")
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .background(.background.opacity(0.8), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        }
-    }
-
-    @ViewBuilder
-    private func devicePicker(
-        _ title: String,
-        icon: String,
-        targets: [DeviceDirectoryEntry],
-        action: @escaping (String) -> Void
-    ) -> some View {
-        if targets.count == 1, let target = targets.first {
-            actionButton(title, icon: icon) { action(target.deviceID) }
-        } else {
-            Menu {
-                ForEach(targets, id: \.deviceID) { target in
-                    Button(target.name) { action(target.deviceID) }
-                }
-            } label: {
-                actionLabel(title, icon: icon)
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .background(.background.opacity(0.8), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        }
-    }
-
-    private func actionLabel(_ title: String, icon: String) -> some View {
-        VStack(spacing: 5) {
-            Image(systemName: icon).font(.system(size: 16, weight: .medium))
-            Text(title).font(.caption2)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 9)
-        .contentShape(Rectangle())
+    /// Whether the feature is offered from this Mac to that peer (MD-2 applicability).
+    private func isEligible(_ device: DeviceListItem, for feature: FeatureApplicability.Feature) -> Bool {
+        pairing.targets(for: feature).contains { $0.deviceID == device.deviceID }
     }
 
     private func actionButton(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
@@ -428,8 +472,10 @@ private struct BridgeyPanel: View {
         .accessibilityHint("Runs the \(title.lowercased()) action for the connected device")
     }
 
+    /// MD-4c: details of the selected peer's own telemetry.
     @ViewBuilder
-    private func deviceDetailsView(name: String) -> some View {
+    private func deviceDetailsView(device: DeviceListItem) -> some View {
+        let deviceTelemetry = pairing.telemetry[device.deviceID]
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
                 Button { showingDeviceDetails = false } label: {
@@ -437,14 +483,14 @@ private struct BridgeyPanel: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
-                Text(name).font(.headline).lineLimit(1)
+                Text(device.name).font(.headline).lineLimit(1)
                 Spacer()
             }
 
-            if pairing.isFeatureAvailable(.storage) {
+            if pairing.isTelemetryAvailable(.storage, for: device.deviceID) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Storage").font(.subheadline.weight(.semibold))
-                    if let storage = pairing.remoteStorage {
+                    if let storage = deviceTelemetry?.storage {
                         ProgressView(value: Double(storage.usedBytes), total: Double(max(storage.totalBytes, 1)))
                         Text("\(formattedByteCount(storage.usedBytes)) used of \(formattedByteCount(storage.totalBytes))")
                             .font(.caption)
@@ -457,10 +503,10 @@ private struct BridgeyPanel: View {
                 }
             }
 
-            if pairing.isFeatureAvailable(.memory) {
+            if pairing.isTelemetryAvailable(.memory, for: device.deviceID) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Memory").font(.subheadline.weight(.semibold))
-                    if let memory = pairing.remoteMemory {
+                    if let memory = deviceTelemetry?.memory {
                         ProgressView(value: Double(memory.usedBytes), total: Double(max(memory.totalBytes, 1)))
                         Text("\(formattedByteCount(memory.usedBytes)) used of \(formattedByteCount(memory.totalBytes))")
                             .font(.caption)
@@ -473,10 +519,10 @@ private struct BridgeyPanel: View {
                 }
             }
 
-            if pairing.isFeatureAvailable(.cpu) {
+            if pairing.isTelemetryAvailable(.cpu, for: device.deviceID) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("CPU").font(.subheadline.weight(.semibold))
-                    switch pairing.remoteCpu {
+                    switch deviceTelemetry?.cpu {
                     case .available(let percent):
                         ProgressView(value: Double(percent), total: 100)
                         Text("\(percent)%").font(.caption)
@@ -488,10 +534,10 @@ private struct BridgeyPanel: View {
                 }
             }
 
-            if pairing.isFeatureAvailable(.temperature) {
+            if pairing.isTelemetryAvailable(.temperature, for: device.deviceID) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Temperature").font(.subheadline.weight(.semibold))
-                    switch pairing.remoteTemperature {
+                    switch deviceTelemetry?.temperature {
                     case .known(let thermalState, let celsius):
                         let (label, _) = thermalDisplayLabel(thermalState)
                         Text(celsius.map { "🌡 \($0)°C" } ?? "🌡 \(label)").font(.caption)

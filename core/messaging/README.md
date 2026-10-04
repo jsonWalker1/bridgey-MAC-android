@@ -72,10 +72,12 @@ inactive-peer gate from every connected session (`deviceAddressedMessageKinds`).
 target-less entry points (`sendPing()` from the keyboard shortcut, `findAndroid()` / `findMac()`)
 remain as compatibility paths that name the routed device explicitly.
 
+**Migrated (MD-4c):** [telemetry](../../features/telemetry/README.md) (battery, storage, memory,
+CPU, temperature) is per peer in both directions.
+
 **Still on `activeSession`:** clipboard, files, photo sync, notifications (forwarding, actions,
 dismiss, Clear All), calls, media (both directions), quick actions / links / Web and Books Handoff,
-telemetry and battery, screen share / Remote Start (video channel providers) and KVM (input
-channel, frozen). The inactive-peer gate in `receive` still drops their messages from non-routed
+screen share / Remote Start (video channel providers) and KVM (input channel, frozen). The inactive-peer gate in `receive` still drops their messages from non-routed
 devices.
 
 ## Invariants (target)

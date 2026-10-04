@@ -57,9 +57,11 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -478,11 +480,7 @@ private fun BridgeyApp(
     val fileTransfers by pairing.fileTransfers.collectAsStateWithLifecycle()
     val phoneRinging by pairing.phoneRinging.collectAsStateWithLifecycle()
     val remoteRinging by pairing.remoteRinging.collectAsStateWithLifecycle()
-    val remoteBattery by pairing.remoteBattery.collectAsStateWithLifecycle()
-    val remoteStorage by pairing.remoteStorage.collectAsStateWithLifecycle()
-    val remoteMemory by pairing.remoteMemory.collectAsStateWithLifecycle()
-    val remoteCpu by pairing.remoteCpu.collectAsStateWithLifecycle()
-    val remoteTemperature by pairing.remoteTemperature.collectAsStateWithLifecycle()
+    val telemetry by pairing.telemetry.collectAsStateWithLifecycle()
     val pingStatus by pairing.pingStatus.collectAsStateWithLifecycle()
     val trustedDevices by pairing.trustedDevices.collectAsStateWithLifecycle()
     val remoteFeatures by pairing.remoteFeatures.collectAsStateWithLifecycle()
@@ -491,15 +489,21 @@ private fun BridgeyApp(
     val directoryRevision by pairing.deviceDirectoryRevision.collectAsStateWithLifecycle()
     val pingTargets = directoryRevision.let { pairing.targets(FeatureApplicability.Feature.PING).map { it.deviceId to it.name } }
     val findTargets = directoryRevision.let { pairing.targets(FeatureApplicability.Feature.FIND_DEVICE).map { it.deviceId to it.name } }
+    // MD-4: every connected device, and the user's selection (UI state only, never routing).
+    val deviceItems = directoryRevision.let { DeviceList.items(pairing.deviceDirectory()) }
+    var selectedDeviceId by rememberSaveable { mutableStateOf<String?>(null) }
+    val selection = DeviceList.reconcile(selectedDeviceId, deviceItems)
+    LaunchedEffect(selection) { selectedDeviceId = selection }
     val settingsState by settings.state.collectAsStateWithLifecycle()
     var permissionPrompt by remember { mutableStateOf<PermissionPrompt?>(null) }
     var showingSettings by remember { mutableStateOf(false) }
 
     // Battery-conscious: telemetry (storage/memory/CPU) is only sampled/sent while this screen is
     // actually visible - opening the app subscribes, backgrounding it unsubscribes immediately.
-    LifecycleStartEffect(Unit) {
-        pairing.requestRemoteTelemetryUpdates()
-        onStopOrDispose { pairing.stopRequestingRemoteTelemetryUpdates() }
+    // MD-4c: the subscription is for the selected peer only, and follows the selection.
+    LifecycleStartEffect(selection) {
+        pairing.showTelemetry(selection)
+        onStopOrDispose { pairing.showTelemetry(null) }
     }
 
     Scaffold(
@@ -579,11 +583,12 @@ private fun BridgeyApp(
                 remoteRinging = remoteRinging,
                 pingTargets = pingTargets,
                 findTargets = findTargets,
-                remoteBattery = remoteBattery,
-                remoteStorage = remoteStorage,
-                remoteMemory = remoteMemory,
-                remoteCpu = remoteCpu,
-                remoteTemperature = remoteTemperature,
+                deviceItems = deviceItems,
+                selectedDeviceId = selection,
+                onSelectDevice = { selectedDeviceId = if (selection == it) null else it },
+                // Changes the legacy routed peer only; the selection is untouched.
+                onUseForFeatures = { settings.setPreferredDevice(it) },
+                telemetry = telemetry,
                 pingStatus = pingStatus,
                 enabledFeatures = BridgeyFeature.entries.associateWith { feature ->
                     settings.isEnabled(feature, (pairingState as? PairingState.Connected)?.deviceId) &&
@@ -1062,11 +1067,11 @@ private fun DeviceScreen(
     remoteRinging: Set<String>,
     pingTargets: List<Pair<String, String>>,
     findTargets: List<Pair<String, String>>,
-    remoteBattery: RemoteBatteryStatus?,
-    remoteStorage: RemoteStorageStatus?,
-    remoteMemory: RemoteMemoryStatus?,
-    remoteCpu: RemoteCpuStatus?,
-    remoteTemperature: RemoteTemperatureStatus?,
+    deviceItems: List<DeviceListItem>,
+    selectedDeviceId: String?,
+    onSelectDevice: (String) -> Unit,
+    onUseForFeatures: (String) -> Unit,
+    telemetry: Map<String, DeviceTelemetry>,
     pingStatus: String?,
     enabledFeatures: Map<BridgeyFeature, Boolean>,
     pairing: PairingCoordinator,
@@ -1090,42 +1095,69 @@ private fun DeviceScreen(
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        val connected = pairingState as? PairingState.Connected
-        if (connected != null) {
-            item {
-                ConnectedDeviceCard(
-                    name = connected.peerName,
-                    clipboardStatus = clipboardStatus,
-                    phoneRinging = phoneRinging,
-                    remoteRinging = remoteRinging,
-                    pingTargets = pingTargets,
-                    findTargets = findTargets,
-                    remoteBattery = remoteBattery,
-                    remoteStorage = remoteStorage,
-                    remoteMemory = remoteMemory,
-                    remoteCpu = remoteCpu,
-                    remoteTemperature = remoteTemperature,
-                    storageEnabled = enabledFeatures[BridgeyFeature.STORAGE] != false,
-                    memoryEnabled = enabledFeatures[BridgeyFeature.MEMORY] != false,
-                    cpuEnabled = enabledFeatures[BridgeyFeature.CPU] != false,
-                    temperatureEnabled = enabledFeatures[BridgeyFeature.TEMPERATURE] != false,
-                    pingStatus = pingStatus,
-                    clipboardEnabled = enabledFeatures[BridgeyFeature.CLIPBOARD] != false,
-                    filesEnabled = enabledFeatures[BridgeyFeature.FILES] != false,
-                    onClipboard = pairing::sendClipboard,
-                    onFile = { filePicker.launch(arrayOf("*/*")) },
-                    onRing = { pairing.startFinding(it) },
-                    onStopRing = pairing::stopFinding,
-                    onPing = { pairing.sendPing(it) },
-                )
+        // MD-4b device-centric shell: the peers, the selected peer's card, and where legacy single-peer
+        // features currently go. The selected peer never shows another peer's feature state.
+        val context = SelectedDeviceContext.make(
+            deviceItems,
+            selectedDeviceId,
+            pairing.deviceDirectory().firstOrNull { it.isRouted }?.deviceId,
+        )
+        val legacy = context.legacyFeaturesApply
+        if (deviceItems.isNotEmpty()) {
+            if (deviceItems.size > 1) item { DeviceListSection(deviceItems, selectedDeviceId, onSelectDevice) }
+            val selected = context.selected
+            if (selected == null) {
+                item { Text("Select a device to see it and act on it.", style = MaterialTheme.typography.bodySmall) }
+            } else {
+                item {
+                    ConnectedDeviceCard(
+                        device = selected,
+                        legacy = legacy,
+                        clipboardStatus = if (legacy) clipboardStatus else null,
+                        phoneRinging = phoneRinging,
+                        remoteRinging = remoteRinging,
+                        pingEligible = pingTargets.any { it.first == selected.deviceId },
+                        findEligible = findTargets.any { it.first == selected.deviceId },
+                        // MD-4c: telemetry is this peer's own, whether or not it is the routed peer.
+                        remoteBattery = telemetry[selected.deviceId]?.battery,
+                        remoteStorage = telemetry[selected.deviceId]?.storage,
+                        remoteMemory = telemetry[selected.deviceId]?.memory,
+                        remoteCpu = telemetry[selected.deviceId]?.cpu,
+                        remoteTemperature = telemetry[selected.deviceId]?.temperature,
+                        storageEnabled = pairing.isTelemetryAvailable(TelemetryMetric.STORAGE, selected.deviceId),
+                        memoryEnabled = pairing.isTelemetryAvailable(TelemetryMetric.MEMORY, selected.deviceId),
+                        cpuEnabled = pairing.isTelemetryAvailable(TelemetryMetric.CPU, selected.deviceId),
+                        temperatureEnabled = pairing.isTelemetryAvailable(TelemetryMetric.TEMPERATURE, selected.deviceId),
+                        pingStatus = pingStatus,
+                        clipboardEnabled = legacy && enabledFeatures[BridgeyFeature.CLIPBOARD] != false,
+                        filesEnabled = legacy && enabledFeatures[BridgeyFeature.FILES] != false,
+                        onClipboard = pairing::sendClipboard,
+                        onFile = { filePicker.launch(arrayOf("*/*")) },
+                        onRing = { pairing.startFinding(it) },
+                        onStopRing = { pairing.stopFinding(it) },
+                        onSilenceThisPhone = pairing::stopLocalRinging,
+                        onPing = { pairing.sendPing(it) },
+                        onDisconnect = { pairing.disconnect(it) },
+                    )
+                }
             }
-            if (enabledFeatures[BridgeyFeature.LINKS] == true || enabledFeatures[BridgeyFeature.MEDIA] == true) {
+            context.legacyFeaturesUseOtherPeer?.let { routed ->
+                item {
+                    LegacyRoutingRow(
+                        routedName = routed.name,
+                        selected = context.selected,
+                        transferActive = fileTransfers.values.any { it.active },
+                        onUseForFeatures = onUseForFeatures,
+                    )
+                }
+            }
+            if (legacy && (enabledFeatures[BridgeyFeature.LINKS] == true || enabledFeatures[BridgeyFeature.MEDIA] == true)) {
                 item {
                     QuickActionsCard(pairing.quickActions, enabledFeatures[BridgeyFeature.LINKS] == true,
                         enabledFeatures[BridgeyFeature.MEDIA] == true)
                 }
             }
-            item {
+            if (legacy) item {
                 ServiceCard(
                     enabled = screenSharing,
                     title = "Screen sharing",
@@ -1134,7 +1166,7 @@ private fun DeviceScreen(
                     onClick = if (screenSharing) onStopScreenShare else onRequestScreenShare,
                 )
             }
-            if (screenSharing && pocketModeSettingEnabled) {
+            if (legacy && screenSharing && pocketModeSettingEnabled) {
                 item {
                     ServiceCard(
                         enabled = false,
@@ -1168,7 +1200,8 @@ private fun DeviceScreen(
             }
         }
 
-        val visiblePeers = peers.filter { it.deviceIdHint != connected?.deviceId }
+        val connectedIds = deviceItems.map { it.deviceId }.toSet()
+        val visiblePeers = peers.filter { it.deviceIdHint !in connectedIds }
         if (visiblePeers.isNotEmpty()) {
             item { SectionTitle("Nearby") }
             items(visiblePeers, key = { it.key }) { peer ->
@@ -1210,10 +1243,10 @@ private fun DeviceScreen(
             }
         }
 
-        if (connected != null && connected.deviceId in trustedIds) {
+        context.selected?.takeIf { it.deviceId in trustedIds }?.let { selected ->
             item {
-                TextButton(onClick = { pairing.forget(connected.deviceId) }, modifier = Modifier.fillMaxWidth()) {
-                    Text("Forget ${connected.peerName}")
+                TextButton(onClick = { pairing.forget(selected.deviceId) }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Forget ${selected.name}")
                 }
             }
         }
@@ -1229,12 +1262,14 @@ private fun DeviceScreen(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ConnectedDeviceCard(
-    name: String,
+    device: DeviceListItem,
+    /** Legacy feature state below belongs to this peer only when it is the routed peer. */
+    legacy: Boolean,
     clipboardStatus: String?,
     phoneRinging: Boolean,
     remoteRinging: Set<String>,
-    pingTargets: List<Pair<String, String>>,
-    findTargets: List<Pair<String, String>>,
+    pingEligible: Boolean,
+    findEligible: Boolean,
     remoteBattery: RemoteBatteryStatus?,
     remoteStorage: RemoteStorageStatus?,
     remoteMemory: RemoteMemoryStatus?,
@@ -1250,8 +1285,10 @@ private fun ConnectedDeviceCard(
     onClipboard: () -> Unit,
     onFile: () -> Unit,
     onRing: (String) -> Unit,
-    onStopRing: () -> Unit,
+    onStopRing: (String) -> Unit,
+    onSilenceThisPhone: () -> Unit,
     onPing: (String) -> Unit,
+    onDisconnect: (String) -> Unit,
 ) {
     var showingStorageDetails by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -1270,14 +1307,18 @@ private fun ConnectedDeviceCard(
                     Box(contentAlignment = Alignment.Center) { Text("⌘", color = MaterialTheme.colorScheme.onPrimary, style = MaterialTheme.typography.headlineSmall) }
                 }
                 Column(Modifier.weight(1f)) {
-                    Text(name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                    Text(device.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         Box(Modifier.size(8.dp).background(Color(0xFF2EAD69), CircleShape))
-                        Text("Connected securely", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f))
+                        Text(
+                            listOf(device.detail, "Connected securely").filter { it.isNotEmpty() }.joinToString(" · "),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f),
+                        )
                     }
                     remoteBattery?.let { battery ->
                         Text(
-                            "Mac battery ${battery.level}%${if (battery.isCharging) " · Charging" else ""}",
+                            "Battery ${battery.level}%${if (battery.isCharging) " · Charging" else ""}",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f),
                         )
@@ -1330,26 +1371,25 @@ private fun ConnectedDeviceCard(
                 if (filesEnabled) QuickAction("File", "Send", Modifier.weight(1f), onFile)
                 if (clipboardEnabled.xor(filesEnabled)) Spacer(Modifier.weight(1f))
             }
-            // MD-3: Ping and Ring address a device explicitly; several eligible devices open a picker.
-            val anyRinging = phoneRinging || remoteRinging.isNotEmpty()
-            val pingEnabled = pingTargets.isNotEmpty()
-            val findEnabled = findTargets.isNotEmpty() || anyRinging
+            // MD-3/4b: Ping and Ring act on this peer itself.
+            val ringing = device.deviceId in remoteRinging
+            val pingEnabled = pingEligible
+            val findEnabled = findEligible || ringing
             if (pingEnabled || findEnabled) Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                if (pingEnabled) DeviceQuickAction("Ping", pingTargets, Modifier.weight(1f), onPing)
+                if (pingEnabled) QuickAction("Ping", device.name, Modifier.weight(1f)) { onPing(device.deviceId) }
                 if (findEnabled) {
-                    if (anyRinging) {
-                        QuickAction("Stop", if (phoneRinging) "This phone" else "Ringing", Modifier.weight(1f), onStopRing)
-                    } else {
-                        DeviceQuickAction("Ring", findTargets, Modifier.weight(1f), onRing)
-                    }
+                    if (ringing) QuickAction("Stop", device.name, Modifier.weight(1f)) { onStopRing(device.deviceId) }
+                    else QuickAction("Ring", device.name, Modifier.weight(1f)) { onRing(device.deviceId) }
                 }
                 if (pingEnabled.xor(findEnabled)) Spacer(Modifier.weight(1f))
             }
-            if (!clipboardEnabled && !filesEnabled && !findEnabled && !pingEnabled) {
+            if (phoneRinging) QuickAction("Silence", "This phone", Modifier.fillMaxWidth(), onSilenceThisPhone)
+            if (legacy && !clipboardEnabled && !filesEnabled && !findEnabled && !pingEnabled) {
                 Text("Quick actions are turned off in Settings on one of your devices.", style = MaterialTheme.typography.bodySmall)
             }
             clipboardStatus?.let { Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f)) }
             pingStatus?.let { Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f)) }
+            TextButton(onClick = { onDisconnect(device.deviceId) }) { Text("Disconnect ${device.name}") }
         }
     }
     if (showingStorageDetails) {
@@ -1449,26 +1489,51 @@ private fun ConnectedDeviceCard(
 
 private fun formattedByteCount(context: Context, bytes: Long): String = Formatter.formatShortFileSize(context, bytes)
 
-/** One target: acts on it directly (subtitle = its name). Several: opens a menu of their names. */
+/**
+ * MD-4b: explains the compatibility routing of features that are not multi-device yet and offers
+ * the explicit switch (setPreferredDevice). Selection and routing stay separate.
+ */
 @Composable
-private fun DeviceQuickAction(
-    title: String,
-    targets: List<Pair<String, String>>,
-    modifier: Modifier,
-    action: (String) -> Unit,
-) {
-    var choosing by remember { mutableStateOf(false) }
-    Box(modifier) {
-        val single = targets.singleOrNull()
-        QuickAction(title, single?.second ?: "Choose device", Modifier.fillMaxWidth()) {
-            if (single != null) action(single.first) else choosing = true
+private fun LegacyRoutingRow(routedName: String, selected: DeviceListItem?, transferActive: Boolean, onUseForFeatures: (String) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            "Files, clipboard, links, media and screen sharing currently use $routedName.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (selected != null) {
+            TextButton(onClick = { onUseForFeatures(selected.deviceId) }) { Text("Use ${selected.name} for these features") }
+            if (transferActive) {
+                Text("Switching stops the file transfer in progress.", style = MaterialTheme.typography.labelSmall)
+            }
         }
-        DropdownMenu(expanded = choosing, onDismissRequest = { choosing = false }) {
-            targets.forEach { (deviceId, name) ->
-                DropdownMenuItem(text = { Text(name) }, onClick = {
-                    choosing = false
-                    action(deviceId)
-                })
+    }
+}
+
+/** MD-4: the connected devices; tapping a row selects that device (UI state only). No feature logic. */
+@Composable
+private fun DeviceListSection(items: List<DeviceListItem>, selectedDeviceId: String?, onSelect: (String) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        SectionTitle("Devices")
+        items.forEach { item ->
+            val selected = item.deviceId == selectedDeviceId
+            Surface(
+                onClick = { onSelect(item.deviceId) },
+                shape = RoundedCornerShape(14.dp),
+                color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .6f),
+                modifier = Modifier.fillMaxWidth().semantics { contentDescription = "${item.name}, ${item.detail}" },
+            ) {
+                Row(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(item.name, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            listOf(item.detail, if (item.isConnected) "Connected" else "Offline").filter { it.isNotEmpty() }.joinToString(" · "),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (selected) Text("✓", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                }
             }
         }
     }

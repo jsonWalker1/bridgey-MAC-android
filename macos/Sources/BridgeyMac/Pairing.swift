@@ -238,11 +238,8 @@ final class PairingCoordinator: ObservableObject {
     @Published private(set) var state: PairingState = .idle
     @Published private(set) var trustedDeviceIDs: Set<String>
     @Published private(set) var clipboardStatus: String? = nil
-    @Published private(set) var remoteBattery: RemoteBatteryStatus? = nil
-    @Published private(set) var remoteStorage: RemoteStorageStatus? = nil
-    @Published private(set) var remoteMemory: RemoteMemoryStatus? = nil
-    @Published private(set) var remoteCpu: RemoteCpuStatus? = nil
-    @Published private(set) var remoteTemperature: RemoteTemperatureStatus? = nil
+    /// MD-4c: the latest telemetry of each peer, keyed by deviceId (never by routing).
+    @Published private(set) var telemetry = DeviceTelemetryStore()
     @Published private(set) var notificationsAuthorized = false
     @Published private(set) var notificationPermissionDetermined = false
     @Published private(set) var fileTransferStatus: String? = nil
@@ -359,18 +356,16 @@ final class PairingCoordinator: ObservableObject {
     var audibleCallIdentity: String?
     private var cancelledTransferIDs = Set<String>()
     private var findDeviceSound: NSSound?
-    private var lastSentBattery: LocalBatteryStatus?
-    private var lastSentStorage: LocalStorageStatus?
-    private var lastSentMemory: LocalMemoryStatus?
+    /// Battery last sent to each peer (sent on change to every connected peer that grants it).
+    private var lastSentBattery: [String: LocalBatteryStatus] = [:]
     private var previousCpuSample: CpuSample?
-    // ALL telemetry (storage/memory/cpu) is on-demand only, battery-conscious: nothing is sampled or
-    // sent in the background. Opening the panel subscribes; closing it unsubscribes.
-    // While subscribed, the peer resends all three every ~3s over the existing telemetry.update kind.
-    private var remoteWantsTelemetryUpdates = false
+    // Storage/memory/CPU/temperature are on-demand only, battery-conscious: nothing is sampled or
+    // sent while no peer displays this Mac. A peer's open panel subscribes; closing it unsubscribes.
+    // MD-4c: subscribers are per peer; each gets the values every ~3s over telemetry.update.
+    private var telemetrySubscribers = TelemetrySubscribers()
     private var telemetrySamplingWorkItem: DispatchWorkItem?
-    // Whether OUR OWN panel is open wanting the peer's telemetry - survives reconnects (unlike the
-    // two fields above, which are per-session) so completeIfConfirmed() can resubscribe automatically.
-    private var localWantsRemoteTelemetryUpdates = false
+    /// MD-4c display side: the peer our own panel shows (survives that peer's reconnects).
+    private var telemetrySubscription = TelemetrySubscription()
     private let diagnostics = BridgeyDiagnostics()
     private let notificationHistoryStore: NotificationHistoryStore
 
@@ -459,7 +454,12 @@ final class PairingCoordinator: ObservableObject {
         }
         shortcuts.register()
         let featureLifecycle = FeatureLifecycleHandler(
-            started: { [weak self] _ in self?.deviceDirectoryRevision += 1 },
+            started: { [weak self] deviceID in
+                guard let self else { return }
+                self.deviceDirectoryRevision += 1
+                // MD-4c: resubscribe if the panel shows this peer.
+                self.applyTelemetrySubscription(self.telemetrySubscription.sessionStarted(deviceID))
+            },
             ended: { [weak self] deviceID in self?.deviceSessionEnded(deviceID) },
             authorizationChanged: { [weak self] deviceID in self?.deviceAuthorizationChanged(deviceID) }
         )
@@ -474,11 +474,8 @@ final class PairingCoordinator: ObservableObject {
             .sink { [weak self] value in
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    if !self.featureEnabled(.battery) { self.remoteBattery = nil }
-                    if !self.featureEnabled(.storage) { self.remoteStorage = nil }
-                    if !self.featureEnabled(.memory) { self.resetRemoteMemoryState() }
-                    if !self.featureEnabled(.cpu) { self.remoteCpu = nil }
-                    if !self.featureEnabled(.temperature) { self.remoteTemperature = nil }
+                    // MD-4c: each peer's telemetry follows that peer's own grant.
+                    self.telemetry.prune { deviceID, metric in self.settings.isEnabled(metric.feature, for: deviceID) }
                     if !self.settings.isEnabled(.ping, for: nil) { self.clearPingStatus() }
                     if !self.isFeatureAvailable(.links) { self.quickActions.reset() }
                     self.mediaController.reset()
@@ -668,6 +665,16 @@ final class PairingCoordinator: ObservableObject {
         }
         reconnectWork.removeValue(forKey: id)?.cancel()
         reconnectAttempts[id] = 0
+        endSession(current, scheduleReconnect: false)
+    }
+
+    /// MD-4b: ends exactly this device's session, like `dismiss()` but addressed. Other peers and
+    /// the routed device are untouched (unless this is the routed device). No reconnect is scheduled.
+    func disconnect(deviceID: String) {
+        guard let current = peers.session(for: deviceID) else { return }
+        failureMessage = nil
+        reconnectWork.removeValue(forKey: deviceID)?.cancel()
+        reconnectAttempts[deviceID] = 0
         endSession(current, scheduleReconnect: false)
     }
 
@@ -1054,111 +1061,140 @@ final class PairingCoordinator: ObservableObject {
         }
     }
 
-    private func publishLocalBattery(force: Bool = false) {
-        guard isFeatureAvailable(.battery),
-              let current = activeSession, case .connected = state,
-              let status = currentMacBatteryStatus(),
-              force || status != lastSentBattery,
-              let plaintext = try? JSONEncoder().encode(BatteryPayload(
-                level: status.level,
-                isCharging: status.isCharging
-              )),
-              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
-        lastSentBattery = status
-        current.send(PairingMessage(
-            kind: "battery.update",
-            sessionId: current.id,
-            messageId: UUID().uuidString.lowercased(),
-            nonce: encrypted.nonce,
-            ciphertext: encrypted.ciphertext
-        ))
-        NSLog("PLUGIN battery sent level=%d charging=%@", status.level, String(status.isCharging))
+    // MARK: Telemetry (MD-4c: per peer, in both directions)
+
+    /// Whether `metric` may flow between this Mac and `deviceID`: our grant for that peer and the
+    /// peer's capability/grant from its features.update.
+    private func telemetryAllowed(_ metric: TelemetryMetric, for deviceID: String) -> Bool {
+        settings.isEnabled(metric.feature, for: deviceID) &&
+            peers.capabilities(for: deviceID)?[metric.feature.rawValue] == true
     }
 
-    /// 100 MiB dead-band, matching Android's `STORAGE_CHANGE_THRESHOLD_BYTES` - raw byte counts
-    /// churn constantly from routine cache/log activity, so exact-equality (as battery uses) would
-    /// resend on every heartbeat tick instead of only on a real, meaningful change.
-    private static let storageChangeThresholdBytes: Int64 = 100 * 1024 * 1024
-
-    private func shouldResendStorage(_ status: LocalStorageStatus, previous: LocalStorageStatus?) -> Bool {
-        guard let previous else { return true }
-        return status.totalBytes != previous.totalBytes ||
-            abs(status.usedBytes - previous.usedBytes) >= Self.storageChangeThresholdBytes
+    /// UI: whether `deviceID`'s `metric` can be shown at all (otherwise it is not offered).
+    func isTelemetryAvailable(_ metric: TelemetryMetric, for deviceID: String) -> Bool {
+        telemetryAllowed(metric, for: deviceID)
     }
 
+    /// Battery goes to every connected peer that grants it, on change (or forced), so a peer can
+    /// show it without opening anything - as before, but no longer only to the routed peer.
+    private func publishLocalBattery(force: Bool = false, to only: String? = nil) {
+        guard let status = currentMacBatteryStatus(),
+              let plaintext = try? JSONEncoder().encode(BatteryPayload(level: status.level, isCharging: status.isCharging))
+        else { return }
+        let targets = only.map { [$0] } ?? peers.connectedInOrder.map(\.deviceID)
+        for deviceID in targets where telemetryAllowed(.battery, for: deviceID) && (force || lastSentBattery[deviceID] != status) {
+            guard send(to: deviceID, kind: "battery.update", payload: plaintext) else { continue }
+            lastSentBattery[deviceID] = status
+            NSLog("PLUGIN battery sent level=%d charging=%@", status.level, String(status.isCharging))
+        }
+    }
+
+    /// Storage goes only to peers displaying this Mac, each behind its own 100 MiB dead-band.
     private func publishLocalStorage(force: Bool = false) {
-        guard isFeatureAvailable(.storage),
-              let current = activeSession, case .connected = state,
-              let status = currentMacStorageStatus(),
-              force || shouldResendStorage(status, previous: lastSentStorage),
+        guard !telemetrySubscribers.isEmpty, let status = currentMacStorageStatus(),
               let plaintext = try? JSONEncoder().encode(TelemetryPayload(
-                version: 1,
-                storageUsedBytes: status.usedBytes,
-                storageTotalBytes: status.totalBytes
-              )),
-              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
-        lastSentStorage = status
-        current.send(PairingMessage(
-            kind: "telemetry.update",
-            sessionId: current.id,
-            messageId: UUID().uuidString.lowercased(),
-            nonce: encrypted.nonce,
-            ciphertext: encrypted.ciphertext
-        ))
-        NSLog("PLUGIN storage sent usedBytes=%lld totalBytes=%lld", status.usedBytes, status.totalBytes)
+                version: 1, storageUsedBytes: status.usedBytes, storageTotalBytes: status.totalBytes
+              )) else { return }
+        for deviceID in telemetrySubscribers.deviceIDs where telemetryAllowed(.storage, for: deviceID) &&
+            (force || telemetrySubscribers.shouldSend(storage: status, to: deviceID)) {
+            guard send(to: deviceID, kind: "telemetry.update", payload: plaintext) else { continue }
+            telemetrySubscribers.sent(storage: status, to: deviceID)
+            NSLog("PLUGIN storage sent usedBytes=%lld totalBytes=%lld", status.usedBytes, status.totalBytes)
+        }
     }
 
-    private func resetRemoteMemoryState() {
-        remoteMemory = nil
-        lastSentMemory = nil
+    /// Mirrors [publishLocalStorage]: same subscribers, same per-subscriber dead-band.
+    private func publishLocalMemory(force: Bool = false) {
+        guard !telemetrySubscribers.isEmpty, let status = currentMacMemoryStatus(),
+              let plaintext = try? JSONEncoder().encode(TelemetryPayload(
+                version: 1, memoryUsedBytes: status.usedBytes, memoryTotalBytes: status.totalBytes
+              )) else { return }
+        for deviceID in telemetrySubscribers.deviceIDs where telemetryAllowed(.memory, for: deviceID) &&
+            (force || telemetrySubscribers.shouldSend(memory: status, to: deviceID)) {
+            guard send(to: deviceID, kind: "telemetry.update", payload: plaintext) else { continue }
+            telemetrySubscribers.sent(memory: status, to: deviceID)
+            NSLog("PLUGIN memory sent usedBytes=%lld totalBytes=%lld", status.usedBytes, status.totalBytes)
+        }
     }
 
-    private func resetTelemetrySubscriptionState() {
-        remoteCpu = nil
-        previousCpuSample = nil
-        remoteTemperature = nil
-        remoteWantsTelemetryUpdates = false
-        telemetrySamplingWorkItem?.cancel()
-        telemetrySamplingWorkItem = nil
+    /// One CPU sample per tick, shared by every subscriber. The first sample after the first
+    /// subscribe only seeds the baseline; a read failure sends an explicit `cpuUnavailable`.
+    private func publishLocalCpu() {
+        let targets = telemetrySubscribers.deviceIDs.filter { telemetryAllowed(.cpu, for: $0) }
+        guard !targets.isEmpty else { return }
+        let sample = currentMacCpuSample()
+        let previous = previousCpuSample
+        let status: CpuStatus?
+        if let sample {
+            previousCpuSample = sample
+            status = previous == nil ? nil : computeCpuPercent(previous: previous, current: sample)
+        } else {
+            status = .unavailable
+        }
+        guard let status else { return } // nil = first sample: seed only, send nothing
+        var payload = TelemetryPayload(version: 1)
+        switch status {
+        case .available(let percent): payload.cpuPercent = percent
+        case .unavailable: payload.cpuUnavailable = true
+        }
+        guard let plaintext = try? JSONEncoder().encode(payload) else { return }
+        for deviceID in targets { send(to: deviceID, kind: "telemetry.update", payload: plaintext) }
+        NSLog("PLUGIN cpu sent %@", String(describing: status))
     }
 
-    /// Call when the panel becomes visible. Battery-conscious by design: nothing is sampled or sent
-    /// while closed. Storage/memory/CPU are all refreshed together, every ~3s, only while the peer
-    /// confirms someone is actually looking.
-    func requestRemoteTelemetryUpdates() {
-        localWantsRemoteTelemetryUpdates = true
-        sendTelemetrySubscription(subscribe: true)
+    /// Thermal state (macOS never sends Celsius, see MacTemperature.swift) to every subscriber.
+    private func publishLocalTemperature() {
+        let targets = telemetrySubscribers.deviceIDs.filter { telemetryAllowed(.temperature, for: $0) }
+        guard !targets.isEmpty else { return }
+        var payload = TelemetryPayload(version: 1)
+        switch currentMacTemperatureStatus() {
+        case .known(let thermalState): payload.thermalState = thermalState
+        case .unavailable: payload.temperatureUnavailable = true
+        }
+        guard let plaintext = try? JSONEncoder().encode(payload) else { return }
+        for deviceID in targets { send(to: deviceID, kind: "telemetry.update", payload: plaintext) }
+        NSLog("PLUGIN temperature sent")
     }
 
-    /// Call when the panel closes.
-    func stopRequestingRemoteTelemetryUpdates() {
-        localWantsRemoteTelemetryUpdates = false
-        sendTelemetrySubscription(subscribe: false)
+    /// MD-4c display side: the panel now shows `deviceID` (nil = panel closed). Subscribes exactly
+    /// that peer and unsubscribes the previous one - never the routed peer by default.
+    func showTelemetry(for deviceID: String?) {
+        applyTelemetrySubscription(telemetrySubscription.show(deviceID) { [peers] in peers.connectedSession(for: $0) != nil })
     }
 
-    /// Not gated by any single telemetry feature - this just signals "my panel is open/closed";
-    /// each metric's own publish function independently respects its own Settings toggle.
-    private func sendTelemetrySubscription(subscribe: Bool) {
-        guard let current = activeSession, case .connected = state else { return }
-        current.send(PairingMessage(
-            kind: subscribe ? "telemetry.subscribe" : "telemetry.unsubscribe",
-            sessionId: current.id
-        ))
+    private func applyTelemetrySubscription(_ changes: [TelemetrySubscription.Change]) {
+        for change in changes {
+            let (deviceID, kind): (String, String) = switch change {
+            case .subscribe(let id): (id, "telemetry.subscribe")
+            case .unsubscribe(let id): (id, "telemetry.unsubscribe")
+            }
+            peers.deliver(to: deviceID) { session in
+                session.send(PairingMessage(kind: kind, sessionId: session.id))
+                return true
+            }
+        }
     }
 
-    /// Peer's panel opened and wants our telemetry - start the on-demand loop that resends
-    /// storage/memory (dead-band gated, as always), CPU, and temperature (always, being rates/
-    /// instant readings) every ~3s. Not gated here by any specific feature - each publish call
-    /// below independently no-ops if its own Settings toggle is off.
-    private func startTelemetrySamplingLoop() {
-        previousCpuSample = nil
-        remoteWantsTelemetryUpdates = true
-        scheduleTelemetrySample()
+    /// A peer opened its panel on this Mac: start (or join) the on-demand sampling loop and send it
+    /// the current values right away.
+    private func telemetrySubscribed(by deviceID: String) {
+        if telemetrySubscribers.add(deviceID) {
+            previousCpuSample = nil
+            scheduleTelemetrySample()
+        }
+        publishLocalBattery(force: true, to: deviceID)
+        publishLocalStorage()
+        publishLocalMemory()
+    }
+
+    private func telemetryUnsubscribed(by deviceID: String) {
+        if telemetrySubscribers.remove(deviceID) { stopTelemetrySamplingLoop() }
     }
 
     private func scheduleTelemetrySample() {
+        telemetrySamplingWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.remoteWantsTelemetryUpdates else { return }
+            guard let self, !self.telemetrySubscribers.isEmpty else { return }
             self.publishLocalStorage()
             self.publishLocalMemory()
             self.publishLocalCpu()
@@ -1169,101 +1205,10 @@ final class PairingCoordinator: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
     }
 
-    /// Stops the loop only - does NOT clear the last-known storage/memory/CPU values, which stay
-    /// visible (e.g. on the connected-device card) until the next real disconnect/reconnect.
     private func stopTelemetrySamplingLoop() {
-        remoteWantsTelemetryUpdates = false
         previousCpuSample = nil
         telemetrySamplingWorkItem?.cancel()
         telemetrySamplingWorkItem = nil
-    }
-
-    /// Reads one CPU sample and, if a previous sample exists, sends the computed delta as
-    /// `cpuPercent`. The first sample after a (re)subscribe only seeds the baseline - sending
-    /// nothing that tick avoids a flash of "unavailable" before the second tick has a real delta.
-    /// A read/computation failure sends explicit `cpuUnavailable: true` rather than a fabricated
-    /// number.
-    private func publishLocalCpu() {
-        guard isFeatureAvailable(.cpu), let current = activeSession, case .connected = state else { return }
-        let sample = currentMacCpuSample()
-        let previous = previousCpuSample
-        let status: CpuStatus?
-        if let sample {
-            previousCpuSample = sample
-            status = previous == nil ? nil : computeCpuPercent(previous: previous, current: sample)
-        } else {
-            status = .unavailable
-        }
-        guard let status else { return } // nil = first sample this subscription: seed only, send nothing
-        var payload = TelemetryPayload(version: 1)
-        switch status {
-        case .available(let percent): payload.cpuPercent = percent
-        case .unavailable: payload.cpuUnavailable = true
-        }
-        guard let plaintext = try? JSONEncoder().encode(payload),
-              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
-        current.send(PairingMessage(
-            kind: "telemetry.update",
-            sessionId: current.id,
-            messageId: UUID().uuidString.lowercased(),
-            nonce: encrypted.nonce,
-            ciphertext: encrypted.ciphertext
-        ))
-        NSLog("PLUGIN cpu sent %@", String(describing: status))
-    }
-
-    private static let memoryChangeThresholdBytes: Int64 = 100 * 1024 * 1024
-
-    private func shouldResendMemory(_ status: LocalMemoryStatus, previous: LocalMemoryStatus?) -> Bool {
-        guard let previous else { return true }
-        return status.totalBytes != previous.totalBytes ||
-            abs(status.usedBytes - previous.usedBytes) >= Self.memoryChangeThresholdBytes
-    }
-
-    /// Mirrors [publishLocalStorage]'s shape and cadence exactly - same background heartbeat call
-    /// site, same dead-band principle - just a second independent metric on the same message kind.
-    private func publishLocalMemory(force: Bool = false) {
-        guard isFeatureAvailable(.memory),
-              let current = activeSession, case .connected = state,
-              let status = currentMacMemoryStatus(),
-              force || shouldResendMemory(status, previous: lastSentMemory),
-              let plaintext = try? JSONEncoder().encode(TelemetryPayload(
-                version: 1,
-                memoryUsedBytes: status.usedBytes,
-                memoryTotalBytes: status.totalBytes
-              )),
-              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
-        lastSentMemory = status
-        current.send(PairingMessage(
-            kind: "telemetry.update",
-            sessionId: current.id,
-            messageId: UUID().uuidString.lowercased(),
-            nonce: encrypted.nonce,
-            ciphertext: encrypted.ciphertext
-        ))
-        NSLog("PLUGIN memory sent usedBytes=%lld totalBytes=%lld", status.usedBytes, status.totalBytes)
-    }
-
-    /// Thermal state is always sent when known (no dead-band - it rarely changes and is cheap to
-    /// encode). macOS never sends a Celsius value (see MacTemperature.swift for why); an explicit
-    /// unavailable state is sent rather than silence, matching CPU.
-    private func publishLocalTemperature() {
-        guard isFeatureAvailable(.temperature), let current = activeSession, case .connected = state else { return }
-        var payload = TelemetryPayload(version: 1)
-        switch currentMacTemperatureStatus() {
-        case .known(let thermalState): payload.thermalState = thermalState
-        case .unavailable: payload.temperatureUnavailable = true
-        }
-        guard let plaintext = try? JSONEncoder().encode(payload),
-              let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else { return }
-        current.send(PairingMessage(
-            kind: "telemetry.update",
-            sessionId: current.id,
-            messageId: UUID().uuidString.lowercased(),
-            nonce: encrypted.nonce,
-            ciphertext: encrypted.ciphertext
-        ))
-        NSLog("PLUGIN temperature sent")
     }
 
     /// Compatibility path without an explicit target: the routed device.
@@ -1348,6 +1293,11 @@ final class PairingCoordinator: ObservableObject {
 
     /// MD-3: a device's session ended - drop only that device's Ping and Find state.
     private func deviceSessionEnded(_ deviceID: String) {
+        // MD-4c: only this peer's telemetry, subscription and dead-band state go away.
+        telemetry.remove(deviceID)
+        lastSentBattery[deviceID] = nil
+        telemetryUnsubscribed(by: deviceID)
+        telemetrySubscription.sessionEnded(deviceID)
         if pings.deviceEnded(deviceID) { setTransientPingStatus("\(displayName(deviceID)) disconnected") }
         if find.deviceEnded(deviceID) { stopMacSound() }
         deviceDirectoryRevision += 1
@@ -1856,31 +1806,19 @@ final class PairingCoordinator: ObservableObject {
     /// Feature layer only. Today's single-peer features restart against the newly routed session.
     /// No session, capability, trust or connection state changes, and no capability update is sent.
     private func activePeerChanged(previous: Session?) {
-        if localWantsRemoteTelemetryUpdates, let previous, peers.phase(of: previous) == .connected {
-            // Battery-conscious: the device we no longer show must stop sampling for us.
-            previous.send(PairingMessage(kind: "telemetry.unsubscribe", sessionId: previous.id))
-        }
         // Transfers bound to the previous peer cannot complete through the feature layer any more.
         if previous != nil { interruptFeatureTransfers() }
-        remoteBattery = nil
-        remoteStorage = nil
         quickActions.reset()
         mediaController.reset()
         mediaRemote.reset()
         videoChannel.reset()
         screenStreamDecoder.reset()
-        lastSentBattery = nil
-        lastSentStorage = nil
-        resetRemoteMemoryState()
-        resetTelemetrySubscriptionState()
         clearRemoteCall()
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
         guard let current = activeSession, peers.phase(of: current) == .connected else { return }
         clearAllDetector.reset() // a new session re-seeds from what is delivered after settling
         clearAllSettlingStartedAt = Date()
-        publishLocalBattery(force: true)
-        if localWantsRemoteTelemetryUpdates { sendTelemetrySubscription(subscribe: true) }
         if let capabilities = activePeerID.flatMap(peers.capabilities(for:)) { applyRemoteFeatures(capabilities) }
     }
 
@@ -1911,6 +1849,8 @@ final class PairingCoordinator: ObservableObject {
     /// MD-3: features that address devices explicitly; consumed from every connected session.
     private static let deviceAddressedMessageKinds: Set<String> = [
         "ping.request", "ping.ack", "find.start", "find.stop", "find.started", "find.stopped",
+        // MD-4c: telemetry is per peer in both directions.
+        "battery.update", "telemetry.update", "telemetry.subscribe", "telemetry.unsubscribe",
     ]
 
     private func receive(_ message: PairingMessage, in current: Session) {
@@ -2020,6 +1960,17 @@ final class PairingCoordinator: ObservableObject {
                 if previousCapabilities != capabilities {
                     peerLifecycle.authorizationChanged(deviceIDs: [current.remoteDeviceID])
                 }
+                // MD-4c: this peer's telemetry follows its own grant; it gets our battery right away.
+                for metric in TelemetryMetric.allCases where capabilities[metric.feature.rawValue] == false {
+                    telemetry.clear(metric, for: current.remoteDeviceID)
+                }
+                publishLocalBattery(force: true, to: current.remoteDeviceID)
+                if telemetrySubscribers.deviceIDs.contains(current.remoteDeviceID) {
+                    // A re-enabled metric must not wait for the 100 MiB dead-band.
+                    telemetrySubscribers.resetDeadBand(current.remoteDeviceID)
+                    publishLocalStorage()
+                    publishLocalMemory()
+                }
                 // MD-3: Ping/Find state of exactly this device follows its own grant.
                 if capabilities[BridgeyFeature.ping.rawValue] == false, pings.deviceEnded(current.remoteDeviceID) {
                     setTransientPingStatus("Ping is turned off on \(current.peerName)")
@@ -2100,7 +2051,7 @@ final class PairingCoordinator: ObservableObject {
                 try receiveFindAcknowledgement(message, in: current, started: false)
             case "battery.update":
                 guard featureEnabled(.battery, current: current) else { return }
-                guard case .connected = state,
+                guard let sender = peers.connectedDeviceID(of: current),
                       message.sessionId == current.id,
                       let messageID = message.messageId,
                       current.acceptMessageID(messageID),
@@ -2111,12 +2062,12 @@ final class PairingCoordinator: ObservableObject {
                       (0...100).contains(payload.level) else {
                     throw PairingError.invalidMessage
                 }
-                remoteBattery = RemoteBatteryStatus(level: payload.level, isCharging: payload.isCharging)
+                telemetry.update(sender) { $0.battery = RemoteBatteryStatus(level: payload.level, isCharging: payload.isCharging) }
                 NSLog("PLUGIN battery received level=%d charging=%@", payload.level, String(payload.isCharging))
             case "telemetry.update":
                 // Not gated by a single telemetry feature here - each field block below
-                // independently checks its own Settings toggle.
-                guard case .connected = state,
+                // independently checks its own Settings toggle. MD-4c: values belong to the sender.
+                guard let sender = peers.connectedDeviceID(of: current),
                       message.sessionId == current.id,
                       let messageID = message.messageId,
                       current.acceptMessageID(messageID),
@@ -2129,41 +2080,40 @@ final class PairingCoordinator: ObservableObject {
                 if featureEnabled(.storage, current: current),
                    let used = payload.storageUsedBytes, let total = payload.storageTotalBytes {
                     guard total > 0, used >= 0, used <= total else { throw PairingError.invalidMessage }
-                    remoteStorage = RemoteStorageStatus(usedBytes: used, totalBytes: total)
+                    telemetry.update(sender) { $0.storage = RemoteStorageStatus(usedBytes: used, totalBytes: total) }
                     NSLog("PLUGIN storage received usedBytes=%lld totalBytes=%lld", used, total)
                 }
                 if featureEnabled(.memory, current: current),
                    let used = payload.memoryUsedBytes, let total = payload.memoryTotalBytes {
                     guard total > 0, used >= 0, used <= total else { throw PairingError.invalidMessage }
-                    remoteMemory = RemoteMemoryStatus(usedBytes: used, totalBytes: total)
+                    telemetry.update(sender) { $0.memory = RemoteMemoryStatus(usedBytes: used, totalBytes: total) }
                     NSLog("PLUGIN memory received usedBytes=%lld totalBytes=%lld", used, total)
                 }
                 if featureEnabled(.cpu, current: current) {
                     if payload.cpuUnavailable == true {
-                        remoteCpu = .unavailable
+                        telemetry.update(sender) { $0.cpu = .unavailable }
                         NSLog("PLUGIN cpu received unavailable")
                     } else if let percent = payload.cpuPercent {
                         guard (0...100).contains(percent) else { throw PairingError.invalidMessage }
-                        remoteCpu = .available(percent)
+                        telemetry.update(sender) { $0.cpu = .available(percent) }
                         NSLog("PLUGIN cpu received percent=%d", percent)
                     }
                 }
                 if featureEnabled(.temperature, current: current) {
                     if payload.temperatureUnavailable == true {
-                        remoteTemperature = .unavailable
+                        telemetry.update(sender) { $0.temperature = .unavailable }
                         NSLog("PLUGIN temperature received unavailable")
                     } else if let thermalState = payload.thermalState {
-                        remoteTemperature = .known(thermalState: thermalState, celsius: payload.temperatureCelsius)
+                        telemetry.update(sender) { $0.temperature = .known(thermalState: thermalState, celsius: payload.temperatureCelsius) }
                         NSLog("PLUGIN temperature received state=%@ celsius=%@", thermalState, payload.temperatureCelsius.map(String.init) ?? "nil")
                     }
                 }
             case "telemetry.subscribe":
-                guard case .connected = state,
-                      message.sessionId == current.id else { return }
-                startTelemetrySamplingLoop()
+                guard let sender = peers.connectedDeviceID(of: current), message.sessionId == current.id else { return }
+                telemetrySubscribed(by: sender)
             case "telemetry.unsubscribe":
-                guard message.sessionId == current.id else { return }
-                stopTelemetrySamplingLoop()
+                guard let sender = peers.connectedDeviceID(of: current), message.sessionId == current.id else { return }
+                telemetryUnsubscribed(by: sender)
             case "notifications.post":
                 guard featureEnabled(.notifications, current: current) else { return }
                 guard case .connected = state,
@@ -2507,11 +2457,6 @@ final class PairingCoordinator: ObservableObject {
         videoChannel.reset()
         screenStreamDecoder.reset()
         mediaController.refresh()
-        if remoteFeatures[.battery] == false { remoteBattery = nil }
-        if remoteFeatures[.storage] == false { remoteStorage = nil }
-        if remoteFeatures[.memory] == false { remoteMemory = nil }
-        if remoteFeatures[.cpu] == false { remoteCpu = nil }
-        if remoteFeatures[.temperature] == false { remoteTemperature = nil }
         if remoteFeatures[.clipboard] == false { clearClipboardSendStatus() }
         if remoteFeatures[.notifications] == false {
             clearRemoteCall()
@@ -2524,9 +2469,6 @@ final class PairingCoordinator: ObservableObject {
             fileTransferStatus = nil
         }
         flushPendingCallIfPossible()
-        publishLocalBattery(force: true)
-        publishLocalStorage(force: true)
-        publishLocalMemory(force: true)
     }
 
     private func completeIfConfirmed(_ current: Session) {
@@ -3023,8 +2965,8 @@ final class PairingCoordinator: ObservableObject {
                 sessionId: current.id,
                 messageId: UUID().uuidString.lowercased()
             ))
+            self.publishLocalBattery(to: current.remoteDeviceID) // MD-4c: every peer's own heartbeat
             if current === self.activeSession {
-                self.publishLocalBattery()
                 self.mediaController.refresh()
                 self.checkNotificationClearAll() // piggybacks on the existing heartbeat, no new timer
             }

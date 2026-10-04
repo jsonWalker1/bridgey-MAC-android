@@ -222,27 +222,20 @@ class PairingCoordinator(
      */
     private val mutableDeviceDirectoryRevision = MutableStateFlow(0)
     val deviceDirectoryRevision: StateFlow<Int> = mutableDeviceDirectoryRevision.asStateFlow()
-    private val mutableRemoteBattery = MutableStateFlow<RemoteBatteryStatus?>(null)
-    val remoteBattery: StateFlow<RemoteBatteryStatus?> = mutableRemoteBattery.asStateFlow()
-    private val mutableRemoteStorage = MutableStateFlow<RemoteStorageStatus?>(null)
-    val remoteStorage: StateFlow<RemoteStorageStatus?> = mutableRemoteStorage.asStateFlow()
-    private var lastSentStorage: LocalStorageStatus? = null
-    private val mutableRemoteMemory = MutableStateFlow<RemoteMemoryStatus?>(null)
-    val remoteMemory: StateFlow<RemoteMemoryStatus?> = mutableRemoteMemory.asStateFlow()
-    private var lastSentMemory: LocalMemoryStatus? = null
-    private val mutableRemoteCpu = MutableStateFlow<RemoteCpuStatus?>(null)
-    val remoteCpu: StateFlow<RemoteCpuStatus?> = mutableRemoteCpu.asStateFlow()
-    private val mutableRemoteTemperature = MutableStateFlow<RemoteTemperatureStatus?>(null)
-    val remoteTemperature: StateFlow<RemoteTemperatureStatus?> = mutableRemoteTemperature.asStateFlow()
-    private var previousCpuSample: CpuSample? = null
-    // ALL telemetry (storage/memory/cpu) is on-demand only, battery-conscious: nothing is sampled or
-    // sent in the background. Opening the app (main panel) subscribes; backgrounding it unsubscribes.
-    // While subscribed, the peer resends all three every ~3s over the existing telemetry.update kind.
-    private var remoteWantsTelemetryUpdates = false
-    private var telemetrySamplingJob: Job? = null
-    // Whether OUR OWN app is in the foreground wanting the peer's telemetry - survives reconnects
-    // (unlike the two fields above, which are per-session) so completeIfConfirmed() can resubscribe.
-    private var localWantsRemoteTelemetryUpdates = false
+    /** MD-4c: the latest telemetry of each peer, keyed by deviceId (never by routing). */
+    private val mutableTelemetry = MutableStateFlow<Map<String, DeviceTelemetry>>(emptyMap())
+    val telemetry: StateFlow<Map<String, DeviceTelemetry>> = mutableTelemetry.asStateFlow()
+    /** This phone's latest battery (from the system broadcast) and what each peer last got. */
+    @Volatile private var localBattery: RemoteBatteryStatus? = null
+    private val lastSentBattery = ConcurrentHashMap<String, RemoteBatteryStatus>()
+    @Volatile private var previousCpuSample: CpuSample? = null
+    // Storage/memory/CPU/temperature are on-demand only, battery-conscious: nothing is sampled or
+    // sent while no peer displays this phone. A peer's open panel subscribes; closing it
+    // unsubscribes. MD-4c: subscribers are per peer; each gets the values every ~3s.
+    private val telemetrySubscribers = TelemetrySubscribers()
+    @Volatile private var telemetrySamplingJob: Job? = null
+    /** MD-4c display side: the peer our own dashboard shows (survives that peer's reconnects). */
+    private val telemetrySubscription = TelemetrySubscription()
     private val mutablePingStatus = MutableStateFlow<String?>(null)
     val pingStatus: StateFlow<String?> = mutablePingStatus.asStateFlow()
     /** MD-3: Ping requests per device. */
@@ -333,7 +326,13 @@ class PairingCoordinator(
     init {
         // MD-3: device-addressed features drop a device's state only when that device's session ends.
         peerLifecycle.addObserver(object : PeerLifecycleObserver {
-            override fun sessionStarted(deviceId: String) = mutableDeviceDirectoryRevision.update { it + 1 }
+            override fun sessionStarted(deviceId: String) {
+                mutableDeviceDirectoryRevision.update { it + 1 }
+                // MD-4c: resubscribe if the dashboard shows this peer.
+                synchronized(telemetrySubscription) {
+                    applyTelemetrySubscription(telemetrySubscription.sessionStarted(deviceId))
+                }
+            }
             override fun sessionEnded(deviceId: String) = deviceSessionEnded(deviceId)
             override fun authorizationChanged(deviceId: String) = deviceAuthorizationChanged(deviceId)
         })
@@ -341,11 +340,10 @@ class PairingCoordinator(
         scope.launch {
             settings.state.collect {
                 if (!featureEnabled(BridgeyFeature.CLIPBOARD)) mutableClipboardStatus.value = null
-                if (!featureEnabled(BridgeyFeature.BATTERY)) mutableRemoteBattery.value = null
-                if (!featureEnabled(BridgeyFeature.STORAGE)) mutableRemoteStorage.value = null
-                if (!featureEnabled(BridgeyFeature.MEMORY)) mutableRemoteMemory.value = null
-                if (!featureEnabled(BridgeyFeature.CPU)) mutableRemoteCpu.value = null
-                if (!featureEnabled(BridgeyFeature.TEMPERATURE)) mutableRemoteTemperature.value = null
+                // MD-4c: each peer's telemetry follows that peer's own grant; a re-enabled battery
+                // grant gets our current battery right away (as on macOS).
+                mutableTelemetry.update { map -> DeviceTelemetryStore.prune(map) { id, metric -> settings.isEnabled(metric.feature, id) } }
+                peers.connectedInOrder().forEach { publishBattery(it.deviceId, force = true) }
                 if (!settings.isEnabled(BridgeyFeature.PING, null)) clearPingStatus()
                 quickActions.policyChanged()
                 mediaRemote.policyChanged()
@@ -475,6 +473,18 @@ class PairingCoordinator(
         endSession(current, Reconnect.NONE)
     }
 
+    /**
+     * MD-4b: ends exactly this device's session, like [dismiss] but addressed. Other peers and the
+     * routed device are untouched (unless this is the routed device). No reconnect is scheduled.
+     */
+    fun disconnect(deviceId: String) {
+        val current = peers.session(deviceId) ?: return
+        failureMessage = null
+        reconnectJobs.remove(deviceId)?.cancel()
+        reconnectAttempts.remove(deviceId)
+        endSession(current, Reconnect.NONE)
+    }
+
     fun forget(deviceId: String) {
         registry.forget(deviceId)
         settings.removeDevice(deviceId)
@@ -586,139 +596,172 @@ class PairingCoordinator(
         }
     }
 
+    // region Telemetry (MD-4c: per peer, in both directions)
+
+    /**
+     * Whether [metric] may flow between this phone and [deviceId]: our grant for that peer and the
+     * peer's capability/grant from its features.update.
+     */
+    private fun telemetryAllowed(metric: TelemetryMetric, deviceId: String): Boolean =
+        settings.isEnabled(metric.feature, deviceId) && peers.capabilities(deviceId)?.get(metric.feature.key) == true
+
+    /** UI: whether [deviceId]'s [metric] can be shown at all (otherwise it is not offered). */
+    internal fun isTelemetryAvailable(metric: TelemetryMetric, deviceId: String): Boolean = telemetryAllowed(metric, deviceId)
+
+    /**
+     * Called with every system battery broadcast. Battery goes to every connected peer that grants
+     * it, on change, so a peer can show it without opening anything - no longer only the routed one.
+     */
     fun sendBattery(level: Int, isCharging: Boolean) {
-        if (!isFeatureAvailable(BridgeyFeature.BATTERY)) return
-        val connectedSession = activeSession ?: return
-        if (mutableState.value !is PairingState.Connected) return
-        scope.launch {
-            if (activeSession !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
-            // BRIDGEY CONNECTIVITY CRASH FIX (2026-09-25): pairingKey can go null on this SAME session
-            // object between the check above and here (e.g. a disconnect racing this coroutine's
-            // dispatch) even though `session !== connectedSession` still holds - force-unwrapping it
-            // crashed the whole process (NullPointerException in sendBattery, confirmed via
-            // AndroidRuntime FATAL EXCEPTION log), taking down BridgeyConnectionService with it and
-            // breaking ALL connectivity, not just this one battery update. `?: return@launch` degrades
-            // to silently skipping this update instead - exactly what sendQuickPayload/receiveQuickPayload
-            // already do elsewhere in this file.
-            val pairingKey = connectedSession.pairingKey ?: return@launch
-            val payload = JSONObject()
-                .put("level", level.coerceIn(0, 100))
-                .put("isCharging", isCharging)
-                .toString()
-                .toByteArray()
-            val encrypted = Crypto.encrypt(pairingKey, payload)
-            if (connectedSession.send(
-                    Message(
-                        kind = "battery.update",
-                        sessionId = connectedSession.id,
-                        messageId = UUID.randomUUID().toString(),
-                        nonce = encrypted.nonce,
-                        ciphertext = encrypted.ciphertext,
-                    ),
-                )
-            ) {
-                android.util.Log.i("Bridgey", "PLUGIN battery sent level=$level charging=$isCharging")
-            }
+        localBattery = RemoteBatteryStatus(level.coerceIn(0, 100), isCharging)
+        peers.connectedInOrder().forEach { publishBattery(it.deviceId) }
+    }
+
+    private fun publishBattery(deviceId: String, force: Boolean = false) {
+        val status = localBattery ?: return
+        if (!telemetryAllowed(TelemetryMetric.BATTERY, deviceId)) return
+        if (!force && lastSentBattery[deviceId] == status) return
+        val payload = JSONObject().put("level", status.level).put("isCharging", status.isCharging).toString().toByteArray()
+        if (send(deviceId, "battery.update", payload)) {
+            lastSentBattery[deviceId] = status
+            android.util.Log.i("Bridgey", "PLUGIN battery sent level=${status.level} charging=${status.isCharging}")
         }
     }
 
-    /** Mirrors [sendBattery]'s shape, but self-contained (no OS broadcast triggers storage checks)
-     *  and change-gated by [STORAGE_CHANGE_THRESHOLD_BYTES] rather than exact equality, since raw
-     *  byte counts churn constantly from routine cache/temp-file activity. */
+    /** Storage goes only to peers displaying this phone, each behind its own 100 MiB dead-band. */
     fun publishLocalStorage(force: Boolean = false) {
-        if (!isFeatureAvailable(BridgeyFeature.STORAGE)) return
-        val connectedSession = activeSession ?: return
-        if (mutableState.value !is PairingState.Connected) return
+        if (telemetrySubscribers.isEmpty()) return
         val status = currentAndroidStorageStatus(appContext) ?: return
-        val previous = lastSentStorage
-        if (!force && previous != null &&
-            status.totalBytes == previous.totalBytes &&
-            kotlin.math.abs(status.usedBytes - previous.usedBytes) < STORAGE_CHANGE_THRESHOLD_BYTES
-        ) {
-            return
-        }
-        scope.launch {
-            if (activeSession !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
-            val pairingKey = connectedSession.pairingKey ?: return@launch
-            val payload = JSONObject()
-                .put("version", 1)
-                .put("storageUsedBytes", status.usedBytes)
-                .put("storageTotalBytes", status.totalBytes)
-                .toString()
-                .toByteArray()
-            val encrypted = Crypto.encrypt(pairingKey, payload)
-            if (connectedSession.send(
-                    Message(
-                        kind = "telemetry.update",
-                        sessionId = connectedSession.id,
-                        messageId = UUID.randomUUID().toString(),
-                        nonce = encrypted.nonce,
-                        ciphertext = encrypted.ciphertext,
-                    ),
-                )
-            ) {
-                lastSentStorage = status
+        val payload = JSONObject().put("version", 1).put("storageUsedBytes", status.usedBytes)
+            .put("storageTotalBytes", status.totalBytes).toString().toByteArray()
+        telemetrySubscribers.deviceIds().forEach { deviceId ->
+            if (!telemetryAllowed(TelemetryMetric.STORAGE, deviceId)) return@forEach
+            if (!force && !telemetrySubscribers.shouldSend(storage = status, to = deviceId)) return@forEach
+            if (send(deviceId, "telemetry.update", payload)) {
+                telemetrySubscribers.sent(storage = status, to = deviceId)
                 android.util.Log.i("Bridgey", "PLUGIN storage sent usedBytes=${status.usedBytes} totalBytes=${status.totalBytes}")
             }
         }
     }
 
-    private fun resetRemoteMemoryState() {
-        mutableRemoteMemory.value = null
-        lastSentMemory = null
-    }
-
-    private fun resetTelemetrySubscriptionState() {
-        mutableRemoteCpu.value = null
-        previousCpuSample = null
-        mutableRemoteTemperature.value = null
-        remoteWantsTelemetryUpdates = false
-        telemetrySamplingJob?.cancel()
-        telemetrySamplingJob = null
-    }
-
-    /** Call when the app becomes visible (foreground). Battery-conscious by design: nothing is
-     *  sampled or sent while backgrounded. Storage/memory/CPU/temperature are all refreshed
-     *  together, every ~3s, only while the peer confirms someone is actually looking - each metric
-     *  independently no-ops in its own publish function if its own Settings toggle is off. */
-    fun requestRemoteTelemetryUpdates() {
-        localWantsRemoteTelemetryUpdates = true
-        sendTelemetrySubscription(subscribe = true)
-    }
-
-    /** Call when the app is backgrounded. */
-    fun stopRequestingRemoteTelemetryUpdates() {
-        localWantsRemoteTelemetryUpdates = false
-        sendTelemetrySubscription(subscribe = false)
-    }
-
-    /** Not gated by any single telemetry feature - this just signals "my panel is open/closed";
-     *  each metric's own publish function independently respects its own Settings toggle. */
-    private fun sendTelemetrySubscription(subscribe: Boolean) {
-        val current = activeSession ?: return
-        if (mutableState.value !is PairingState.Connected) return
-        scope.launch {
-            if (activeSession !== current || mutableState.value !is PairingState.Connected) return@launch
-            current.send(
-                Message(
-                    kind = if (subscribe) "telemetry.subscribe" else "telemetry.unsubscribe",
-                    sessionId = current.id,
-                ),
-            )
+    /** Mirrors [publishLocalStorage]: same subscribers, same per-subscriber dead-band. */
+    fun publishLocalMemory(force: Boolean = false) {
+        if (telemetrySubscribers.isEmpty()) return
+        val status = currentAndroidMemoryStatus(appContext) ?: return
+        val payload = JSONObject().put("version", 1).put("memoryUsedBytes", status.usedBytes)
+            .put("memoryTotalBytes", status.totalBytes).toString().toByteArray()
+        telemetrySubscribers.deviceIds().forEach { deviceId ->
+            if (!telemetryAllowed(TelemetryMetric.MEMORY, deviceId)) return@forEach
+            if (!force && !telemetrySubscribers.shouldSend(memory = status, to = deviceId)) return@forEach
+            if (send(deviceId, "telemetry.update", payload)) {
+                telemetrySubscribers.sent(memory = status, to = deviceId)
+                android.util.Log.i("Bridgey", "PLUGIN memory sent usedBytes=${status.usedBytes} totalBytes=${status.totalBytes}")
+            }
         }
     }
 
-    /** Peer's app came to the foreground and wants our telemetry - start the on-demand loop that
-     *  resends storage/memory (dead-band gated, as always), CPU, and temperature (always, being
-     *  rates/instant readings) every ~3s. Not gated here by any specific feature - each publish call
-     *  below independently no-ops if its own Settings toggle is off. */
+    /**
+     * One /proc/stat sample per tick, shared by every subscriber. The first sample after the first
+     * subscribe only seeds the baseline; a read failure sends an explicit `cpuUnavailable`.
+     */
+    private fun publishLocalCpu() {
+        val targets = telemetrySubscribers.deviceIds().filter { telemetryAllowed(TelemetryMetric.CPU, it) }
+        if (targets.isEmpty()) return
+        val sample = readProcStatCpuSample()
+        val previous = previousCpuSample
+        if (sample != null) previousCpuSample = sample
+        val status: CpuStatus = when {
+            sample == null -> CpuStatus.Unavailable
+            previous == null -> return // first sample: seed only, send nothing
+            else -> computeCpuPercent(previous, sample) ?: return
+        }
+        val payload = JSONObject().put("version", 1)
+        when (status) {
+            is CpuStatus.Available -> payload.put("cpuPercent", status.percent)
+            CpuStatus.Unavailable -> payload.put("cpuUnavailable", true)
+        }
+        val bytes = payload.toString().toByteArray()
+        targets.forEach { send(it, "telemetry.update", bytes) }
+        android.util.Log.i("Bridgey", "PLUGIN cpu sent $status")
+    }
+
+    /** Thermal state (plus best-effort Celsius) to every subscriber. */
+    fun publishLocalTemperature() {
+        val targets = telemetrySubscribers.deviceIds().filter { telemetryAllowed(TelemetryMetric.TEMPERATURE, it) }
+        if (targets.isEmpty()) return
+        val status = currentAndroidTemperatureStatus(appContext)
+        val payload = JSONObject().put("version", 1)
+        when (status) {
+            is TemperatureStatus.Known -> {
+                payload.put("thermalState", status.thermalState)
+                status.celsius?.let { payload.put("temperatureCelsius", it) }
+            }
+            TemperatureStatus.Unavailable -> payload.put("temperatureUnavailable", true)
+        }
+        val bytes = payload.toString().toByteArray()
+        targets.forEach { send(it, "telemetry.update", bytes) }
+        android.util.Log.i("Bridgey", "PLUGIN temperature sent $status")
+    }
+
+    /**
+     * MD-4c display side: the dashboard now shows [deviceId] (null = app not visible). Subscribes
+     * exactly that peer and unsubscribes the previous one - never the routed peer by default.
+     */
+    fun showTelemetry(deviceId: String?) {
+        // Decide and queue under the subscription's lock, so a concurrent sessionStarted cannot
+        // reorder an unsubscribe and a subscribe on the wire.
+        synchronized(telemetrySubscription) {
+            applyTelemetrySubscription(telemetrySubscription.show(deviceId) { peers.connectedSession(it) != null })
+        }
+    }
+
+    private fun applyTelemetrySubscription(changes: List<TelemetrySubscription.Change>) {
+        changes.forEach { change ->
+            val (deviceId, kind) = when (change) {
+                is TelemetrySubscription.Change.Subscribe -> change.deviceId to "telemetry.subscribe"
+                is TelemetrySubscription.Change.Unsubscribe -> change.deviceId to "telemetry.unsubscribe"
+            }
+            peers.deliver(deviceId) { session ->
+                session.outbox.enqueue { session.send(Message(kind = kind, sessionId = session.id)) }
+                true
+            }
+        }
+    }
+
+    /** A peer opened its panel on this phone: start (or join) the sampling loop, send values now. */
     private fun receiveTelemetrySubscribe(current: Session, message: Message) {
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        val sender = peers.connectedDeviceId(current) ?: return
+        if (message.sessionId != current.id) return
+        addTelemetrySubscriber(sender)
+        publishBattery(sender, force = true)
+        publishLocalStorage()
+        publishLocalMemory()
+    }
+
+    private fun receiveTelemetryUnsubscribe(current: Session, message: Message) {
+        val sender = peers.connectedDeviceId(current) ?: return
+        if (message.sessionId != current.id) return
+        removeTelemetrySubscriber(sender)
+    }
+
+    /** Guards the sampling job only (never held while sending or calling out). */
+    private val telemetrySamplingLock = Any()
+
+    /** "First subscriber" and the loop start happen as one step (sessions run on separate threads). */
+    private fun addTelemetrySubscriber(deviceId: String) = synchronized(telemetrySamplingLock) {
+        if (telemetrySubscribers.add(deviceId)) startTelemetrySampling()
+    }
+
+    /** "Last subscriber left" and the loop stop happen as one step. */
+    private fun removeTelemetrySubscriber(deviceId: String) = synchronized(telemetrySamplingLock) {
+        if (telemetrySubscribers.remove(deviceId)) stopTelemetrySampling()
+    }
+
+    private fun startTelemetrySampling() = synchronized(telemetrySamplingLock) {
         previousCpuSample = null
-        remoteWantsTelemetryUpdates = true
         telemetrySamplingJob?.cancel()
         telemetrySamplingJob = scope.launch {
-            while (remoteWantsTelemetryUpdates) {
+            while (!telemetrySubscribers.isEmpty()) {
                 publishLocalStorage()
                 publishLocalMemory()
                 publishLocalCpu()
@@ -728,128 +771,13 @@ class PairingCoordinator(
         }
     }
 
-    /** Stops the loop only - does NOT clear the last-known storage/memory/CPU/temperature values,
-     *  which stay visible (e.g. on the connected-device card) until the next real disconnect/reconnect. */
-    private fun receiveTelemetryUnsubscribe(current: Session, message: Message) {
-        if (message.sessionId != current.id) return
-        remoteWantsTelemetryUpdates = false
+    private fun stopTelemetrySampling() = synchronized(telemetrySamplingLock) {
         previousCpuSample = null
         telemetrySamplingJob?.cancel()
         telemetrySamplingJob = null
     }
 
-    /** Reads one /proc/stat sample and, if a previous sample exists, sends the computed delta as
-     *  `cpuPercent`. The first sample after a (re)subscribe only seeds the baseline - sending
-     *  nothing that tick avoids a flash of "unavailable" before the second tick has a real delta.
-     *  A read/parse failure, or a computation the sample math can't trust (rollover, zero elapsed
-     *  time), sends explicit `cpuUnavailable: true` rather than a fabricated number. */
-    private fun publishLocalCpu() {
-        if (!isFeatureAvailable(BridgeyFeature.CPU)) return
-        val connectedSession = activeSession ?: return
-        if (mutableState.value !is PairingState.Connected) return
-        val sample = readProcStatCpuSample()
-        val previous = previousCpuSample
-        if (sample != null) previousCpuSample = sample
-        val status: CpuStatus? = when {
-            sample == null -> CpuStatus.Unavailable
-            previous == null -> null // first sample this subscription: seed only, send nothing
-            else -> computeCpuPercent(previous, sample)
-        }
-        if (status == null) return
-        scope.launch {
-            if (activeSession !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
-            val pairingKey = connectedSession.pairingKey ?: return@launch
-            val payload = JSONObject().put("version", 1)
-            when (status) {
-                is CpuStatus.Available -> payload.put("cpuPercent", status.percent)
-                CpuStatus.Unavailable -> payload.put("cpuUnavailable", true)
-            }
-            val encrypted = Crypto.encrypt(pairingKey, payload.toString().toByteArray())
-            connectedSession.send(
-                Message(
-                    kind = "telemetry.update",
-                    sessionId = connectedSession.id,
-                    messageId = UUID.randomUUID().toString(),
-                    nonce = encrypted.nonce,
-                    ciphertext = encrypted.ciphertext,
-                ),
-            )
-            android.util.Log.i("Bridgey", "PLUGIN cpu sent $status")
-        }
-    }
-
-    /** Mirrors [publishLocalStorage]'s shape and cadence exactly - same background loop, same
-     *  dead-band principle - just a second independent metric on the same [Message] kind. */
-    fun publishLocalMemory(force: Boolean = false) {
-        if (!isFeatureAvailable(BridgeyFeature.MEMORY)) return
-        val connectedSession = activeSession ?: return
-        if (mutableState.value !is PairingState.Connected) return
-        val status = currentAndroidMemoryStatus(appContext) ?: return
-        val previous = lastSentMemory
-        if (!force && previous != null &&
-            status.totalBytes == previous.totalBytes &&
-            kotlin.math.abs(status.usedBytes - previous.usedBytes) < MEMORY_CHANGE_THRESHOLD_BYTES
-        ) {
-            return
-        }
-        scope.launch {
-            if (activeSession !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
-            val pairingKey = connectedSession.pairingKey ?: return@launch
-            val payload = JSONObject()
-                .put("version", 1)
-                .put("memoryUsedBytes", status.usedBytes)
-                .put("memoryTotalBytes", status.totalBytes)
-                .toString()
-                .toByteArray()
-            val encrypted = Crypto.encrypt(pairingKey, payload)
-            if (connectedSession.send(
-                    Message(
-                        kind = "telemetry.update",
-                        sessionId = connectedSession.id,
-                        messageId = UUID.randomUUID().toString(),
-                        nonce = encrypted.nonce,
-                        ciphertext = encrypted.ciphertext,
-                    ),
-                )
-            ) {
-                lastSentMemory = status
-                android.util.Log.i("Bridgey", "PLUGIN memory sent usedBytes=${status.usedBytes} totalBytes=${status.totalBytes}")
-            }
-        }
-    }
-
-    /** Thermal state is always sent when known (no dead-band - it rarely changes and is cheap to
-     *  encode); the bonus real Celsius reading (best-effort, device-specific) rides along whenever
-     *  it's available. An explicit unavailable state is sent rather than silence, matching CPU. */
-    private fun publishLocalTemperature() {
-        if (!isFeatureAvailable(BridgeyFeature.TEMPERATURE)) return
-        val connectedSession = activeSession ?: return
-        if (mutableState.value !is PairingState.Connected) return
-        val status = currentAndroidTemperatureStatus(appContext)
-        scope.launch {
-            if (activeSession !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
-            val pairingKey = connectedSession.pairingKey ?: return@launch
-            val payload = JSONObject().put("version", 1)
-            when (status) {
-                is TemperatureStatus.Known -> {
-                    payload.put("thermalState", status.thermalState)
-                    status.celsius?.let { payload.put("temperatureCelsius", it) }
-                }
-                TemperatureStatus.Unavailable -> payload.put("temperatureUnavailable", true)
-            }
-            val encrypted = Crypto.encrypt(pairingKey, payload.toString().toByteArray())
-            connectedSession.send(
-                Message(
-                    kind = "telemetry.update",
-                    sessionId = connectedSession.id,
-                    messageId = UUID.randomUUID().toString(),
-                    nonce = encrypted.nonce,
-                    ciphertext = encrypted.ciphertext,
-                ),
-            )
-            android.util.Log.i("Bridgey", "PLUGIN temperature sent $status")
-        }
-    }
+    // endregion
 
     /** Compatibility path without an explicit target: the routed device. */
     fun sendPing() {
@@ -1278,6 +1206,11 @@ class PairingCoordinator(
 
     /** MD-3: a device's session ended - drop only that device's Ping and Find state. */
     private fun deviceSessionEnded(deviceId: String) {
+        // MD-4c: only this peer's telemetry, subscription and dead-band state go away.
+        mutableTelemetry.update { DeviceTelemetryStore.remove(it, deviceId) }
+        lastSentBattery.remove(deviceId)
+        removeTelemetrySubscriber(deviceId)
+        telemetrySubscription.sessionEnded(deviceId)
         if (pings.deviceEnded(deviceId)) mutablePingStatus.value = "${displayName(deviceId)} disconnected"
         synchronized(findLock) {
             if (find.deviceEnded(deviceId)) stopPhoneRinging()
@@ -1598,11 +1531,12 @@ class PairingCoordinator(
             mutableRemoteRinging.value = emptySet()
             stopPhoneRinging()
         }
-        mutableRemoteBattery.value = null
-        mutableRemoteStorage.value = null
-        lastSentStorage = null
-        resetRemoteMemoryState()
-        resetTelemetrySubscriptionState()
+        mutableTelemetry.value = emptyMap()
+        lastSentBattery.clear()
+        synchronized(telemetrySamplingLock) {
+            telemetrySubscribers.reset()
+            stopTelemetrySampling()
+        }
         clearPingStatus()
         quickActions.reset()
         mediaRemote.reset()
@@ -1808,18 +1742,9 @@ class PairingCoordinator(
      * No session, capability, trust or connection state changes, and no capability update is sent.
      */
     private fun activePeerChanged(previous: Session?) {
-        if (localWantsRemoteTelemetryUpdates && previous != null && peers.phase(previous) == PeerSessionPhase.CONNECTED) {
-            // Battery-conscious: the device we no longer show must stop sampling for us.
-            previous.outbox.enqueue { previous.send(Message(kind = "telemetry.unsubscribe", sessionId = previous.id)) }
-        }
         // (4) Transfers and acknowledgements bound to the previous peer cannot complete through the
         // feature layer any more; finish them now instead of letting them time out.
         if (previous != null) interruptFeatureTransfers()
-        mutableRemoteBattery.value = null
-        mutableRemoteStorage.value = null
-        lastSentStorage = null
-        resetRemoteMemoryState()
-        resetTelemetrySubscriptionState()
         quickActions.reset()
         mediaRemote.reset()
         videoChannel.reset()
@@ -1833,7 +1758,6 @@ class PairingCoordinator(
             applyRemoteFeatures(BridgeyFeature.entries.associateWith { capabilities[it.key] ?: false })
         }
         mediaRemote.sendFreshState()
-        if (localWantsRemoteTelemetryUpdates) sendTelemetrySubscription(subscribe = true)
         // BRIDGEY NOTIFICATION++ RECONCILIATION: a newly routed session starts "not yet reconciled".
         refreshNotificationForwardingAvailability(sessionStarted = true)
     }
@@ -1889,6 +1813,8 @@ class PairingCoordinator(
     /** MD-3: features that address devices explicitly; consumed from every connected session. */
     private val deviceAddressedMessageKinds = setOf(
         "ping.request", "ping.ack", "find.start", "find.stop", "find.started", "find.stopped",
+        // MD-4c: telemetry is per peer in both directions.
+        "battery.update", "telemetry.update", "telemetry.subscribe", "telemetry.unsubscribe",
     )
 
     private fun receive(current: Session, message: Message) {
@@ -2679,6 +2605,18 @@ class PairingCoordinator(
         // Features: only the routed session's capabilities drive today's single-peer features.
         if (current === activeSession) applyRemoteFeatures(received)
         if (previousCapabilities != capabilities) peerLifecycle.authorizationChanged(setOf(current.remoteDeviceId))
+        // MD-4c: this peer's telemetry follows its own grant; it gets our battery right away.
+        val peerId = current.remoteDeviceId
+        mutableTelemetry.update { map ->
+            DeviceTelemetryStore.prune(map) { id, metric -> id != peerId || received[metric.feature] != false }
+        }
+        publishBattery(peerId, force = true)
+        if (peerId in telemetrySubscribers.deviceIds()) {
+            // A re-enabled metric must not wait for the 100 MiB dead-band.
+            telemetrySubscribers.resetDeadBand(peerId)
+            publishLocalStorage()
+            publishLocalMemory()
+        }
         // MD-3: Ping/Find state of exactly this device follows its own grant.
         if (received[BridgeyFeature.PING] == false && pings.deviceEnded(current.remoteDeviceId)) {
             mutablePingStatus.value = "Ping is turned off on ${current.peerName}"
@@ -2699,16 +2637,12 @@ class PairingCoordinator(
         mediaRemote.policyChanged()
         refreshNotificationForwardingAvailability()
         if (received[BridgeyFeature.CLIPBOARD] == false) mutableClipboardStatus.value = null
-        if (received[BridgeyFeature.BATTERY] == false) mutableRemoteBattery.value = null
-        if (received[BridgeyFeature.STORAGE] == false) mutableRemoteStorage.value = null
-        if (received[BridgeyFeature.MEMORY] == false) mutableRemoteMemory.value = null
-        if (received[BridgeyFeature.CPU] == false) mutableRemoteCpu.value = null
-        if (received[BridgeyFeature.TEMPERATURE] == false) mutableRemoteTemperature.value = null
     }
 
     private fun receiveBattery(current: Session, message: Message) {
         if (!featureEnabled(BridgeyFeature.BATTERY, current)) return
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        val sender = peers.connectedDeviceId(current) ?: return
+        if (message.sessionId != current.id) return
         val messageId = message.messageId ?: return
         if (!current.acceptMessageId(messageId)) return
         val plaintext = Crypto.decrypt(
@@ -2720,14 +2654,18 @@ class PairingCoordinator(
             ?: return failSession(current, "Invalid battery status")
         val level = payload.optInt("level", -1)
         if (level !in 0..100 || payload.opt("isCharging") !is Boolean) return failSession(current, "Invalid battery status")
-        mutableRemoteBattery.value = RemoteBatteryStatus(level, payload.getBoolean("isCharging"))
+        val battery = RemoteBatteryStatus(level, payload.getBoolean("isCharging"))
+        mutableTelemetry.update { DeviceTelemetryStore.update(it, sender) { values -> values.copy(battery = battery) } }
         android.util.Log.i("Bridgey", "PLUGIN battery received level=$level")
     }
 
     /** Not gated by a single telemetry feature at the top - each field block below independently
      *  checks its own Settings toggle, since Storage/Memory/CPU/Temperature are now independent. */
     private fun receiveStorageTelemetry(current: Session, message: Message) {
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        // MD-4c: values belong to the sender.
+        val sender = peers.connectedDeviceId(current) ?: return
+        if (message.sessionId != current.id) return
+        fun store(change: (DeviceTelemetry) -> DeviceTelemetry) = mutableTelemetry.update { DeviceTelemetryStore.update(it, sender, change) }
         val messageId = message.messageId ?: return
         if (!current.acceptMessageId(messageId)) return
         val plaintext = Crypto.decrypt(
@@ -2743,7 +2681,7 @@ class PairingCoordinator(
             val usedBytes = payload.optLong("storageUsedBytes", -1)
             val totalBytes = payload.optLong("storageTotalBytes", -1)
             if (usedBytes < 0 || totalBytes <= 0 || usedBytes > totalBytes) return failSession(current, "Invalid storage status")
-            mutableRemoteStorage.value = RemoteStorageStatus(usedBytes, totalBytes)
+            store { it.copy(storage = RemoteStorageStatus(usedBytes, totalBytes)) }
             android.util.Log.i("Bridgey", "PLUGIN storage received usedBytes=$usedBytes totalBytes=$totalBytes")
         }
         if (featureEnabled(BridgeyFeature.MEMORY, current) &&
@@ -2752,30 +2690,30 @@ class PairingCoordinator(
             val usedBytes = payload.optLong("memoryUsedBytes", -1)
             val totalBytes = payload.optLong("memoryTotalBytes", -1)
             if (usedBytes < 0 || totalBytes <= 0 || usedBytes > totalBytes) return failSession(current, "Invalid memory status")
-            mutableRemoteMemory.value = RemoteMemoryStatus(usedBytes, totalBytes)
+            store { it.copy(memory = RemoteMemoryStatus(usedBytes, totalBytes)) }
             android.util.Log.i("Bridgey", "PLUGIN memory received usedBytes=$usedBytes totalBytes=$totalBytes")
         }
         if (featureEnabled(BridgeyFeature.CPU, current)) {
             if (payload.has("cpuUnavailable")) {
-                mutableRemoteCpu.value = RemoteCpuStatus.Unavailable
+                store { it.copy(cpu = RemoteCpuStatus.Unavailable) }
                 android.util.Log.i("Bridgey", "PLUGIN cpu received unavailable")
             } else if (payload.has("cpuPercent")) {
                 val percent = payload.optInt("cpuPercent", -1)
                 if (percent !in 0..100) return failSession(current, "Invalid cpu status")
-                mutableRemoteCpu.value = RemoteCpuStatus.Available(percent)
+                store { it.copy(cpu = RemoteCpuStatus.Available(percent)) }
                 android.util.Log.i("Bridgey", "PLUGIN cpu received percent=$percent")
             }
         }
         if (featureEnabled(BridgeyFeature.TEMPERATURE, current)) {
             if (payload.has("temperatureUnavailable")) {
-                mutableRemoteTemperature.value = RemoteTemperatureStatus.Unavailable
+                store { it.copy(temperature = RemoteTemperatureStatus.Unavailable) }
                 android.util.Log.i("Bridgey", "PLUGIN temperature received unavailable")
             } else if (payload.has("thermalState")) {
                 val state = payload.optString("thermalState", "")
                 if (state.isEmpty()) return failSession(current, "Invalid temperature status")
                 val celsius = if (payload.has("temperatureCelsius")) payload.optInt("temperatureCelsius", Int.MIN_VALUE) else null
                 if (celsius == Int.MIN_VALUE) return failSession(current, "Invalid temperature status")
-                mutableRemoteTemperature.value = RemoteTemperatureStatus.Known(state, celsius)
+                store { it.copy(temperature = RemoteTemperatureStatus.Known(state, celsius)) }
                 android.util.Log.i("Bridgey", "PLUGIN temperature received state=$state celsius=$celsius")
             }
         }

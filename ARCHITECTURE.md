@@ -208,6 +208,8 @@ domain's code has moved, its README lists where the code lives today.
 | MD-1 routing foundation (addressed send, receive identity, per-device lifecycle, device directory, applicability) | done — no feature migrated yet, see [messaging](core/messaging/README.md) |
 | MD-2 device profiles and directional applicability per product feature | done — not used by features yet |
 | MD-3 Ping and Find Device addressed by deviceId (first feature migration) | done — see [ping](features/ping/README.md), [find](features/find/README.md) |
+| MD-4 multi-device UI: peer list from the directory, UI-only selection, selected-peer card, addressed disconnect, Ping/Find on the selected peer | done — see [ui](ui/README.md) |
+| MD-4c per-device telemetry: the selected peer's own values, subscription follows the shown peer | done — see [telemetry](features/telemetry/README.md) |
 | Documentation (this file, domain READMEs, component docs) | in progress |
 | Domain source tree: build skeleton (root `Package.swift`, Gradle source dirs for `features/*`) | done |
 | Feature moves into `features/` | in progress |
