@@ -25,7 +25,7 @@ struct LocalDevice {
     let platform = "macos"
     let deviceType = "computer"
 
-    var identityKey: String { identity.publicKey }
+    var identityKey: String? { identity.publicKey }
 
     /// Loads this Mac's persistent identity from the same stores as before (UserDefaults
     /// `deviceID`, Keychain `dev.bridgey.identity`). Identity generation is unchanged.

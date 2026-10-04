@@ -600,8 +600,15 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func confirm(_ current: Session) {
+        // R1: without a readable identity nothing is presented - never a substitute key.
+        guard identity.reloadIfUnavailable(), let identityKey = identity.publicKey,
+              let signature = identity.sign(authTranscript(current)) else {
+            NSLog("IDENTITY unavailable; closing session instead of presenting an identity")
+            failureMessage = "This Mac's identity is temporarily unavailable (Keychain). Try again after unlocking."
+            endSession(current, scheduleReconnect: true)
+            return
+        }
         current.localConfirmed = true
-        let identityKey = identity.publicKey
         current.send(PairingMessage(
             kind: "pairing.confirm",
             sessionId: current.id,
@@ -613,7 +620,7 @@ final class PairingCoordinator: ObservableObject {
                 deviceID: deviceID,
                 identityKey: identityKey
             ),
-            signature: identity.sign(authTranscript(current))
+            signature: signature
         ))
         completeIfConfirmed(current)
     }
@@ -3543,42 +3550,118 @@ private final class IncomingFileTransfer {
     }
 }
 
+/// This Mac's long-term identity key. R1: the identity must never silently change because of a
+/// Keychain error - only a confirmed "nothing stored yet" (errSecItemNotFound) creates a key. Any
+/// other failure leaves the identity unavailable (nothing is signed or presented) until a later
+/// reload succeeds, so peers never see a new key for this deviceId.
 final class MacIdentity {
-    private let service = "dev.bridgey.identity"
-    private let account = "p256-signing-v1"
-    private let key: P256.Signing.PrivateKey
+    enum Status: Equatable {
+        case available
+        /// Keychain could not be read (locked, interaction not allowed, I/O, ...). Retried later.
+        case unavailable(OSStatus)
+        /// A key is stored but cannot be decoded. Never overwritten automatically.
+        case unreadable
+    }
 
-    init() {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-           let data = item as? Data,
-           let stored = try? P256.Signing.PrivateKey(rawRepresentation: data) {
-            key = stored
-        } else {
-            let generated = P256.Signing.PrivateKey()
-            key = generated
-            let add: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: service,
-                kSecAttrAccount as String: account,
-                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-                kSecValueData as String: generated.rawRepresentation,
-            ]
-            SecItemDelete(query as CFDictionary)
-            SecItemAdd(add as CFDictionary, nil)
+    /// The two Keychain operations identity needs, injectable for tests.
+    struct KeychainAccess {
+        let copy: () -> (OSStatus, Data?)
+        let add: (Data) -> OSStatus
+
+        static func system(service: String, account: String) -> KeychainAccess {
+            KeychainAccess(
+                copy: {
+                    var query = baseQuery(service: service, account: account)
+                    query[kSecReturnData as String] = true
+                    query[kSecMatchLimit as String] = kSecMatchLimitOne
+                    var item: CFTypeRef?
+                    let status = SecItemCopyMatching(query as CFDictionary, &item)
+                    return (status, item as? Data)
+                },
+                add: { data in
+                    var item = baseQuery(service: service, account: account)
+                    item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+                    item[kSecValueData as String] = data
+                    return SecItemAdd(item as CFDictionary, nil)
+                }
+            )
         }
     }
 
-    var publicKey: String { key.publicKey.x963Representation.base64EncodedString() }
+    static let defaultService = "dev.bridgey.identity"
+    static let defaultAccount = "p256-signing-v1"
 
-    func sign(_ data: Data) -> String {
-        (try? key.signature(for: data).derRepresentation.base64EncodedString()) ?? ""
+    private let keychain: KeychainAccess
+    private var key: P256.Signing.PrivateKey?
+    private(set) var status: Status = .unavailable(errSecNotAvailable)
+
+    convenience init(service: String = MacIdentity.defaultService, account: String = MacIdentity.defaultAccount) {
+        self.init(keychain: .system(service: service, account: account))
+    }
+
+    init(keychain: KeychainAccess) {
+        self.keychain = keychain
+        load()
+    }
+
+    var isAvailable: Bool { status == .available }
+
+    /// Base64 X9.63 public key, or nil while the identity is unavailable.
+    var publicKey: String? { key?.publicKey.x963Representation.base64EncodedString() }
+
+    /// DER ECDSA signature, or nil while the identity is unavailable.
+    func sign(_ data: Data) -> String? {
+        guard let key else { return nil }
+        return try? key.signature(for: data).derRepresentation.base64EncodedString()
+    }
+
+    /// Retries a failed load (e.g. Keychain locked at launch). Never replaces an existing key.
+    @discardableResult
+    func reloadIfUnavailable() -> Bool {
+        if !isAvailable { load() }
+        return isAvailable
+    }
+
+    private func load() {
+        let (copyStatus, data) = keychain.copy()
+        switch copyStatus {
+        case errSecSuccess:
+            guard let data, let stored = try? P256.Signing.PrivateKey(rawRepresentation: data) else {
+                key = nil
+                status = .unreadable
+                NSLog("IDENTITY stored key is unreadable; not replacing it")
+                return
+            }
+            key = stored
+            status = .available
+        case errSecItemNotFound:
+            // First launch: the only case in which a new identity may be created.
+            let generated = P256.Signing.PrivateKey()
+            let addStatus = keychain.add(generated.rawRepresentation)
+            guard addStatus == errSecSuccess else {
+                key = nil
+                status = .unavailable(addStatus)
+                NSLog("IDENTITY could not persist a new identity (status=%d)", addStatus)
+                return
+            }
+            key = generated
+            status = .available
+        default:
+            key = nil
+            status = .unavailable(copyStatus)
+            NSLog("IDENTITY Keychain unavailable (status=%d); identity kept, will retry", copyStatus)
+        }
+    }
+
+    private static func baseQuery(service: String, account: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+    }
+
+    static func deleteForTesting(service: String, account: String = MacIdentity.defaultAccount) {
+        SecItemDelete(baseQuery(service: service, account: account) as CFDictionary)
     }
 }
