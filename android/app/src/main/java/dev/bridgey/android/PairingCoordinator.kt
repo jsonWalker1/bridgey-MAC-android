@@ -1556,7 +1556,7 @@ class PairingCoordinator(
         socket.keepAlive = true
         socket.tcpNoDelay = true
         socket.soTimeout = HEARTBEAT_INTERVAL_MILLIS.toInt()
-        val current = Session(socket)
+        val current = Session(socket, SessionWriter(scope))
         current.initiatedLocally = initiatedLocally
         current.expectedDeviceId = expectedDeviceId
         dialKey?.let(outgoingDials::remove)
@@ -1722,7 +1722,7 @@ class PairingCoordinator(
     private fun activePeerChanged(previous: Session?) {
         if (localWantsRemoteTelemetryUpdates && previous != null && peers.phase(previous) == PeerSessionPhase.CONNECTED) {
             // Battery-conscious: the device we no longer show must stop sampling for us.
-            scope.launch { previous.send(Message(kind = "telemetry.unsubscribe", sessionId = previous.id)) }
+            previous.outbox.enqueue { previous.send(Message(kind = "telemetry.unsubscribe", sessionId = previous.id)) }
         }
         // (4) Transfers and acknowledgements bound to the previous peer cannot complete through the
         // feature layer any more; finish them now instead of letting them time out.
@@ -2456,7 +2456,9 @@ class PairingCoordinator(
 
     /** Sends every connected session its real local feature state; never depends on the active peer. */
     private fun sendFeatureState() {
-        peers.identifiedSessions().forEach(::sendFeatureState)
+        // Session isolation: each peer's features.update goes through that session's own outbox, so
+        // one peer that stops reading cannot delay any other peer (or the settings collector).
+        peers.identifiedSessions().forEach { session -> session.outbox.enqueue { sendFeatureState(session) } }
     }
 
     private fun sendFeatureState(current: Session) {
@@ -2659,7 +2661,7 @@ class PairingCoordinator(
         const val MEMORY_CHANGE_THRESHOLD_BYTES = 100L * 1024 * 1024
     }
 
-    private class Session(private val socket: Socket) {
+    private class Session(private val socket: Socket, val outbox: SessionWriter) {
         // Used by VideoChannelManager to dial the dedicated video/input socket to the same peer
         // this control session is already talking to - no separate discovery/addressing needed.
         val remoteHost: String? = socket.inetAddress?.hostAddress

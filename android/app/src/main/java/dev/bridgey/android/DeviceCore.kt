@@ -385,6 +385,21 @@ internal fun acceptConnections(
     }
 }
 
+/**
+ * One serial writer per session. Writes fanned out to several peers are queued here instead of
+ * being written one after another on the caller's thread, so a peer that stops reading (zero TCP
+ * window) can only ever block its own queue - never another session's writes or the caller.
+ * Writes of one session stay in order and never overlap.
+ */
+internal class SessionWriter(private val scope: CoroutineScope) {
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val dispatcher = kotlinx.coroutines.Dispatchers.IO.limitedParallelism(1)
+
+    fun enqueue(write: () -> Unit) {
+        scope.launch(dispatcher) { runCatching(write) }
+    }
+}
+
 // endregion
 
 // region Routing compatibility seam
