@@ -9,7 +9,7 @@ persistent status notification (connected device, "No Wi-Fi", transfers, Find de
 ## Why it exists
 Without a running foreground service Samsung's Freecess freezes the app and the Mac connection drops
 every few seconds (observed on a Galaxy S23 Ultra). The service is the app's "keep alive" contract;
-the battery exemption ([BackgroundRunning](BackgroundRunning.md)) only covers the gaps.
+the battery exemption ([BackgroundRunning](../../../../../../../../context/android/BackgroundRunning.md)) only covers the gaps.
 
 ## Ownership / non-responsibilities
 Owns the foreground notification and its actions (Stop, cancel transfer, stop finding, Remote Start
@@ -34,4 +34,4 @@ service (when Android rebinds it in a fresh process after an update). All must c
 `ConnectionServiceStartTest.kt`, `ConnectionStatusTextTest.kt`.
 
 ## Related
-[BackgroundRunning](BackgroundRunning.md) · `BridgeyApplication.kt` · [app](../../../../../../../../app/README.md)
+[BackgroundRunning](../../../../../../../../context/android/BackgroundRunning.md) · `BridgeyApplication.kt` · [app](../../../../../../../../app/README.md)

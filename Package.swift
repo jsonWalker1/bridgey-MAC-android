@@ -19,6 +19,10 @@ let features = ["calls", "clipboard", "files", "handoff", "media", "notification
 /// Platform adapter directories that have moved into platform/macos/.
 let platformSources = ["platform/macos/transport"]
 
+/// Non-feature domain directories (keep in sync with android/app/build.gradle.kts).
+let domainSources = ["diagnostics/macos"]
+let domainTestSources = ["diagnostics/tests/macos"]
+
 let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 let fileManager = FileManager.default
 
@@ -51,8 +55,8 @@ func everythingExcept(_ sources: [String], under relative: String = "") -> [Stri
     }
 }
 
-let appSources = ["macos/Sources/BridgeyMac"] + featureDirectories("macos") + platformSources
-let testSources = ["macos/Tests/BridgeyMacTests"] + featureDirectories("tests/macos")
+let appSources = ["macos/Sources/BridgeyMac"] + featureDirectories("macos") + platformSources + domainSources
+let testSources = ["macos/Tests/BridgeyMacTests"] + featureDirectories("tests/macos") + domainTestSources
 
 let package = Package(
     name: "Bridgey",

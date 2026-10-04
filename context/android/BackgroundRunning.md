@@ -19,4 +19,4 @@ Does **not** start or keep the foreground service (`BridgeyConnectionService`, s
 and by the accessibility service — only while Bridgey is on).
 
 ## Related
-`BridgeyConnectionService.kt` · [context](../../../../../../../../context/README.md)
+`BridgeyConnectionService.kt` · [context](../README.md)

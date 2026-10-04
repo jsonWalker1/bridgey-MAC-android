@@ -4,7 +4,8 @@
 
 **Owns:** entry points, the composition root (create Identity/Trust/Presence/Connection,
 features and the routing seam, then connect them), OS lifecycle (Android foreground service,
-boot receiver, battery exemption flow; macOS launch at login, shortcuts), and commands from the
+boot receiver; macOS launch at login, shortcuts — the battery-exemption check and dialog live in
+[context](../context/README.md)), and commands from the
 UI that manage devices (pair, confirm code, cancel, forget, select preferred device).
 **Does not own:** protocol, crypto, handlers, feature state. The final runtime *composes* the
 system; it does not own it.

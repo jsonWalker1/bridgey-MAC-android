@@ -16,6 +16,10 @@ val repositoryRoot: File = rootDir.parentFile
 val features = listOf("calls", "clipboard", "files", "handoff", "media", "notifications", "photos", "screen-share", "telemetry")
 fun featureDirectories(subdirectory: String): List<File> =
     features.map { repositoryRoot.resolve("features/$it/$subdirectory") }.filter { it.isDirectory }
+/** Non-feature domains with Android code in <domain>/android and <domain>/tests/android (keep in sync with Package.swift). */
+val domains = listOf("context", "diagnostics")
+fun domainDirectories(subdirectory: String): List<File> =
+    domains.map { repositoryRoot.resolve("$it/$subdirectory") }.filter { it.isDirectory }
 
 android {
     namespace = "dev.bridgey.android"
@@ -57,8 +61,8 @@ android {
     }
 
     sourceSets {
-        getByName("main").kotlin.directories.addAll(featureDirectories("android").map { it.path })
-        getByName("test").kotlin.directories.addAll(featureDirectories("tests/android").map { it.path })
+        getByName("main").kotlin.directories.addAll((featureDirectories("android") + domainDirectories("android")).map { it.path })
+        getByName("test").kotlin.directories.addAll((featureDirectories("tests/android") + domainDirectories("tests/android")).map { it.path })
     }
 
     buildFeatures { compose = true }

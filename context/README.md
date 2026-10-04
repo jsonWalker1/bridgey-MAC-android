@@ -15,7 +15,7 @@ in that feature. No global event bus — consumers observe the values they need.
 ## Code today
 | Fact | Where |
 |---|---|
-| Battery-optimisation exemption (Android) | `BackgroundRunning.kt` |
+| Battery-optimisation exemption (Android) | [`android/BackgroundRunning.kt`](android/BackgroundRunning.md) (fact + the one-time system dialog) |
 | Notification permission (macOS) | `refreshNotificationAuthorization` in `Pairing.swift` |
 | Local Network denied (macOS) | `localNetworkPermissionDenied` in `Reliability.swift` |
 | Network lost / Wi-Fi available (Android) | `NetworkCallback` in `PairingCoordinator.kt`, Wi-Fi watch in `BridgeyConnectionService.kt` |
