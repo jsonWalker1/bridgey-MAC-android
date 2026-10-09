@@ -105,6 +105,8 @@ final class BridgeySettings: ObservableObject {
     @Published private(set) var deviceRoutingMode: DeviceRoutingMode
     /// The device today's single-peer features prefer when it is connected. Kept while offline.
     @Published private(set) var preferredDeviceID: String?
+    /// MD-6: file transfers with other Macs. Off by default; Android <-> Mac is unaffected.
+    @Published private(set) var macToMacFilesEnabled: Bool
 
     private let defaults = UserDefaults.standard
 
@@ -117,6 +119,7 @@ final class BridgeySettings: ObservableObject {
         deviceRoutingMode = storedDefaults.string(forKey: "settings.routing.mode")
             .flatMap(DeviceRoutingMode.init(rawValue:)) ?? .singleActive
         preferredDeviceID = storedDefaults.string(forKey: "settings.routing.preferredDeviceID")
+        macToMacFilesEnabled = storedDefaults.bool(forKey: "settings.files.macToMac.enabled")
         globalFeatures = Dictionary(uniqueKeysWithValues: BridgeyFeature.allCases.map {
             ($0, storedDefaults.object(forKey: "settings.global.\($0.rawValue)") as? Bool ?? !(([.media, .photoSync] as Set<BridgeyFeature>).union(BridgeyFeature.optIn).contains($0)))
         })
@@ -157,6 +160,11 @@ final class BridgeySettings: ObservableObject {
     func setGlobal(_ feature: BridgeyFeature, enabled: Bool) {
         defaults.set(enabled, forKey: "settings.global.\(feature.rawValue)")
         globalFeatures[feature] = enabled
+    }
+
+    func setMacToMacFilesEnabled(_ enabled: Bool) {
+        defaults.set(enabled, forKey: "settings.files.macToMac.enabled")
+        macToMacFilesEnabled = enabled
     }
 
     func setNotificationHistoryEnabled(_ enabled: Bool) {

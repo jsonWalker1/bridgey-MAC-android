@@ -329,10 +329,21 @@ failure without requiring broad storage access.
 Either peer can send `files.cancel` with the transfer ID. The sender stops
 reading and sending chunks, while the receiver closes and deletes its partial
 file. Cancellation is idempotent and leaves the authenticated session usable.
-For Mac-to-Android transfers, Android sends cumulative `files.chunk.ack`
-messages and macOS keeps at most 64 chunks (1.5 MiB) unacknowledged. This bounds
-memory and cancellation latency without limiting throughput to one network
-round trip per chunk.
+Receivers send cumulative `files.chunk.ack` messages (transfer ID and the
+sequence of the last chunk written); macOS senders keep at most 64 chunks
+(1.5 MiB) unacknowledged. This bounds memory and cancellation latency without
+limiting throughput to one network round trip per chunk. Android receivers have
+always sent them; macOS receivers send them since MD-6, which makes Mac-to-Mac
+transfers work. Android senders keep no window and ignore them. A sender only
+moves its acknowledged position forward and never past a chunk it actually sent,
+so duplicate, reordered, late or bogus acknowledgements cannot advance flow
+control. A transfer belongs to the authenticated peer it was offered to or by:
+its messages are correlated by (sender device ID, transfer ID), never by
+transfer ID alone. A macOS sender sending to an older macOS receiver (no
+acknowledgements) stops after 64 chunks with a visible failure.
+Mac-to-Mac transfers require the local "Allow file transfers with other Macs"
+opt-in (off by default) on both ends; a receiver without it answers
+`files.rejected`.
 An offer repeats its transfer ID in the outer session message so a receiver
 whose local file policy is disabled can return `files.rejected` without
 decrypting or accepting the offer. It then resends `features.update` to repair

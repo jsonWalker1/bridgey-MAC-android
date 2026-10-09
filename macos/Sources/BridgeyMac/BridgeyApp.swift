@@ -11,7 +11,8 @@ struct BridgeyApp: App {
     /// MD-4: which device the user selected in the panel's device list. UI state only.
     @StateObject private var deviceSelection = DeviceSelection()
     private let settingsWindow: SettingsWindowController
-    private let callServiceProvider: CallServiceProvider
+    /// NSServices: "Call with Bridgey" and Finder's "Send to Bridgey…".
+    private let services: BridgeyServices
     private let globalMediaCommandCenter: GlobalMediaCommandCenter
 
     init() {
@@ -25,9 +26,15 @@ struct BridgeyApp: App {
         pairing.observe(discovery)
         _pairing = StateObject(wrappedValue: pairing)
         let callServiceProvider = CallServiceProvider { [weak pairing] number in pairing?.sendCallWhenConnected(number) }
-        self.callServiceProvider = callServiceProvider
-        NSApplication.shared.servicesProvider = callServiceProvider
-        settingsWindow = SettingsWindowController(discovery: discovery, pairing: pairing, settings: settings)
+        let settingsWindow = SettingsWindowController(discovery: discovery, pairing: pairing, settings: settings)
+        self.settingsWindow = settingsWindow
+        services = BridgeyServices(
+            call: callServiceProvider,
+            files: FileSendServiceProvider(pairing: pairing, onOpenSettings: settingsWindow.show)
+        )
+        NSApplication.shared.servicesProvider = services
+        NSUpdateDynamicServices()
+
         globalMediaCommandCenter = GlobalMediaCommandCenter(mediaRemote: pairing.mediaRemote, mediaController: pairing.mediaController)
         phoneURLHandler.configure { [weak pairing] number in pairing?.sendCallWhenConnected(number) }
     }
@@ -340,8 +347,10 @@ private struct BridgeyPanel: View {
                     actionButton("Clipboard", icon: "doc.on.clipboard") { pairing.sendClipboard(to: device.deviceID) }
                         .help("Send the clipboard to \(device.name)")
                 }
-                if legacy && pairing.isFeatureAvailable(.files) {
-                    actionButton("File", icon: "paperplane") { pairing.chooseAndSendFile() }
+                // MD-6: files go to this peer, whichever peer legacy features use.
+                if isEligible(device, for: .files) {
+                    actionButton("Send Files…", icon: "paperplane") { pairing.chooseAndSendFiles(to: device.deviceID) }
+                        .help("Choose files to send to \(device.name)")
                 }
                 // MD-3/4b: Ping and Find act on this peer itself.
                 if pairing.find.isRinging(device.deviceID) {
@@ -368,29 +377,6 @@ private struct BridgeyPanel: View {
                 }
             }
             if legacy { QuickActionsPanel(actions: pairing.quickActions) }
-            if legacy && pairing.isFeatureAvailable(.files) {
-                Button { pairing.showFileDropWindow() } label: {
-                    Label(
-                        L10n.text("drop.open", fallback: "Open file drop window"),
-                        systemImage: "rectangle.on.rectangle.angled"
-                    )
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.plain)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .background(
-                        Color.accentColor.opacity(0.08),
-                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .strokeBorder(Color.accentColor.opacity(0.3), style: StrokeStyle(lineWidth: 1, dash: [4]))
-                    )
-                    .accessibilityHint("Opens a window that stays visible while you drag a file from Finder")
-            }
             if legacy &&
                 !isEligible(device, for: .clipboard) &&
                 !pairing.isFeatureAvailable(.files) &&
@@ -713,6 +699,12 @@ private struct SettingsView: View {
                     LabeledContent("Received files", value: settings.receiveFolderPath)
                     Button("Choose…") { settings.chooseReceiveFolder() }
                 }
+                Toggle("Allow file transfers with other Macs", isOn: Binding(
+                    get: { settings.macToMacFilesEnabled },
+                    set: { settings.setMacToMacFilesEnabled($0) }
+                ))
+                Text("Off by default. When off, this Mac neither offers files to nor accepts files from other Macs. Android devices are not affected.")
+                    .font(.caption).foregroundStyle(.secondary)
                 HStack {
                     LabeledContent("Synced photos & videos", value: settings.syncFolderPath)
                     Button("Choose…") { settings.chooseSyncFolder() }

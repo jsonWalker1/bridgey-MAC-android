@@ -63,6 +63,18 @@
             <key>NSSendTypes</key>
             <array><string>public.utf8-plain-text</string></array>
         </dict>
+        <dict>
+            <key>NSMenuItem</key>
+            <dict><key>default</key><string>Send to Bridgey…</string></dict>
+            <key>NSMessage</key>
+            <string>sendToBridgey</string>
+            <key>NSPortName</key>
+            <string>BridgeyMac</string>
+            <key>NSSendFileTypes</key>
+            <array><string>public.item</string></array>
+            <key>NSRequiredContext</key>
+            <dict/>
+        </dict>
     </array>
 </dict>
 </plist>

@@ -16,7 +16,8 @@ import android.widget.Toast
 object ReceivedFileNotifier {
     private const val CHANNEL_ID = "bridgey_received_files_v1"
 
-    fun show(context: Context, name: String, mimeType: String, uri: Uri) {
+    /** [from] is the peer that sent the file (MD-6). */
+    fun show(context: Context, name: String, mimeType: String, uri: Uri, from: String) {
         val manager = context.getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Received files", NotificationManager.IMPORTANCE_DEFAULT).apply {
@@ -39,7 +40,7 @@ object ReceivedFileNotifier {
             uri.toString().hashCode(),
             Notification.Builder(context, CHANNEL_ID)
                 .setSmallIcon(dev.bridgey.android.R.drawable.ic_bridgey_notification)
-                .setContentTitle("File received")
+                .setContentTitle("File received from $from")
                 .setContentText(name)
                 .setSubText("Download/Bridgey")
                 .setContentIntent(pendingIntent)

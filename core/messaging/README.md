@@ -78,7 +78,11 @@ CPU, temperature) is per peer in both directions.
 **Migrated (MD-5):** [clipboard](../../features/clipboard/README.md) sends go to an explicit peer
 and are accepted from any connected peer with its own grant.
 
-**Still on `activeSession`:** files, photo sync, notifications (forwarding, actions,
+**Migrated (MD-6):** [files](../../features/files/README.md) transfers belong to one peer, keyed
+(deviceId, transferId); `files.*` is accepted from any connected peer. Photo sync reuses the same
+engine but still targets the routed peer, resolved when an asset starts.
+
+**Still on `activeSession`:** photo sync (target only), notifications (forwarding, actions,
 dismiss, Clear All), calls, media (both directions), quick actions / links / Web and Books Handoff,
 screen share / Remote Start (video channel providers) and KVM (input channel, frozen). The inactive-peer gate in `receive` still drops their messages from non-routed
 devices.

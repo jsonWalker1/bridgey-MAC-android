@@ -33,9 +33,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import android.text.format.Formatter
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.RadioButton
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -67,6 +69,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -694,16 +697,16 @@ private fun BridgeyApp(
     }
 
     sharedContent?.let { content ->
-        val isConnected = pairingState is PairingState.Connected
-        val requiredFeature = if (content.files.isNotEmpty()) BridgeyFeature.FILES else BridgeyFeature.CLIPBOARD
-        val featureAvailable = settings.isEnabled(
-            requiredFeature,
-            (pairingState as? PairingState.Connected)?.deviceId,
-        ) && remoteFeatures[requiredFeature] != false
+        // MD-6: the recipient is explicit. The selected peer is preselected when it can receive
+        // this content, a single eligible peer is chosen automatically; never a routed fallback.
+        val feature = if (content.files.isNotEmpty()) FeatureApplicability.Feature.FILES else FeatureApplicability.Feature.CLIPBOARD
+        val recipients = pairing.targets(feature)
+        var recipient by remember(content) { mutableStateOf(FileTransferTarget.initial(selection, recipients.map { it.deviceId })) }
+        val chosen = recipient?.takeIf { id -> recipients.any { it.deviceId == id } }
         val summary = when {
-            content.files.size == 1 -> "Send the selected file to your Mac?"
-            content.files.isNotEmpty() -> "Send ${content.files.size} selected files to your Mac?"
-            else -> "Send the shared text to your Mac?"
+            content.files.size == 1 -> "Send the selected file?"
+            content.files.isNotEmpty() -> "Send ${content.files.size} selected files?"
+            else -> "Send the shared text?"
         }
         AlertDialog(
             onDismissRequest = onSharedContentHandled,
@@ -711,24 +714,39 @@ private fun BridgeyApp(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(summary)
-                    when {
-                        !isConnected -> Text(
-                            "Waiting for a trusted Mac to reconnect.",
+                    if (recipients.isEmpty()) {
+                        Text(
+                            "No connected device can receive this right now.",
                             color = MaterialTheme.colorScheme.error,
                         )
-                        !featureAvailable -> Text(
-                            "This feature is turned off on one of your devices.",
-                            color = MaterialTheme.colorScheme.error,
-                        )
+                    } else {
+                        Text("Send to", style = MaterialTheme.typography.labelLarge)
+                        recipients.forEach { device ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .selectable(
+                                        selected = chosen == device.deviceId,
+                                        onClick = { recipient = device.deviceId },
+                                        role = Role.RadioButton,
+                                    ),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                RadioButton(selected = chosen == device.deviceId, onClick = null)
+                                Text(device.name, Modifier.padding(start = 8.dp))
+                            }
+                        }
                     }
                 }
             },
             confirmButton = {
                 Button(
-                    enabled = isConnected && featureAvailable,
+                    enabled = chosen != null,
                     onClick = {
-                        content.text?.let { pairing.sendText(it) }
-                        content.files.forEach(pairing::sendFile)
+                        // The recipient is captured now; later selection/routing changes do not move it.
+                        val target = chosen ?: return@Button
+                        content.text?.let { pairing.sendText(target, it) }
+                        content.files.forEach { pairing.sendFile(target, it) }
                         onSharedContentHandled()
                     },
                 ) { Text("Send") }
@@ -1088,7 +1106,13 @@ private fun DeviceScreen(
     onEnterPocketMode: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(pairing::sendFile) }
+    // MD-6: the picker sends to the peer whose card opened it (captured before the picker opens).
+    var fileTarget by rememberSaveable { mutableStateOf<String?>(null) }
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val target = fileTarget
+        fileTarget = null
+        if (uri != null && target != null) pairing.sendFile(target, uri)
+    }
     val screenSharing by pairing.screenCapture.isActive.collectAsStateWithLifecycle()
     LazyColumn(
         modifier = modifier.fillMaxSize(),
@@ -1132,9 +1156,14 @@ private fun DeviceScreen(
                         // MD-5: the clipboard goes to this peer, whichever peer legacy features use.
                         clipboardEnabled = pairing.applicability(FeatureApplicability.Feature.CLIPBOARD, selected.deviceId, localIsSource = true) ==
                             FeatureApplicabilityResult.OFFERED,
-                        filesEnabled = legacy && enabledFeatures[BridgeyFeature.FILES] != false,
+                        // MD-6: files go to this peer, whichever peer legacy features use.
+                        filesEnabled = pairing.applicability(FeatureApplicability.Feature.FILES, selected.deviceId, localIsSource = true) ==
+                            FeatureApplicabilityResult.OFFERED,
                         onClipboard = { pairing.sendClipboard(selected.deviceId) },
-                        onFile = { filePicker.launch(arrayOf("*/*")) },
+                        onFile = {
+                            fileTarget = selected.deviceId
+                            filePicker.launch(arrayOf("*/*"))
+                        },
                         onRing = { pairing.startFinding(it) },
                         onStopRing = { pairing.stopFinding(it) },
                         onSilenceThisPhone = pairing::stopLocalRinging,
@@ -1370,7 +1399,7 @@ private fun ConnectedDeviceCard(
             }
             if (clipboardEnabled || filesEnabled) Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 if (clipboardEnabled) QuickAction("Clipboard", "To ${device.name}", Modifier.weight(1f), onClipboard)
-                if (filesEnabled) QuickAction("File", "Send", Modifier.weight(1f), onFile)
+                if (filesEnabled) QuickAction("File", "To ${device.name}", Modifier.weight(1f), onFile)
                 if (clipboardEnabled.xor(filesEnabled)) Spacer(Modifier.weight(1f))
             }
             // MD-3/4b: Ping and Ring act on this peer itself.

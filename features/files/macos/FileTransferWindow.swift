@@ -39,7 +39,9 @@ private struct FileTransferView: View {
                             HStack(alignment: .center, spacing: 12) {
                                 if transfer.active { ProgressView().controlSize(.small) }
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text(transfer.name).fontWeight(.medium)
+                                    // MD-6: every row names its peer and direction.
+                                    Text(transfer.peerName.isEmpty ? transfer.name : "\(transfer.name) \(transfer.outgoing ? "→" : "←") \(transfer.peerName)")
+                                        .fontWeight(.medium)
                                     Text(transfer.status).font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(2)
                                 }
                                 Spacer()

@@ -53,6 +53,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -98,6 +100,10 @@ data class FileTransferState(
     val progressPercent: Int?,
     val startedAtMillis: Long = System.currentTimeMillis(),
     val retryable: Boolean = false,
+    /** MD-6: the peer the transfer belongs to, and which way it goes. */
+    val deviceId: String = "",
+    val peerName: String = "",
+    val outgoing: Boolean = true,
 )
 
 data class TrustedDevice(val id: String, val name: String)
@@ -200,8 +206,9 @@ class PairingCoordinator(
     /** MD-5: clipboard sends per (deviceId, messageId), and one completion per send. */
     private val clipboardSends = ClipboardSends()
     private val clipboardCompletions = ConcurrentHashMap<String, (ClipboardSendResult) -> Unit>()
-    private val pendingFileAccepts = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
-    private val pendingFileCompletions = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
+    // MD-6: every transfer belongs to one peer and is keyed (deviceId, transferId).
+    private val pendingFileAccepts = FileTransferTable<CompletableDeferred<Boolean>>()
+    private val pendingFileCompletions = FileTransferTable<CompletableDeferred<Boolean>>()
     private val mutableFileTransferStatus = MutableStateFlow<String?>(null)
     val fileTransferStatus: StateFlow<String?> = mutableFileTransferStatus.asStateFlow()
     private val mutableFileTransferActive = MutableStateFlow(false)
@@ -253,10 +260,11 @@ class PairingCoordinator(
     private var pendingRemoteStartRequestId: String? = null
     private val mutableRemoteFeatures = MutableStateFlow(defaultFeatureState())
     val remoteFeatures: StateFlow<Map<BridgeyFeature, Boolean>> = mutableRemoteFeatures.asStateFlow()
-    private val incomingFiles = ConcurrentHashMap<String, IncomingFileTransfer>()
-    private val cancelledTransferIds = ConcurrentHashMap.newKeySet<String>()
-    private val outgoingFileJobs = ConcurrentHashMap<String, Job>()
-    private val outgoingFileSources = ConcurrentHashMap<String, Uri>()
+    private val incomingFiles = FileTransferTable<IncomingFileTransfer>()
+    private val cancelledFileTransfers = CancelledFileTransfers()
+    private val outgoingFileJobs = FileTransferTable<Job>()
+    /** The source of each outgoing transfer, kept for Retry (to the same peer). */
+    private val outgoingFileSources = ConcurrentHashMap<FileTransferKey, Uri>()
     val deviceId: String get() = localDeviceId
     @Volatile private var server: ServerSocket? = null
     private var acceptJob: Job? = null
@@ -535,6 +543,10 @@ class PairingCoordinator(
         }
         sendClipboardContent(deviceId, text, html = null, onResult = onResult)
     }
+
+    /** MD-6: shared text sent to the recipient the user chose in the share dialog. */
+    fun sendText(deviceId: String, text: String, onResult: (ClipboardSendResult) -> Unit = {}) =
+        sendClipboardContent(deviceId, text, html = null, onResult = onResult)
 
     /**
      * MD-5: the send is tracked as (deviceId, messageId); its ack, rejection, timeout or the device's
@@ -1220,6 +1232,7 @@ class PairingCoordinator(
         removeTelemetrySubscriber(deviceId)
         telemetrySubscription.sessionEnded(deviceId)
         clipboardDeviceEnded(deviceId) // MD-5
+        endFileTransfers(deviceId) // MD-6
         if (pings.deviceEnded(deviceId)) mutablePingStatus.value = "${displayName(deviceId)} disconnected"
         synchronized(findLock) {
             if (find.deviceEnded(deviceId)) stopPhoneRinging()
@@ -1299,25 +1312,58 @@ class PairingCoordinator(
         mutablePhoneRinging.value = false
     }
 
-    fun sendFile(uri: Uri, assetKey: String? = null, onResult: ((Boolean) -> Unit)? = null) {
-        val feature = if (assetKey != null) BridgeyFeature.PHOTO_SYNC else BridgeyFeature.FILES
-        if (!isFeatureAvailable(feature)) {
+    /** MD-6: sends [uri] to [deviceId], whichever peer legacy features are routed to. Never another peer. */
+    fun sendFile(deviceId: String, uri: Uri, onResult: ((Boolean) -> Unit)? = null) {
+        val name = displayName(deviceId)
+        if (peers.connectedSession(deviceId) == null) {
+            mutableFileTransferStatus.value = FileTransferText.notConnected(name)
+            onResult?.invoke(false)
+            return
+        }
+        if (applicability(FeatureApplicability.Feature.FILES, deviceId, localIsSource = true) != FeatureApplicabilityResult.OFFERED) {
+            mutableFileTransferStatus.value = FileTransferText.turnedOff(name)
+            onResult?.invoke(false)
+            return
+        }
+        startFileTransfer(deviceId, uri, assetKey = null, onResult = onResult)
+    }
+
+    /**
+     * Photo Sync is not migrated (MD-6): it keeps using the routed peer, but resolved once when the
+     * asset starts, so a routing change neither interrupts nor redirects an asset in flight.
+     */
+    fun sendSyncAsset(uri: Uri, assetKey: String, onResult: (Boolean) -> Unit) {
+        if (!isFeatureAvailable(BridgeyFeature.PHOTO_SYNC)) {
             mutableFileTransferStatus.value = "File transfer is turned off on one of your devices"
-            onResult?.invoke(false)
+            onResult(false)
             return
         }
-        val connectedSession = activeSession
-        if (connectedSession == null || mutableState.value !is PairingState.Connected) {
+        val deviceId = activePeerId
+        if (deviceId == null || peers.connectedSession(deviceId) == null) {
             mutableFileTransferStatus.value = "Not connected — file was not sent"
+            onResult(false)
+            return
+        }
+        startFileTransfer(deviceId, uri, assetKey = assetKey, onResult = onResult)
+    }
+
+    /** One outgoing transfer, bound to [deviceId]'s session for its whole lifetime. */
+    private fun startFileTransfer(deviceId: String, uri: Uri, assetKey: String?, onResult: ((Boolean) -> Unit)?) {
+        val connectedSession = peers.connectedSession(deviceId)
+        if (connectedSession == null) {
+            mutableFileTransferStatus.value = FileTransferText.notConnected(displayName(deviceId))
             onResult?.invoke(false)
             return
         }
-        val transferId = UUID.randomUUID().toString()
-        outgoingFileSources[transferId] = uri
+        val peerName = displayName(deviceId)
+        val key = FileTransferKey(deviceId, UUID.randomUUID().toString())
+        val transferId = key.transferId
+        outgoingFileSources[key] = uri
         diagnostics.record("transfer", "send_started")
-        updateFileTransfer(transferId, "Selected file", "Preparing…", true)
+        updateFileTransfer(key, "Selected file", "Preparing…", true, outgoing = true)
         var succeeded = false
-        val job = scope.launch {
+        // Registered before it runs, so a disconnect in between still finds and cancels it.
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             val resolver = appContext.contentResolver
             val metadata = runCatching {
                 var name = "file"
@@ -1330,21 +1376,21 @@ class PairingCoordinator(
                 }
                 Triple(name.take(255), resolver.getType(uri) ?: "application/octet-stream", size)
             }.getOrElse {
-                updateFileTransfer(transferId, "Selected file", "Could not read the selected file", false)
+                updateFileTransfer(key, "Selected file", "Could not read the selected file", false, outgoing = true)
                 return@launch
             }
             if (metadata.third < 0) {
                 mutableFileTransferStatus.value = "This file provider did not report a file size"
-                updateFileTransfer(transferId, metadata.first, mutableFileTransferStatus.value!!, false)
+                updateFileTransfer(key, metadata.first, mutableFileTransferStatus.value!!, false, outgoing = true)
                 return@launch
             }
             if (metadata.third > MAX_FILE_SIZE) {
                 mutableFileTransferStatus.value = "File is larger than 10 GB"
-                updateFileTransfer(transferId, metadata.first, mutableFileTransferStatus.value!!, false)
+                updateFileTransfer(key, metadata.first, mutableFileTransferStatus.value!!, false, outgoing = true)
                 return@launch
             }
 
-            updateFileTransfer(transferId, metadata.first, "Preparing ${metadata.first}…", true)
+            updateFileTransfer(key, metadata.first, "Preparing ${metadata.first} for $peerName…", true, outgoing = true)
             val digest = MessageDigest.getInstance("SHA-256")
             val hash = runCatching {
                 resolver.openInputStream(uri)?.use { input ->
@@ -1358,8 +1404,9 @@ class PairingCoordinator(
                 } ?: error("File unavailable")
                 Base64.encodeToString(digest.digest(), Base64.NO_WRAP)
             }.getOrElse {
+                if (it is CancellationException) throw it // cancelled or disconnected, not unreadable
                 mutableFileTransferStatus.value = "Could not read the selected file"
-                updateFileTransfer(transferId, metadata.first, mutableFileTransferStatus.value!!, false)
+                updateFileTransfer(key, metadata.first, mutableFileTransferStatus.value!!, false, outgoing = true)
                 return@launch
             }
 
@@ -1376,12 +1423,12 @@ class PairingCoordinator(
             // that turns a failure into a clean "transfer failed" outcome), this one was unguarded and
             // could crash the whole process exactly like sendBattery did.
             val pairingKey = connectedSession.pairingKey ?: run {
-                updateFileTransfer(transferId, metadata.first, "Connection lost — file was not sent", false)
+                updateFileTransfer(key, metadata.first, "Connection lost — file was not sent", false, outgoing = true)
                 return@launch
             }
             val offer = Crypto.encrypt(pairingKey, offerPayload)
             val accepted = CompletableDeferred<Boolean>()
-            pendingFileAccepts[transferId] = accepted
+            pendingFileAccepts.put(key, accepted)
             if (!connectedSession.send(Message(
                     kind = "files.offer",
                     sessionId = connectedSession.id,
@@ -1390,21 +1437,21 @@ class PairingCoordinator(
                     nonce = offer.nonce,
                     ciphertext = offer.ciphertext,
                 ))) {
-                pendingFileAccepts.remove(transferId)
+                pendingFileAccepts.remove(key)
                 mutableFileTransferStatus.value = "Connection lost — file was not sent"
-                updateFileTransfer(transferId, metadata.first, mutableFileTransferStatus.value!!, false)
+                updateFileTransfer(key, metadata.first, mutableFileTransferStatus.value!!, false, outgoing = true)
                 return@launch
             }
-            updateFileTransfer(transferId, metadata.first, "Waiting for Mac…", true)
+            updateFileTransfer(key, metadata.first, FileTransferText.waiting(peerName), true, outgoing = true)
             if (withTimeoutOrNull(10_000) { accepted.await() } != true) {
-                pendingFileAccepts.remove(transferId)
-                if (transferId in cancelledTransferIds || outgoingFileJobs[transferId] == null) return@launch
-                updateFileTransfer(transferId, metadata.first, "Mac did not accept the file", false)
+                pendingFileAccepts.remove(key)
+                if (key in cancelledFileTransfers || outgoingFileJobs[key] == null) return@launch
+                updateFileTransfer(key, metadata.first, FileTransferText.notAccepted(peerName), false, outgoing = true)
                 return@launch
             }
 
             val completed = CompletableDeferred<Boolean>()
-            pendingFileCompletions[transferId] = completed
+            pendingFileCompletions.put(key, completed)
             val sent = runCatching {
                 resolver.openInputStream(uri)?.use { input ->
                     val buffer = ByteArray(FILE_CHUNK_SIZE)
@@ -1427,10 +1474,10 @@ class PairingCoordinator(
                         )))
                         total += count
                         progress.status(total)?.let {
-                            updateFileTransfer(transferId, metadata.first, "Sending ${metadata.first}: $it", true)
+                            updateFileTransfer(key, metadata.first, FileTransferText.sending(metadata.first, peerName, it), true, outgoing = true)
                         }
                     }
-                    updateFileTransfer(transferId, metadata.first, "Verifying ${metadata.first} on Mac…", true)
+                    updateFileTransfer(key, metadata.first, FileTransferText.verifying(metadata.first, peerName), true, outgoing = true)
                 } ?: error("File unavailable")
                 val completionPayload = Crypto.encrypt(
                     connectedSession.pairingKey!!,
@@ -1445,64 +1492,70 @@ class PairingCoordinator(
                 )))
             }.isSuccess
             if (!sent) {
-                pendingFileCompletions.remove(transferId)
-                if (transferId in cancelledTransferIds || outgoingFileJobs[transferId] == null) return@launch
-                updateFileTransfer(transferId, metadata.first, "File transfer failed", false)
+                pendingFileCompletions.remove(key)
+                if (key in cancelledFileTransfers || outgoingFileJobs[key] == null) return@launch
+                updateFileTransfer(key, metadata.first, "File transfer to $peerName failed", false, outgoing = true)
                 return@launch
             }
             if (withTimeoutOrNull(15_000) { completed.await() } == true) {
-                outgoingFileSources.remove(transferId)
-                updateFileTransfer(transferId, metadata.first, "${metadata.first} saved on Mac", false)
+                outgoingFileSources.remove(key)
+                updateFileTransfer(key, metadata.first, FileTransferText.saved(metadata.first, peerName), false, outgoing = true)
                 diagnostics.record("transfer", "send_completed")
+                android.util.Log.i("Bridgey", "PLUGIN file sent name=${metadata.first} to=${deviceId.take(8)}")
                 succeeded = true
             } else {
-                pendingFileCompletions.remove(transferId)
-                if (transferId in cancelledTransferIds || outgoingFileJobs[transferId] == null) return@launch
-                updateFileTransfer(transferId, metadata.first, "Mac did not confirm the saved file", false)
+                pendingFileCompletions.remove(key)
+                if (key in cancelledFileTransfers || outgoingFileJobs[key] == null) return@launch
+                updateFileTransfer(key, metadata.first, FileTransferText.notConfirmed(peerName), false, outgoing = true)
             }
         }
-        outgoingFileJobs[transferId] = job
-        job.invokeOnCompletion { outgoingFileJobs.remove(transferId, job); onResult?.invoke(succeeded) }
+        outgoingFileJobs.put(key, job)
+        job.invokeOnCompletion { outgoingFileJobs.remove(key, job); onResult?.invoke(succeeded) }
+        job.start()
     }
 
-    fun sendSyncAsset(uri: Uri, assetKey: String, onResult: (Boolean) -> Unit) {
-        sendFile(uri, assetKey = assetKey, onResult = onResult)
-    }
-
-    fun cancelFileTransfer(transferId: String) {
-        val current = activeSession
-        markTransferCancelled(transferId)
-        scope.launch {
-            repeat(3) { attempt ->
-                if (activeSession === current) current?.send(Message(kind = "files.cancel", sessionId = current.id, transferId = transferId))
-                if (attempt < 2) delay(250)
+    /** Cancels one transfer (by its row id): only its own peer is told, nothing else is touched. */
+    fun cancelFileTransfer(rowId: String) {
+        val key = FileTransferKey.fromRowId(rowId) ?: return
+        val session = peers.connectedSession(key.deviceId)
+        cancelledFileTransfers.add(key)
+        if (session != null) {
+            scope.launch {
+                repeat(3) { attempt ->
+                    if (peers.connectedSession(key.deviceId) === session) {
+                        session.send(Message(kind = "files.cancel", sessionId = session.id, transferId = key.transferId))
+                    }
+                    if (attempt < 2) delay(250)
+                }
             }
         }
-        outgoingFileJobs.remove(transferId)?.cancel()
-        incomingFiles.remove(transferId)?.cancel()
-        pendingFileAccepts.remove(transferId)?.complete(false)
-        pendingFileCompletions.remove(transferId)?.complete(false)
-        val name = mutableFileTransfers.value[transferId]?.name ?: "File"
-        removeFileTransfer(transferId, "Transfer cancelled")
+        outgoingFileJobs.remove(key)?.cancel()
+        incomingFiles.remove(key)?.cancel()
+        pendingFileAccepts.remove(key)?.complete(false)
+        pendingFileCompletions.remove(key)?.complete(false)
+        removeFileTransfer(rowId, "Transfer cancelled")
         diagnostics.record("transfer", "cancelled")
     }
 
     fun cancelFileTransfer() = mutableFileTransfers.value.values.filter { it.active }.forEach { cancelFileTransfer(it.id) }
 
-    fun retryFileTransfer(transferId: String) {
-        val uri = outgoingFileSources[transferId] ?: return
-        if (activeSession == null || mutableState.value !is PairingState.Connected) {
-            removeFileTransfer(transferId, "Reconnect before retrying")
+    /** Retries to the same peer; if it is gone, says so instead of using another one. */
+    fun retryFileTransfer(rowId: String) {
+        val key = FileTransferKey.fromRowId(rowId) ?: return
+        val uri = outgoingFileSources[key] ?: return
+        val name = displayName(key.deviceId)
+        if (peers.connectedSession(key.deviceId) == null) {
+            removeFileTransfer(rowId, FileTransferText.reconnectToRetry(name))
             return
         }
-        if (!isFeatureAvailable(BridgeyFeature.FILES)) {
-            removeFileTransfer(transferId, "File transfer is turned off on one of your devices")
+        if (applicability(FeatureApplicability.Feature.FILES, key.deviceId, localIsSource = true) != FeatureApplicabilityResult.OFFERED) {
+            removeFileTransfer(rowId, FileTransferText.turnedOff(name))
             return
         }
-        mutableFileTransfers.value = mutableFileTransfers.value.toMutableMap().apply { remove(transferId) }
-        outgoingFileSources.remove(transferId)
+        mutableFileTransfers.update { it - rowId }
+        outgoingFileSources.remove(key)
         diagnostics.record("transfer", "retry_started")
-        sendFile(uri)
+        startFileTransfer(key.deviceId, uri, assetKey = null, onResult = null)
     }
 
     fun diagnosticsReport(): String {
@@ -1519,8 +1572,8 @@ class PairingCoordinator(
 
     fun clearTransferHistory() {
         val inactiveIds = mutableFileTransfers.value.values.filterNot(FileTransferState::active).map(FileTransferState::id)
-        inactiveIds.forEach(outgoingFileSources::remove)
-        mutableFileTransfers.value = mutableFileTransfers.value.filterValues(FileTransferState::active)
+        inactiveIds.mapNotNull(FileTransferKey::fromRowId).forEach { outgoingFileSources.remove(it) }
+        mutableFileTransfers.update { rows -> rows.filterValues(FileTransferState::active) }
         refreshFileTransferSummary()
     }
 
@@ -1555,22 +1608,8 @@ class PairingCoordinator(
         server = null
         acceptJob?.cancel()
         acceptJob = null
-        interruptFeatureTransfers()
+        endFileTransfers(null)
         refreshState()
-    }
-
-    /** Ends every in-flight clipboard/file exchange of the single-peer feature layer. */
-    private fun interruptFeatureTransfers() {
-        pendingFileAccepts.values.forEach { it.complete(false) }
-        pendingFileAccepts.clear()
-        pendingFileCompletions.values.forEach { it.complete(false) }
-        pendingFileCompletions.clear()
-        incomingFiles.values.forEach(IncomingFileTransfer::cancel)
-        incomingFiles.clear()
-        outgoingFileJobs.values.forEach(Job::cancel)
-        outgoingFileJobs.clear()
-        mutableFileTransfers.value = recoverInterruptedTransfers(mutableFileTransfers.value)
-        refreshFileTransferSummary("File transfer interrupted")
     }
 
     private fun handle(socket: Socket, initiatedLocally: Boolean, peerHint: String?, expectedDeviceId: String?, dialKey: String?) {
@@ -1678,16 +1717,11 @@ class PairingCoordinator(
      * reset only when this was the routed (active) session.
      */
     private fun endSession(current: Session, reconnect: Reconnect) {
-        val wasActive = current === activeSession
         // Lifecycle is bound to this session object: only the session that was started ends its
         // device (a failed pending dial or an older session never ends a newer one).
         val identifiedDeviceId = peers.deviceId(current)
         val deviceId = peers.remove(current)
         current.close()
-        if (wasActive) {
-            cancelIncomingFiles()
-            mutableFileTransfers.value = recoverInterruptedTransfers(mutableFileTransfers.value)
-        }
         recomputeActivePeer()
         identifiedDeviceId?.let { peerLifecycle.sessionEnded(it, current) }
         if (deviceId == null || deviceId !in registry.trustedDeviceIds()) return
@@ -1751,7 +1785,7 @@ class PairingCoordinator(
     private fun activePeerChanged(previous: Session?) {
         // (4) Transfers and acknowledgements bound to the previous peer cannot complete through the
         // feature layer any more; finish them now instead of letting them time out.
-        if (previous != null) interruptFeatureTransfers()
+        // MD-6: file transfers are not part of it - they belong to their own peer.
         quickActions.reset()
         mediaRemote.reset()
         videoChannel.reset()
@@ -1824,6 +1858,9 @@ class PairingCoordinator(
         "battery.update", "telemetry.update", "telemetry.subscribe", "telemetry.unsubscribe",
         // MD-5: clipboard is sent to and accepted from an explicit peer.
         "clipboard.update", "clipboard.rich", "clipboard.ack", "clipboard.rejected",
+        // MD-6: file transfers belong to the peer that sends or receives them.
+        "files.offer", "files.accept", "files.chunk", "files.chunk.ack", "files.complete",
+        "files.complete.ack", "files.rejected", "files.cancel", "files.cancel.ack",
     )
 
     private fun receive(current: Session, message: Message) {
@@ -1945,27 +1982,33 @@ class PairingCoordinator(
             "telemetry.update" -> receiveStorageTelemetry(current, message)
             "telemetry.subscribe" -> receiveTelemetrySubscribe(current, message)
             "telemetry.unsubscribe" -> receiveTelemetryUnsubscribe(current, message)
-            "files.accept" -> message.transferId?.let { pendingFileAccepts.remove(it)?.complete(true) }
-            "files.complete.ack" -> message.transferId?.let { pendingFileCompletions.remove(it)?.complete(true) }
-            "files.offer" -> {
-                if (settings.isEnabled(BridgeyFeature.FILES, current.remoteDeviceId)) {
-                    receiveFileOffer(current, message)
+            // MD-6: files.* is accepted from any connected peer; every transfer is (sender, transferId),
+            // never looked up by transferId alone and never via the routed peer.
+            "files.accept" -> fileKey(current, message.transferId)?.let { pendingFileAccepts.remove(it)?.complete(true) }
+            "files.complete.ack" -> fileKey(current, message.transferId)?.let { pendingFileCompletions.remove(it)?.complete(true) }
+            "files.offer" -> peers.connectedDeviceId(current)?.let { sender ->
+                if (settings.isEnabled(BridgeyFeature.FILES, sender)) {
+                    receiveFileOffer(current, message, sender)
                 } else {
                     current.send(Message(kind = "files.rejected", sessionId = current.id, transferId = message.transferId))
                     sendFeatureState()
                 }
             }
-            "files.rejected" -> message.transferId?.let { transferId ->
-                pendingFileAccepts.remove(transferId)?.complete(false)
-                outgoingFileJobs.remove(transferId)?.cancel()
-                removeFileTransfer(transferId, "File transfer is turned off on Mac")
+            "files.rejected" -> fileKey(current, message.transferId)?.let { key ->
+                // Stop the job first, so it cannot overwrite this status with "did not accept".
+                cancelledFileTransfers.add(key)
+                outgoingFileJobs.remove(key)?.cancel()
+                pendingFileAccepts.remove(key)?.complete(false)
+                removeFileTransfer(key.rowId, FileTransferText.turnedOff(displayName(key.deviceId)))
             }
             // Once an offer has been accepted, let that transfer finish even if the
             // setting changes. Disabling Files blocks the next offer instead.
             "files.chunk" -> receiveFileChunk(current, message)
             "files.complete" -> receiveFileComplete(current, message)
-            "files.cancel" -> receiveFileCancel(message.transferId)
-            "files.cancel.ack" -> message.transferId?.let { removeFileTransfer(it, "Transfer cancelled") }
+            "files.cancel" -> receiveFileCancel(current, message.transferId)
+            "files.cancel.ack" -> fileKey(current, message.transferId)?.let { removeFileTransfer(it.rowId, "Transfer cancelled") }
+            // A Mac receiver's cumulative acknowledgements: this sender keeps no window (files.v1).
+            "files.chunk.ack" -> Unit
         }
     }
 
@@ -2258,8 +2301,15 @@ class PairingCoordinator(
         }
     }
 
-    private fun receiveFileOffer(current: Session, message: Message) {
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+    /** MD-6: the transfer a files.* message refers to - always the authenticated sender's own. */
+    private fun fileKey(current: Session, transferId: String?): FileTransferKey? {
+        val sender = peers.connectedDeviceId(current) ?: return null
+        return FileTransferKey(sender, transferId ?: return null)
+    }
+
+    private fun receiveFileOffer(current: Session, message: Message, sender: String) {
+        // Per session only: the app-wide state (another device pairing, routing) is irrelevant here.
+        if (message.sessionId != current.id) return
         val messageId = message.messageId ?: return
         if (!current.acceptMessageId(messageId)) return
         val plaintext = Crypto.decrypt(
@@ -2276,7 +2326,7 @@ class PairingCoordinator(
         val hash = payload.optString("sha256")
         if (runCatching { UUID.fromString(transferId) }.isFailure || name.isBlank() || size !in 0..MAX_FILE_SIZE ||
             runCatching { Base64.decode(hash, Base64.DEFAULT).size == 32 }.getOrDefault(false).not() ||
-            incomingFiles.containsKey(transferId)
+            incomingFiles.contains(FileTransferKey(sender, transferId))
         ) return failSession(current, "Invalid file offer")
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             return failSession(current, "Receiving files requires Android 10 or newer")
@@ -2284,19 +2334,22 @@ class PairingCoordinator(
         val transfer = runCatching {
             IncomingFileTransfer(appContext, transferId, name, mimeType, size, hash)
         }.getOrElse { return failSession(current, "Could not create file in Downloads") }
-        incomingFiles[transferId] = transfer
-        updateFileTransfer(transferId, transfer.displayName, "Receiving ${transfer.displayName}: ${transfer.progress.status(0, force = true)}", true)
+        val key = FileTransferKey(sender, transferId)
+        incomingFiles.insert(key, transfer)
+        val status = FileTransferText.receiving(transfer.displayName, displayName(sender), transfer.progress.status(0, force = true).orEmpty())
+        updateFileTransfer(key, transfer.displayName, status, true, outgoing = false)
         current.send(Message(kind = "files.accept", sessionId = current.id, transferId = transferId))
-        android.util.Log.i("Bridgey", "PLUGIN file accepted name=${transfer.displayName} size=$size")
+        android.util.Log.i("Bridgey", "PLUGIN file accepted name=${transfer.displayName} size=$size from=${sender.take(8)}")
     }
 
     private fun receiveFileChunk(current: Session, message: Message) {
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        if (message.sessionId != current.id) return
         val messageId = message.messageId ?: return
         if (!current.acceptMessageId(messageId)) return
-        val transferId = message.transferId ?: return
-        val transfer = incomingFiles[transferId] ?: run {
-            if (transferId in cancelledTransferIds) return
+        val key = fileKey(current, message.transferId) ?: return
+        val transferId = key.transferId
+        val transfer = incomingFiles[key] ?: run {
+            if (key in cancelledFileTransfers) return
             return failSession(current, "Unknown file transfer")
         }
         val chunk = Crypto.decrypt(
@@ -2305,11 +2358,11 @@ class PairingCoordinator(
             message.ciphertext ?: return failSession(current, "Invalid encrypted file chunk"),
         ) ?: return failSession(current, "Invalid encrypted file chunk")
         if (!runCatching { transfer.append(chunk, message.sequence ?: -1) }.isSuccess) {
-            incomingFiles.remove(transfer.transferId)?.cancel()
+            incomingFiles.remove(key)?.cancel()
             return failSession(current, "Invalid file data")
         }
         transfer.progress.status(transfer.receivedSize)?.let {
-            updateFileTransfer(transferId, transfer.displayName, "Receiving ${transfer.displayName}: $it", true)
+            updateFileTransfer(key, transfer.displayName, FileTransferText.receiving(transfer.displayName, displayName(key.deviceId), it), true, outgoing = false)
         }
         current.send(
             Message(
@@ -2322,7 +2375,8 @@ class PairingCoordinator(
     }
 
     private fun receiveFileComplete(current: Session, message: Message) {
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        val sender = peers.connectedDeviceId(current) ?: return
+        if (message.sessionId != current.id) return
         val messageId = message.messageId ?: return
         if (!current.acceptMessageId(messageId)) return
         val plaintext = Crypto.decrypt(
@@ -2333,78 +2387,84 @@ class PairingCoordinator(
         val payload = runCatching { JSONObject(plaintext.toString(Charsets.UTF_8)) }.getOrNull()
             ?: return failSession(current, "Invalid file completion")
         val transferId = payload.optString("transferId")
-        val transfer = incomingFiles.remove(transferId) ?: run {
-            if (transferId in cancelledTransferIds) return
+        val key = FileTransferKey(sender, transferId)
+        val transfer = incomingFiles.remove(key) ?: run {
+            if (key in cancelledFileTransfers) return
             return failSession(current, "Unknown file transfer")
         }
         val savedUri = runCatching { transfer.finish(payload.optString("sha256")) }.getOrNull()
         if (savedUri == null) {
             transfer.cancel()
             mutableFileTransferStatus.value = "File verification failed"
+            removeFileTransfer(key.rowId, "File verification failed")
             return failSession(current, "File verification failed")
         }
-        updateFileTransfer(transferId, transfer.displayName, "${transfer.displayName} saved to Download/Bridgey", false)
-        ReceivedFileNotifier.show(appContext, transfer.displayName, transfer.mimeType, savedUri)
+        val peerName = displayName(sender)
+        updateFileTransfer(key, transfer.displayName, FileTransferText.received(transfer.displayName, peerName), false, outgoing = false)
+        ReceivedFileNotifier.show(appContext, transfer.displayName, transfer.mimeType, savedUri, from = peerName)
         current.send(Message(kind = "files.complete.ack", sessionId = current.id, transferId = transferId))
-        android.util.Log.i("Bridgey", "PLUGIN file received name=${transfer.displayName}")
+        android.util.Log.i("Bridgey", "PLUGIN file received name=${transfer.displayName} from=${sender.take(8)}")
     }
 
-    private fun receiveFileCancel(transferId: String?) {
-        if (transferId == null) return
-        markTransferCancelled(transferId)
-        incomingFiles.remove(transferId)?.cancel()
-        outgoingFileJobs.remove(transferId)?.cancel()
-        pendingFileAccepts.remove(transferId)?.complete(false)
-        pendingFileCompletions.remove(transferId)?.complete(false)
-        removeFileTransfer(transferId, "Transfer cancelled by Mac")
-        activeSession?.send(Message(kind = "files.cancel.ack", sessionId = activeSession?.id ?: return, transferId = transferId))
-        android.util.Log.i("Bridgey", "PLUGIN file cancellation received transfer=${transferId.take(8)}")
+    private fun receiveFileCancel(current: Session, transferId: String?) {
+        val key = fileKey(current, transferId) ?: return
+        // Only a transfer that exists is remembered as cancelled (a peer cannot flush the list).
+        if (incomingFiles.contains(key) || outgoingFileJobs.contains(key)) cancelledFileTransfers.add(key)
+        incomingFiles.remove(key)?.cancel()
+        outgoingFileJobs.remove(key)?.cancel()
+        pendingFileAccepts.remove(key)?.complete(false)
+        pendingFileCompletions.remove(key)?.complete(false)
+        removeFileTransfer(key.rowId, FileTransferText.cancelledBy(displayName(key.deviceId)))
+        current.send(Message(kind = "files.cancel.ack", sessionId = current.id, transferId = key.transferId))
+        android.util.Log.i("Bridgey", "PLUGIN file cancellation received transfer=${key.transferId.take(8)}")
     }
 
-    private fun markTransferCancelled(transferId: String) {
-        cancelledTransferIds += transferId
-        while (cancelledTransferIds.size > 64) cancelledTransferIds.firstOrNull()?.let(cancelledTransferIds::remove)
-    }
-
-    private fun updateFileTransfer(id: String, name: String, status: String, active: Boolean) {
-        mutableFileTransfers.value = mutableFileTransfers.value.toMutableMap().apply {
-            val percent = Regex("(\\d{1,3})%").find(status)?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(0, 100)
-            val previous = get(id)
-            put(id, FileTransferState(
+    // Rows are written from several session threads, IO jobs and the UI: every write is one atomic
+    // update of the whole map (MD-6 makes concurrent transfers with several peers the normal case).
+    private fun updateFileTransfer(key: FileTransferKey, name: String, status: String, active: Boolean, outgoing: Boolean) {
+        // A late progress update of a cancelled/interrupted transfer must not make its row active again.
+        if (active && key in cancelledFileTransfers) return
+        val id = key.rowId
+        val percent = Regex("(\\d{1,3})%").find(status)?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(0, 100)
+        val peerName = displayName(key.deviceId)
+        val retryable = !active && outgoingFileSources.containsKey(key)
+        mutableFileTransfers.update { rows ->
+            prunedTransferHistory(rows + (id to FileTransferState(
                 id = id,
                 name = name,
                 status = status,
                 active = active,
                 progressPercent = percent,
-                startedAtMillis = previous?.startedAtMillis ?: System.currentTimeMillis(),
-                retryable = !active && outgoingFileSources.containsKey(id),
-            ))
+                startedAtMillis = rows[id]?.startedAtMillis ?: System.currentTimeMillis(),
+                retryable = retryable,
+                deviceId = key.deviceId,
+                peerName = peerName,
+                outgoing = outgoing,
+            )))
         }
-        pruneTransferHistory()
         refreshFileTransferSummary(status)
     }
 
     private fun removeFileTransfer(id: String, status: String) {
-        mutableFileTransfers.value[id]?.let { previous ->
-            mutableFileTransfers.value = mutableFileTransfers.value.toMutableMap().apply {
-                put(id, previous.copy(
-                    status = status,
-                    active = false,
-                    progressPercent = null,
-                    retryable = outgoingFileSources.containsKey(id),
-                ))
-            }
+        val retryable = FileTransferKey.fromRowId(id)?.let(outgoingFileSources::containsKey) == true
+        mutableFileTransfers.update { rows ->
+            val previous = rows[id] ?: return@update rows
+            prunedTransferHistory(rows + (id to previous.copy(
+                status = status,
+                active = false,
+                progressPercent = null,
+                retryable = retryable,
+            )))
         }
-        pruneTransferHistory()
         refreshFileTransferSummary(status)
     }
 
-    private fun pruneTransferHistory() {
-        val active = mutableFileTransfers.value.values.filter(FileTransferState::active)
-        val history = mutableFileTransfers.value.values.filterNot(FileTransferState::active)
+    private fun prunedTransferHistory(rows: Map<String, FileTransferState>): Map<String, FileTransferState> {
+        val active = rows.values.filter(FileTransferState::active)
+        val history = rows.values.filterNot(FileTransferState::active)
             .sortedByDescending(FileTransferState::startedAtMillis)
             .take(MAX_TRANSFER_HISTORY)
-        mutableFileTransfers.value = (active + history).associateBy(FileTransferState::id)
+        return (active + history).associateBy(FileTransferState::id)
     }
 
     private fun refreshFileTransferSummary(fallback: String? = null) {
@@ -2763,22 +2823,37 @@ class PairingCoordinator(
         reconnectJobs.put(deviceId, job)?.cancel()
     }
 
-    private fun cancelIncomingFiles() {
-        val hadActiveTransfers = mutableFileTransfers.value.values.any(FileTransferState::active)
-        incomingFiles.values.forEach(IncomingFileTransfer::cancel)
-        incomingFiles.clear()
-        outgoingFileJobs.values.forEach(Job::cancel)
-        outgoingFileJobs.clear()
-        pendingFileAccepts.values.forEach { it.complete(false) }
-        pendingFileAccepts.clear()
-        pendingFileCompletions.values.forEach { it.complete(false) }
-        pendingFileCompletions.clear()
-        mutableFileTransfers.value = recoverInterruptedTransfers(mutableFileTransfers.value)
-        refreshFileTransferSummary("File transfer interrupted")
-        if (hadActiveTransfers) diagnostics.record("transfer", "interrupted", "retry_available")
-        if (mutableFileTransferStatus.value?.startsWith("Receiving ") == true) {
-            mutableFileTransferStatus.value = "File transfer interrupted"
+    /**
+     * MD-6: a peer's session ended - only its transfers end (marked interrupted; outgoing ones can
+     * be retried to the same peer). Other peers' transfers continue. Null ends every transfer (pause).
+     */
+    private fun endFileTransfers(deviceId: String?) {
+        fun <V> FileTransferTable<V>.take() = if (deviceId == null) removeAll() else removeAll(deviceId)
+        val incoming = incomingFiles.take()
+        incoming.forEach { (key, transfer) ->
+            cancelledFileTransfers.add(key)
+            transfer.cancel()
         }
+        val outgoing = outgoingFileJobs.take()
+        outgoing.forEach { (key, job) ->
+            cancelledFileTransfers.add(key)
+            job.cancel()
+        }
+        pendingFileAccepts.take().forEach { it.second.complete(false) }
+        pendingFileCompletions.take().forEach { it.second.complete(false) }
+        var anyInterrupted = false
+        mutableFileTransfers.update { rows ->
+            val interrupted = rows.filterValues { it.active && (deviceId == null || it.deviceId == deviceId) }
+            anyInterrupted = interrupted.isNotEmpty()
+            rows + recoverInterruptedTransfers(interrupted).mapValues { (rowId, row) ->
+                row.copy(retryable = FileTransferKey.fromRowId(rowId)?.let(outgoingFileSources::containsKey) == true)
+            }
+        }
+        if (!anyInterrupted) return
+        val status = deviceId?.let { "File transfer with ${displayName(it)} interrupted" } ?: "File transfer interrupted"
+        refreshFileTransferSummary(status)
+        mutableFileTransferStatus.value = status
+        diagnostics.record("transfer", "interrupted", "retry_available")
     }
 
     private companion object {

@@ -173,7 +173,8 @@ class BridgeyConnectionService : Service() {
             )
             val builder = android.app.Notification.Builder(this, TRANSFER_CHANNEL_ID)
                 .setSmallIcon(dev.bridgey.android.R.drawable.ic_bridgey_notification)
-                .setContentTitle(transfer.name)
+                // MD-6: which peer the file goes to (→) or comes from (←).
+                .setContentTitle(if (transfer.peerName.isEmpty()) transfer.name else "${transfer.name} ${if (transfer.outgoing) "→" else "←"} ${transfer.peerName}")
                 .setContentText(compactTransferStatus(transfer))
                 .setSubText(transfer.progressPercent?.let { "$it%" })
                 .setOnlyAlertOnce(true)

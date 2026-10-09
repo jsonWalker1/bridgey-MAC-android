@@ -50,6 +50,10 @@ struct FileTransferRow: Identifiable, Equatable {
     let active: Bool
     let startedAt: Date
     let retryable: Bool
+    /// MD-6: the peer the transfer belongs to, and which way it goes.
+    let deviceID: String
+    let peerName: String
+    let outgoing: Bool
 
     init(
         id: String,
@@ -57,7 +61,10 @@ struct FileTransferRow: Identifiable, Equatable {
         status: String,
         active: Bool,
         startedAt: Date = Date(),
-        retryable: Bool = false
+        retryable: Bool = false,
+        deviceID: String = "",
+        peerName: String = "",
+        outgoing: Bool = true
     ) {
         self.id = id
         self.name = name
@@ -65,6 +72,9 @@ struct FileTransferRow: Identifiable, Equatable {
         self.active = active
         self.startedAt = startedAt
         self.retryable = retryable
+        self.deviceID = deviceID
+        self.peerName = peerName
+        self.outgoing = outgoing
     }
 }
 
@@ -341,20 +351,21 @@ final class PairingCoordinator: ObservableObject {
     // posted AFTER the snapshot was applied (getDeliveredNotifications is asynchronous, so such a
     // newer post could otherwise show up in the delivered list and be removed by an older snapshot).
     private var notificationPostedAt: [String: Date] = [:]
-    private var incomingFiles: [String: IncomingFileTransfer] = [:]
-    private var incomingSyncAssets: [String: (assetKey: String, isVideo: Bool)] = [:]
-    private var outgoingFiles: [String: OutgoingFileTransfer] = [:]
-    private var outgoingFileSources: [String: URL] = [:]
-    private var fileOperationID: UUID?
-    private var filePreparationCancellation: FileCancellationToken?
+    // MD-6: every transfer belongs to one peer and is keyed (deviceId, transferId).
+    private var incomingFiles = FileTransferTable<IncomingFileTransfer>()
+    private var incomingSyncAssets: [FileTransferKey: (assetKey: String, isVideo: Bool)] = [:]
+    private var outgoingFiles = FileTransferTable<OutgoingFileTransfer>()
+    /// The source of each outgoing transfer, kept for Retry (to the same peer).
+    private var outgoingFileSources: [FileTransferKey: URL] = [:]
+    /// Files being hashed before their offer goes out, each bound to the peer chosen for it.
+    private var filePreparations: [UUID: (deviceID: String, cancellation: FileCancellationToken)] = [:]
     private var fileTransferWindow: FileTransferWindowController?
     private var screenShareWindow: ScreenShareWindowController?
-    private var fileDropWindow: FileDropWindowController?
     // Accessed from the call-domain extension in Calls.swift, hence not `private`.
     lazy var callOverlayWindow = CallOverlayWindowController(pairing: self)
     var hiddenCallOverlayIdentity: String?
     var audibleCallIdentity: String?
-    private var cancelledTransferIDs = Set<String>()
+    private var cancelledFileTransfers = CancelledFileTransfers()
     private var findDeviceSound: NSSound?
     /// Battery last sent to each peer (sent on change to every connected peer that grants it).
     private var lastSentBattery: [String: LocalBatteryStatus] = [:]
@@ -1321,6 +1332,7 @@ final class PairingCoordinator: ObservableObject {
         telemetryUnsubscribed(by: deviceID)
         telemetrySubscription.sessionEnded(deviceID)
         clipboardDeviceEnded(deviceID) // MD-5
+        endFileTransfers(of: deviceID) // MD-6
         if pings.deviceEnded(deviceID) { setTransientPingStatus("\(displayName(deviceID)) disconnected") }
         if find.deviceEnded(deviceID) { stopMacSound() }
         deviceDirectoryRevision += 1
@@ -1360,15 +1372,10 @@ final class PairingCoordinator: ObservableObject {
         macRinging = false
     }
 
-    func chooseAndSendFile() {
-        guard activeSession != nil, case .connected = state else {
-            fileTransferStatus = "Not connected — file was not sent"
-            return
-        }
-        guard isFeatureAvailable(.files) else {
-            fileTransferStatus = "File transfer is turned off on one of your devices"
-            return
-        }
+    /// MD-6: "Send Files…" on a peer's card - the native picker, then one transfer per file to
+    /// `deviceID`, whichever peer legacy features are routed to.
+    func chooseAndSendFiles(to deviceID: String) {
+        guard fileTargetAvailable(deviceID) else { return }
         // MenuBarExtra closes its transient window after invoking the action.
         // Present the picker on the next run-loop turn as an app-modal panel so
         // an LSUIElement app can reliably bring it in front of other windows.
@@ -1376,33 +1383,40 @@ final class PairingCoordinator: ObservableObject {
             guard let self else { return }
             NSApp.activate(ignoringOtherApps: true)
             let panel = NSOpenPanel()
-            panel.title = "Send File to Android"
+            panel.title = "Send Files to \(self.displayName(deviceID))"
             panel.prompt = "Send"
             panel.canChooseFiles = true
             panel.canChooseDirectories = false
-            panel.allowsMultipleSelection = false
+            panel.allowsMultipleSelection = true
             panel.level = .floating
-            guard panel.runModal() == .OK, let url = panel.url else { return }
-            self.prepareFile(url)
+            guard panel.runModal() == .OK else { return }
+            panel.urls.forEach { self.sendFile($0, to: deviceID) }
         }
     }
 
+    /// MD-6: one file to `deviceID` (the card's picker and Finder's "Send to Bridgey…").
     @discardableResult
-    func sendDroppedFile(_ url: URL) -> Bool {
-        guard activeSession != nil, case .connected = state else {
-            fileTransferStatus = "Not connected — file was not sent"
-            return false
-        }
-        guard isFeatureAvailable(.files) else {
-            fileTransferStatus = "File transfer is turned off on one of your devices"
-            return false
-        }
+    func sendFile(_ url: URL, to deviceID: String) -> Bool {
+        guard fileTargetAvailable(deviceID) else { return false }
         guard url.isFileURL,
               (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
-            fileTransferStatus = "Drop a file, not a folder"
+            fileTransferStatus = "Only files can be sent, not folders"
             return false
         }
-        prepareFile(url)
+        prepareFile(url, to: deviceID)
+        return true
+    }
+
+    /// Whether a file can be offered to `deviceID` now; otherwise says why. Never picks another peer.
+    func fileTargetAvailable(_ deviceID: String) -> Bool {
+        guard peers.connectedSession(for: deviceID) != nil else {
+            fileTransferStatus = FileTransferText.notConnected(displayName(deviceID))
+            return false
+        }
+        guard applicability(of: .files, with: deviceID, localIsSource: true) == .offered else {
+            fileTransferStatus = FileTransferText.turnedOff(on: displayName(deviceID))
+            return false
+        }
         return true
     }
 
@@ -1433,35 +1447,33 @@ final class PairingCoordinator: ObservableObject {
         try? report.write(to: url, options: .atomic)
     }
 
-    private func prepareFile(_ url: URL) {
-        guard let current = activeSession, case .connected = state else { return }
-        let expectedSessionID = current.id
-        let operationID = UUID()
-        let preparationCancellation = FileCancellationToken()
-        fileOperationID = operationID
-        filePreparationCancellation = preparationCancellation
+    private func prepareFile(_ url: URL, to deviceID: String) {
+        let peerName = displayName(deviceID)
+        let preparationID = UUID()
+        let cancellation = FileCancellationToken()
+        filePreparations[preparationID] = (deviceID, cancellation)
         beginFileTransferUI()
-        fileTransferStatus = "Preparing \(url.lastPathComponent)…"
+        fileTransferStatus = "Preparing \(url.lastPathComponent) for \(peerName)…"
         diagnostics.record(category: "transfer", event: "send_started")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                let transfer = try OutgoingFileTransfer(url: url, cancellation: preparationCancellation)
+                let transfer = try OutgoingFileTransfer(url: url, cancellation: cancellation)
                 DispatchQueue.main.async {
-                    guard let self, self.fileOperationID == operationID,
-                          let current = self.activeSession, current.id == expectedSessionID,
-                          case .connected = self.state else { return }
-                    self.filePreparationCancellation = nil
+                    guard let self, self.filePreparations.removeValue(forKey: preparationID) != nil else { return }
+                    // The target was fixed when the user chose it; it is never replaced by another peer.
+                    guard let current = self.peers.connectedSession(for: deviceID), let pairingKey = current.pairingKey else {
+                        self.fileTransferStatus = FileTransferText.notConnected(peerName)
+                        self.refreshFileTransferActive()
+                        return
+                    }
+                    let key = FileTransferKey(deviceID: deviceID, transferID: transfer.transferID)
                     do {
                         let payload = try JSONEncoder().encode(transfer.offer)
-                        let encrypted = try encrypt(payload, key: current.pairingKey!)
-                        self.outgoingFiles[transfer.transferID] = transfer
-                        self.outgoingFileSources[transfer.transferID] = url
-                        self.updateFileTransfer(
-                            id: transfer.transferID,
-                            name: transfer.displayName,
-                            status: "Waiting for Android…",
-                            active: true
-                        )
+                        let encrypted = try encrypt(payload, key: pairingKey)
+                        self.outgoingFiles.insert(transfer, for: key)
+                        self.outgoingFileSources[key] = url
+                        let status = FileTransferText.waiting(for: peerName)
+                        self.updateFileTransfer(key, name: transfer.displayName, status: status, active: true, outgoing: true)
                         current.send(PairingMessage(
                             kind: "files.offer",
                             sessionId: current.id,
@@ -1470,70 +1482,111 @@ final class PairingCoordinator: ObservableObject {
                             ciphertext: encrypted.ciphertext,
                             transferId: transfer.transferID
                         ))
-                        self.fileTransferStatus = "Waiting for Android…"
+                        self.fileTransferStatus = status
                     } catch {
                         self.fileTransferStatus = "Could not prepare the selected file"
+                        self.refreshFileTransferActive()
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
-                    guard self?.fileOperationID == operationID else { return }
-                    self?.fileTransferStatus = "Could not read the selected file"
-                    self?.fileTransferActive = self?.fileTransfers.values.contains(where: { $0.active }) == true
-                    self?.filePreparationCancellation = nil
+                    guard let self, self.filePreparations.removeValue(forKey: preparationID) != nil else { return }
+                    self.fileTransferStatus = "Could not read the selected file"
+                    self.refreshFileTransferActive()
                 }
             }
         }
     }
 
     func cancelFileTransfer() {
-        filePreparationCancellation?.cancel()
-        filePreparationCancellation = nil
-        let transferIDs = Set(incomingFiles.keys).union(outgoingFiles.keys)
-        transferIDs.forEach { transferID in
-            markTransferCancelled(transferID)
-            activeSession?.send(PairingMessage(kind: "files.cancel", sessionId: activeSession?.id ?? "", transferId: transferID))
-        }
-        incomingFiles.values.forEach { $0.cancel() }
-        incomingFiles.removeAll()
-        outgoingFiles.values.forEach { $0.cancel() }
-        outgoingFiles.removeAll()
-        transferIDs.forEach { markFileTransferFinished(id: $0, status: "Transfer cancelled") }
-        fileOperationID = nil
-        fileTransferActive = false
+        filePreparations.values.forEach { $0.cancellation.cancel() }
+        filePreparations.removeAll()
+        Set(incomingFiles.keys).union(outgoingFiles.keys).forEach(cancelFileTransfer)
+        fileTransferStatus = "Transfer cancelled"
+        refreshFileTransferActive()
+    }
+
+    func cancelFileTransfer(id rowID: String) {
+        guard let key = FileTransferKey(rowID: rowID) else { return }
+        cancelFileTransfer(key)
         fileTransferStatus = "Transfer cancelled"
     }
 
-    func cancelFileTransfer(id transferID: String) {
-        markTransferCancelled(transferID)
-        activeSession?.send(PairingMessage(kind: "files.cancel", sessionId: activeSession?.id ?? "", transferId: transferID))
-        incomingFiles.removeValue(forKey: transferID)?.cancel()
-        outgoingFiles.removeValue(forKey: transferID)?.cancel()
-        markFileTransferFinished(id: transferID, status: "Transfer cancelled")
-        fileTransferStatus = "Transfer cancelled"
+    /// Cancels one transfer: only its own peer is told, nothing else is touched.
+    private func cancelFileTransfer(_ key: FileTransferKey) {
+        markTransferCancelled(key)
+        if let session = peers.connectedSession(for: key.deviceID) {
+            session.send(PairingMessage(kind: "files.cancel", sessionId: session.id, transferId: key.transferID))
+        }
+        incomingFiles.remove(key)?.cancel()
+        incomingSyncAssets.removeValue(forKey: key)
+        outgoingFiles.remove(key)?.cancel()
+        markFileTransferFinished(key, status: "Transfer cancelled")
     }
 
-    func retryFileTransfer(id transferID: String) {
-        guard let url = outgoingFileSources[transferID] else { return }
-        guard activeSession != nil, case .connected = state else {
-            markFileTransferFinished(id: transferID, status: "Reconnect before retrying")
+    /// Retries to the same peer; if it is gone, says so instead of using another one.
+    func retryFileTransfer(id rowID: String) {
+        guard let key = FileTransferKey(rowID: rowID), let url = outgoingFileSources[key] else { return }
+        let peerName = displayName(key.deviceID)
+        guard peers.connectedSession(for: key.deviceID) != nil else {
+            markFileTransferFinished(key, status: FileTransferText.reconnectToRetry(peerName))
             return
         }
-        guard isFeatureAvailable(.files) else {
-            markFileTransferFinished(id: transferID, status: "File transfer is turned off on one of your devices")
+        guard applicability(of: .files, with: key.deviceID, localIsSource: true) == .offered else {
+            markFileTransferFinished(key, status: FileTransferText.turnedOff(on: peerName))
             return
         }
-        fileTransfers.removeValue(forKey: transferID)
-        outgoingFileSources.removeValue(forKey: transferID)
+        fileTransfers.removeValue(forKey: key.rowID)
+        outgoingFileSources.removeValue(forKey: key)
         diagnostics.record(category: "transfer", event: "retry_started")
-        prepareFile(url)
+        prepareFile(url, to: key.deviceID)
     }
 
     func clearTransferHistory() {
         let inactiveIDs = fileTransfers.values.filter { !$0.active }.map(\.id)
-        inactiveIDs.forEach { outgoingFileSources.removeValue(forKey: $0) }
+        inactiveIDs.compactMap(FileTransferKey.init(rowID:)).forEach { outgoingFileSources.removeValue(forKey: $0) }
         fileTransfers = fileTransfers.filter { $0.value.active }
-        fileTransferActive = fileTransfers.values.contains(where: { $0.active })
+        refreshFileTransferActive()
+    }
+
+    /// MD-6: a peer's session ended - only its transfers end (marked interrupted; outgoing ones
+    /// can be retried to the same peer). Other peers' transfers continue untouched.
+    private func endFileTransfers(of deviceID: String) {
+        let incoming = incomingFiles.removeAll(deviceID: deviceID)
+        let outgoing = outgoingFiles.removeAll(deviceID: deviceID)
+        for (key, transfer) in incoming {
+            transfer.cancel()
+            incomingSyncAssets.removeValue(forKey: key)
+            cancelledFileTransfers.insert(key)
+        }
+        for (key, transfer) in outgoing {
+            transfer.cancel()
+            cancelledFileTransfers.insert(key)
+        }
+        for (id, preparation) in filePreparations where preparation.deviceID == deviceID {
+            preparation.cancellation.cancel()
+            filePreparations.removeValue(forKey: id)
+        }
+        // Outgoing rows stay retryable (to this same peer) while their source is known.
+        let status = "Transfer with \(displayName(deviceID)) interrupted — reconnect to retry"
+        fileTransfers.values.filter { $0.active && $0.deviceID == deviceID }
+            .compactMap { FileTransferKey(rowID: $0.id) }
+            .forEach { markFileTransferFinished($0, status: status) }
+        refreshFileTransferActive()
+        if !incoming.isEmpty || !outgoing.isEmpty {
+            fileTransferStatus = "File transfer with \(displayName(deviceID)) interrupted"
+            diagnostics.record(category: "transfer", event: "interrupted", outcome: "retry_available")
+        }
+    }
+
+    /// MD-6: the peer turned file transfer off (features.update) - its transfers stop; others continue.
+    private func peerTurnedFilesOff(_ deviceID: String) {
+        // Incoming Photo Sync assets are gated by .photoSync, not .files: they continue.
+        let keys = (incomingFiles.keys + outgoingFiles.keys)
+            .filter { $0.deviceID == deviceID && incomingSyncAssets[$0] == nil }
+        guard !keys.isEmpty else { return }
+        keys.forEach(cancelFileTransfer)
+        fileTransferStatus = FileTransferText.turnedOff(on: displayName(deviceID))
     }
 
     func showFileTransferWindow() {
@@ -1650,13 +1703,6 @@ final class PairingCoordinator: ObservableObject {
             ciphertext: encrypted.ciphertext
         ))
         NSLog("KVM switchKeyboard request sent to Android")
-    }
-
-    func showFileDropWindow() {
-        if fileDropWindow == nil {
-            fileDropWindow = FileDropWindowController(pairing: self)
-        }
-        fileDropWindow?.show()
     }
 
     private func beginFileTransferUI() {
@@ -1796,15 +1842,10 @@ final class PairingCoordinator: ObservableObject {
         return true
     }
 
-    /// Ends in-flight clipboard/file/call exchanges of the single-peer feature layer.
+    /// Ends in-flight call exchanges of the single-peer feature layer. File transfers are not
+    /// part of it any more (MD-6): they belong to their own peer and end only with that peer.
     private func interruptFeatureTransfers() {
-        cancelIncomingFiles()
         clearCallStatus()
-        if !outgoingFiles.isEmpty {
-            outgoingFiles.values.forEach { $0.cancel() }
-            outgoingFiles.removeAll()
-            fileTransferStatus = "File transfer interrupted"
-        }
     }
 
     /// The routing seam: recomputes which connected device today's single-peer features use.
@@ -1875,6 +1916,9 @@ final class PairingCoordinator: ObservableObject {
         "battery.update", "telemetry.update", "telemetry.subscribe", "telemetry.unsubscribe",
         // MD-5: clipboard is sent to and accepted from an explicit peer.
         "clipboard.update", "clipboard.rich", "clipboard.ack", "clipboard.rejected",
+        // MD-6: file transfers belong to the peer that sends or receives them.
+        "files.offer", "files.accept", "files.chunk", "files.chunk.ack", "files.complete",
+        "files.complete.ack", "files.rejected", "files.cancel", "files.cancel.ack",
     ]
 
     private func receive(_ message: PairingMessage, in current: Session) {
@@ -1981,6 +2025,11 @@ final class PairingCoordinator: ObservableObject {
                 peers.setCapabilities(capabilities, for: current)
                 // Features: only the routed session's capabilities drive today's single-peer features.
                 if current === activeSession { applyRemoteFeatures(capabilities) }
+                // MD-6: this peer's transfers stop when it turns file transfer off; others continue.
+                if previousCapabilities?[BridgeyFeature.files.rawValue] == true,
+                   capabilities[BridgeyFeature.files.rawValue] == false {
+                    peerTurnedFilesOff(current.remoteDeviceID)
+                }
                 if previousCapabilities != capabilities {
                     peerLifecycle.authorizationChanged(deviceIDs: [current.remoteDeviceID])
                 }
@@ -2263,8 +2312,11 @@ final class PairingCoordinator: ObservableObject {
             case "video.offer", "video.accept", "video.reject", "video.stop",
                  "input.offer", "input.accept", "input.reject", "input.stop":
                 receiveVideoChannelMessage(message, current: current)
+            // MD-6: files.* is accepted from any connected peer and every transfer belongs to the
+            // authenticated sender: it is looked up as (sender deviceId, transferId), never by
+            // transferId alone and never via the routed peer.
             case "files.offer":
-                guard case .connected = state,
+                guard let senderID = peers.connectedDeviceID(of: current),
                       message.sessionId == current.id,
                       let messageID = message.messageId,
                       current.acceptMessageID(messageID),
@@ -2283,7 +2335,11 @@ final class PairingCoordinator: ObservableObject {
                 // feature flag and routed to the dedicated sync folder instead of the general
                 // receive folder, with a dedup check against that folder's sync index.
                 let requiredFeature: BridgeyFeature = offer.assetKey != nil ? .photoSync : .files
-                guard featureEnabled(requiredFeature, current: current) else {
+                // Mac <-> Mac transfers additionally need this Mac's opt-in (off by default).
+                let senderAllowed = device(senderID).map {
+                    FileTransferPolicy.allows(local: localProfile.platform, peer: $0.platform, macToMacEnabled: settings.macToMacFilesEnabled)
+                } ?? false
+                guard senderAllowed, featureEnabled(requiredFeature, current: current) else {
                     current.send(PairingMessage(
                         kind: "files.rejected",
                         sessionId: current.id,
@@ -2292,7 +2348,8 @@ final class PairingCoordinator: ObservableObject {
                     sendFeatureState()
                     return
                 }
-                guard incomingFiles[offer.transferId] == nil else { throw PairingError.invalidMessage }
+                let key = FileTransferKey(deviceID: senderID, transferID: offer.transferId)
+                guard !incomingFiles.contains(key) else { throw PairingError.invalidMessage }
                 let directoryAccess = offer.assetKey != nil ? settings.syncDirectoryAccess() : settings.receiveDirectoryAccess()
                 if let assetKey = offer.assetKey, settings.isAssetSynced(assetKey, directory: directoryAccess.url) {
                     current.send(PairingMessage(
@@ -2303,43 +2360,54 @@ final class PairingCoordinator: ObservableObject {
                     return
                 }
                 let transfer = try IncomingFileTransfer(offer: offer, directoryAccess: directoryAccess)
-                incomingFiles[offer.transferId] = transfer
+                incomingFiles.insert(transfer, for: key)
                 if let assetKey = offer.assetKey {
-                    incomingSyncAssets[offer.transferId] = (assetKey, offer.mimeType.hasPrefix("video/"))
+                    incomingSyncAssets[key] = (assetKey, offer.mimeType.hasPrefix("video/"))
                 }
-                fileOperationID = UUID()
                 beginFileTransferUI()
-                fileTransferStatus = "Receiving \(transfer.displayName): \(transfer.progressStatus(force: true)!)"
-                updateFileTransfer(id: offer.transferId, name: transfer.displayName, status: fileTransferStatus!, active: true)
+                let status = FileTransferText.receiving(transfer.displayName, from: displayName(senderID), progress: transfer.progressStatus(force: true)!)
+                fileTransferStatus = status
+                updateFileTransfer(key, name: transfer.displayName, status: status, active: true, outgoing: false)
                 current.send(PairingMessage(
                     kind: "files.accept",
                     sessionId: current.id,
                     transferId: offer.transferId
                 ))
-                NSLog("PLUGIN file accepted name=%@ size=%lld", transfer.displayName, offer.size)
+                NSLog("PLUGIN file accepted name=%@ size=%lld from=%@", transfer.displayName, offer.size, String(senderID.prefix(8)))
             case "files.chunk":
-                if let transferID = message.transferId,
-                   incomingFiles[transferID] == nil,
-                   cancelledTransferIDs.contains(transferID) { return }
-                guard case .connected = state,
-                      message.sessionId == current.id,
+                guard let senderID = peers.connectedDeviceID(of: current) else { throw PairingError.invalidMessage }
+                if let transferID = message.transferId {
+                    let key = FileTransferKey(deviceID: senderID, transferID: transferID)
+                    if !incomingFiles.contains(key), cancelledFileTransfers.contains(key) { return }
+                }
+                guard message.sessionId == current.id,
                       let messageID = message.messageId,
                       current.acceptMessageID(messageID),
                       let transferID = message.transferId,
                       let sequence = message.sequence,
-                      let transfer = incomingFiles[transferID],
+                      let transfer = incomingFiles[FileTransferKey(deviceID: senderID, transferID: transferID)],
                       let nonce = message.nonce,
                       let ciphertext = message.ciphertext,
                       let chunk = try? decrypt(nonce: nonce, ciphertext: ciphertext, key: current.pairingKey!) else {
                     throw PairingError.invalidMessage
                 }
                 try transfer.append(chunk, sequence: sequence)
+                // Cumulative files.chunk.ack (files.v1 flow control): a Mac sender keeps at most 64
+                // chunks unacknowledged. Android senders ignore it.
+                current.send(PairingMessage(
+                    kind: "files.chunk.ack",
+                    sessionId: current.id,
+                    transferId: transferID,
+                    sequence: sequence
+                ))
                 if let progress = transfer.progressStatus() {
-                    fileTransferStatus = "Receiving \(transfer.displayName): \(progress)"
-                    updateFileTransfer(id: transferID, name: transfer.displayName, status: fileTransferStatus!, active: true)
+                    let key = FileTransferKey(deviceID: senderID, transferID: transferID)
+                    let status = FileTransferText.receiving(transfer.displayName, from: displayName(senderID), progress: progress)
+                    fileTransferStatus = status
+                    updateFileTransfer(key, name: transfer.displayName, status: status, active: true, outgoing: false)
                 }
             case "files.complete":
-                guard case .connected = state,
+                guard let senderID = peers.connectedDeviceID(of: current),
                       message.sessionId == current.id,
                       let messageID = message.messageId,
                       current.acceptMessageID(messageID),
@@ -2349,11 +2417,12 @@ final class PairingCoordinator: ObservableObject {
                       let completion = try? JSONDecoder().decode(FileCompletePayload.self, from: plaintext) else {
                     throw PairingError.invalidMessage
                 }
-                guard let transfer = incomingFiles.removeValue(forKey: completion.transferId) else {
-                    if cancelledTransferIDs.contains(completion.transferId) { return }
+                let key = FileTransferKey(deviceID: senderID, transferID: completion.transferId)
+                guard let transfer = incomingFiles.remove(key) else {
+                    if cancelledFileTransfers.contains(key) { return }
                     throw PairingError.invalidMessage
                 }
-                let syncAsset = incomingSyncAssets.removeValue(forKey: completion.transferId)
+                let syncAsset = incomingSyncAssets.removeValue(forKey: key)
                 do {
                     let destination = try transfer.finish(expectedHash: completion.sha256)
                     if let syncAsset {
@@ -2370,101 +2439,108 @@ final class PairingCoordinator: ObservableObject {
                         }
                     }
                     let folder = destination.deletingLastPathComponent().path
-                    fileTransferStatus = "Saved \(transfer.displayName) to \(folder)"
-                    updateFileTransfer(id: completion.transferId, name: transfer.displayName, status: fileTransferStatus!, active: false)
-                    fileTransferActive = fileTransfers.values.contains(where: { $0.active })
-                    fileOperationID = nil
+                    let status = FileTransferText.received(transfer.displayName, from: displayName(senderID), folder: folder)
+                    fileTransferStatus = status
+                    updateFileTransfer(key, name: transfer.displayName, status: status, active: false, outgoing: false)
                     current.send(PairingMessage(
                         kind: "files.complete.ack",
                         sessionId: current.id,
                         transferId: completion.transferId
                     ))
                     if syncAsset == nil { NSWorkspace.shared.activateFileViewerSelecting([destination]) }
-                    NSLog("PLUGIN file received name=%@", transfer.displayName)
+                    NSLog("PLUGIN file received name=%@ from=%@", transfer.displayName, String(senderID.prefix(8)))
                 } catch {
                     transfer.cancel()
                     fileTransferStatus = "File verification failed"
+                    markFileTransferFinished(key, status: "File verification failed")
                     throw error
                 }
             case "files.accept":
-                if let transferID = message.transferId,
-                   outgoingFiles[transferID] == nil,
-                   cancelledTransferIDs.contains(transferID) { return }
-                guard case .connected = state,
-                      message.sessionId == current.id,
+                guard let senderID = peers.connectedDeviceID(of: current) else { throw PairingError.invalidMessage }
+                if let transferID = message.transferId {
+                    let key = FileTransferKey(deviceID: senderID, transferID: transferID)
+                    if !outgoingFiles.contains(key), cancelledFileTransfers.contains(key) { return }
+                }
+                guard message.sessionId == current.id,
                       let transferID = message.transferId,
-                      let transfer = outgoingFiles[transferID] else { throw PairingError.invalidMessage }
-                updateFileTransfer(id: transferID, name: transfer.displayName, status: "Sending \(transfer.displayName)…", active: true)
+                      let transfer = outgoingFiles[FileTransferKey(deviceID: senderID, transferID: transferID)],
+                      transfer.beginSending() else {
+                    throw PairingError.invalidMessage
+                }
+                let key = FileTransferKey(deviceID: senderID, transferID: transferID)
+                let peerName = displayName(senderID)
+                updateFileTransfer(key, name: transfer.displayName, status: FileTransferText.sending(transfer.displayName, to: peerName), active: true, outgoing: true)
                 transfer.send(
                     through: current,
                     key: current.pairingKey!,
+                    peerName: peerName,
                     status: { [weak self] value in
-                        guard let self, self.outgoingFiles[transferID] === transfer,
+                        guard let self, self.outgoingFiles[key] === transfer,
                               !transfer.isCancelled,
-                              !self.cancelledTransferIDs.contains(transferID) else { return }
+                              !self.cancelledFileTransfers.contains(key) else { return }
                         self.fileTransferStatus = value
-                        self.updateFileTransfer(id: transferID, name: transfer.displayName, status: value, active: true)
+                        self.updateFileTransfer(key, name: transfer.displayName, status: value, active: true, outgoing: true)
                     },
                     completion: { [weak self, weak current] result in
-                        guard let self, let current, self.activeSession === current else { return }
+                        // Only this peer's own session counts - the routed peer is irrelevant.
+                        guard let self, let current, self.peers.connectedSession(for: senderID) === current else { return }
                         switch result {
                         case let .success(completion):
                             guard !transfer.isCancelled,
-                                  self.outgoingFiles[transferID] === transfer,
-                                  !self.cancelledTransferIDs.contains(transferID) else { return }
+                                  self.outgoingFiles[key] === transfer,
+                                  !self.cancelledFileTransfers.contains(key) else { return }
                             current.send(completion)
                         case .failure:
-                            self.outgoingFiles.removeValue(forKey: transferID)
-                            if transfer.isCancelled {
-                                self.fileTransferStatus = "Transfer cancelled"
-                                self.markFileTransferFinished(id: transferID, status: "Transfer cancelled")
-                                return
-                            } else {
-                                self.fileTransferStatus = "File transfer failed"
-                            }
-                            self.fileTransferActive = self.fileTransfers.values.contains(where: { $0.active })
-                            self.fileOperationID = nil
-                            self.updateFileTransfer(id: transferID, name: transfer.displayName, status: self.fileTransferStatus!, active: false)
+                            guard self.outgoingFiles[key] === transfer else { return }
+                            self.outgoingFiles.remove(key)
+                            let status = transfer.isCancelled ? "Transfer cancelled" : "File transfer to \(peerName) failed"
+                            self.fileTransferStatus = status
+                            self.markFileTransferFinished(key, status: status)
                         }
                     }
                 )
             case "files.rejected":
-                guard let transferID = message.transferId,
-                      let transfer = outgoingFiles.removeValue(forKey: transferID) else { return }
+                guard let senderID = peers.connectedDeviceID(of: current),
+                      let transferID = message.transferId else { return }
+                let key = FileTransferKey(deviceID: senderID, transferID: transferID)
+                guard let transfer = outgoingFiles.remove(key) else { return }
                 transfer.cancel()
-                markTransferCancelled(transferID)
-                markFileTransferFinished(id: transferID, status: "File transfer is turned off on Android")
-                fileOperationID = nil
-                filePreparationCancellation = nil
-                fileTransferStatus = "File transfer is turned off on Android"
+                markTransferCancelled(key)
+                let status = FileTransferText.turnedOff(on: displayName(senderID))
+                markFileTransferFinished(key, status: status)
+                fileTransferStatus = status
             case "files.complete.ack":
-                guard let transferID = message.transferId,
-                      let transfer = outgoingFiles.removeValue(forKey: transferID) else { return }
-                outgoingFileSources.removeValue(forKey: transferID)
-                fileTransferStatus = "\(transfer.displayName) saved on Android"
-                updateFileTransfer(id: transferID, name: transfer.displayName, status: fileTransferStatus!, active: false)
-                fileTransferActive = fileTransfers.values.contains(where: { $0.active })
-                fileOperationID = nil
-                filePreparationCancellation = nil
-                NSLog("PLUGIN file sent name=%@", transfer.displayName)
+                guard let senderID = peers.connectedDeviceID(of: current),
+                      let transferID = message.transferId else { return }
+                let key = FileTransferKey(deviceID: senderID, transferID: transferID)
+                guard let transfer = outgoingFiles.remove(key) else { return }
+                outgoingFileSources.removeValue(forKey: key)
+                let status = FileTransferText.saved(transfer.displayName, on: displayName(senderID))
+                fileTransferStatus = status
+                updateFileTransfer(key, name: transfer.displayName, status: status, active: false, outgoing: true)
+                NSLog("PLUGIN file sent name=%@ to=%@", transfer.displayName, String(senderID.prefix(8)))
             case "files.cancel":
-                guard let transferID = message.transferId else { return }
-                markTransferCancelled(transferID)
-                incomingFiles.removeValue(forKey: transferID)?.cancel()
-                incomingSyncAssets.removeValue(forKey: transferID)
-                outgoingFiles.removeValue(forKey: transferID)?.cancel()
-                markFileTransferFinished(id: transferID, status: "Transfer cancelled by Android")
-                fileOperationID = nil
-                fileTransferStatus = "Transfer cancelled by Android"
+                guard let senderID = peers.connectedDeviceID(of: current),
+                      let transferID = message.transferId else { return }
+                let key = FileTransferKey(deviceID: senderID, transferID: transferID)
+                // Only a transfer that exists is remembered as cancelled (a peer cannot flush the list).
+                if incomingFiles.contains(key) || outgoingFiles.contains(key) { markTransferCancelled(key) }
+                incomingFiles.remove(key)?.cancel()
+                incomingSyncAssets.removeValue(forKey: key)
+                outgoingFiles.remove(key)?.cancel()
+                let status = FileTransferText.cancelled(by: displayName(senderID))
+                markFileTransferFinished(key, status: status)
+                fileTransferStatus = status
                 current.send(PairingMessage(kind: "files.cancel.ack", sessionId: current.id, transferId: transferID))
                 NSLog("PLUGIN file cancellation received transfer=%@", String(transferID.prefix(8)))
             case "files.cancel.ack":
-                if let transferID = message.transferId {
-                    markFileTransferFinished(id: transferID, status: "Transfer cancelled")
+                if let senderID = peers.connectedDeviceID(of: current), let transferID = message.transferId {
+                    markFileTransferFinished(FileTransferKey(deviceID: senderID, transferID: transferID), status: "Transfer cancelled")
                 }
             case "files.chunk.ack":
-                if let transferID = message.transferId, let sequence = message.sequence {
-                    outgoingFiles[transferID]?.acknowledge(sequence: sequence)
+                if let senderID = peers.connectedDeviceID(of: current),
+                   let transferID = message.transferId, let sequence = message.sequence {
+                    outgoingFiles[FileTransferKey(deviceID: senderID, transferID: transferID)]?.acknowledge(sequence: sequence)
                 }
             default:
                 break
@@ -2494,10 +2570,6 @@ final class PairingCoordinator: ObservableObject {
             removeAllRemoteNotifications(reason: "peer_feature_off") { $0 == peerID }
         }
         if remoteFeatures[.calls] == false { clearCallStatus() }
-        if remoteFeatures[.files] == false && fileTransferActive {
-            cancelFileTransfer()
-            fileTransferStatus = nil
-        }
         flushPendingCallIfPossible()
     }
 
@@ -2560,6 +2632,11 @@ final class PairingCoordinator: ObservableObject {
         localIsSource: Bool
     ) -> FeatureApplicabilityResult {
         guard let peer = device(deviceID) else { return .notApplicable }
+        // MD-6: Mac <-> Mac file transfers need this Mac's opt-in (off by default).
+        if feature == .files,
+           !FileTransferPolicy.allows(local: localProfile.platform, peer: peer.platform, macToMacEnabled: settings.macToMacFilesEnabled) {
+            return .notApplicable
+        }
         return FeatureApplicability.evaluate(feature, local: localProfile, peer: peer, localIsSource: localIsSource) { [settings] key in
             BridgeyFeature(rawValue: key).map { settings.isEnabled($0, for: deviceID) } ?? true
         }
@@ -2616,57 +2693,46 @@ final class PairingCoordinator: ObservableObject {
         ))
     }
 
-    private func cancelIncomingFiles() {
-        let hadActiveTransfers = fileTransfers.values.contains(where: { $0.active })
-        incomingFiles.values.forEach { $0.cancel() }
-        incomingFiles.removeAll()
-        outgoingFiles.values.forEach { $0.cancel() }
-        outgoingFiles.removeAll()
-        fileTransfers = recoverInterruptedTransfers(fileTransfers)
-        fileTransferActive = false
-        fileOperationID = nil
-        filePreparationCancellation = nil
-        if fileTransferStatus?.hasPrefix("Receiving ") == true {
-            fileTransferStatus = "File transfer interrupted"
-        }
-        if hadActiveTransfers {
-            diagnostics.record(category: "transfer", event: "interrupted", outcome: "retry_available")
-        }
+    private func markTransferCancelled(_ key: FileTransferKey) {
+        cancelledFileTransfers.insert(key)
     }
 
-    private func markTransferCancelled(_ transferID: String) {
-        cancelledTransferIDs.insert(transferID)
-        if cancelledTransferIDs.count > 64, let first = cancelledTransferIDs.first {
-            cancelledTransferIDs.remove(first)
-        }
-    }
-
-    private func updateFileTransfer(id: String, name: String, status: String, active: Bool) {
-        let previous = fileTransfers[id]
-        fileTransfers[id] = FileTransferRow(
-            id: id,
+    private func updateFileTransfer(_ key: FileTransferKey, name: String, status: String, active: Bool, outgoing: Bool) {
+        let previous = fileTransfers[key.rowID]
+        fileTransfers[key.rowID] = FileTransferRow(
+            id: key.rowID,
             name: name,
             status: status,
             active: active,
             startedAt: previous?.startedAt ?? Date(),
-            retryable: !active && outgoingFileSources[id] != nil
+            retryable: !active && outgoingFileSources[key] != nil,
+            deviceID: key.deviceID,
+            peerName: displayName(key.deviceID),
+            outgoing: outgoing
         )
         pruneTransferHistory()
-        fileTransferActive = fileTransfers.values.contains(where: { $0.active })
+        refreshFileTransferActive()
     }
 
-    private func markFileTransferFinished(id: String, status: String) {
-        guard let transfer = fileTransfers[id] else { return }
-        fileTransfers[id] = FileTransferRow(
+    private func markFileTransferFinished(_ key: FileTransferKey, status: String) {
+        guard let transfer = fileTransfers[key.rowID] else { return }
+        fileTransfers[key.rowID] = FileTransferRow(
             id: transfer.id,
             name: transfer.name,
             status: status,
             active: false,
             startedAt: transfer.startedAt,
-            retryable: outgoingFileSources[id] != nil
+            retryable: outgoingFileSources[key] != nil,
+            deviceID: transfer.deviceID,
+            peerName: transfer.peerName,
+            outgoing: transfer.outgoing
         )
         pruneTransferHistory()
-        fileTransferActive = fileTransfers.values.contains(where: { $0.active })
+        refreshFileTransferActive()
+    }
+
+    private func refreshFileTransferActive() {
+        fileTransferActive = fileTransfers.values.contains(where: { $0.active }) || !filePreparations.isEmpty
     }
 
     private func pruneTransferHistory() {
@@ -3431,7 +3497,19 @@ private final class OutgoingFileTransfer {
     private var cancelled = false
     private let acknowledgement = NSCondition()
     private var acknowledgedSequence: Int64 = -1
+    /// The last chunk handed to the connection; an ack beyond it is ignored (MD-6).
+    private var highestSentSequence: Int64 = -1
     var isCancelled: Bool { lock.withLock { cancelled } }
+    private var sending = false
+
+    /// True exactly once: a duplicate files.accept must not start a second send loop.
+    func beginSending() -> Bool {
+        lock.withLock {
+            guard !sending else { return false }
+            sending = true
+            return true
+        }
+    }
 
     func cancel() {
         lock.withLock { cancelled = true }
@@ -3442,7 +3520,11 @@ private final class OutgoingFileTransfer {
 
     func acknowledge(sequence: Int64) {
         acknowledgement.lock()
-        acknowledgedSequence = max(acknowledgedSequence, sequence)
+        acknowledgedSequence = FileChunkAcknowledgement.advance(
+            current: acknowledgedSequence,
+            acknowledged: sequence,
+            highestSent: highestSentSequence
+        )
         acknowledgement.broadcast()
         acknowledgement.unlock()
     }
@@ -3482,6 +3564,7 @@ private final class OutgoingFileTransfer {
     func send(
         through session: Session,
         key: Data,
+        peerName: String,
         status: @escaping @MainActor (String) -> Void,
         completion: @escaping @MainActor (Result<PairingMessage, Error>) -> Void
     ) {
@@ -3495,6 +3578,11 @@ private final class OutgoingFileTransfer {
                 while let chunk = try handle.read(upToCount: Self.chunkSize), !chunk.isEmpty {
                     guard !self.isCancelled else { throw PairingError.cancelled }
                     let sealed = try Self.encrypt(chunk, key: key)
+                    // Recorded before sending: the receiver's ack can be handled on the main queue
+                    // before sendAndWait returns, and must not be discarded as "ahead of the data".
+                    self.acknowledgement.lock()
+                    self.highestSentSequence = sequence
+                    self.acknowledgement.unlock()
                     guard session.sendAndWait(PairingMessage(
                         kind: "files.chunk",
                         sessionId: session.id,
@@ -3510,7 +3598,7 @@ private final class OutgoingFileTransfer {
                     sequence += 1
                     sent += Int64(chunk.count)
                     if let detail = progress.status(transferred: sent) {
-                        DispatchQueue.main.async { status("Sending \(self.displayName): \(detail)") }
+                        DispatchQueue.main.async { status(FileTransferText.sending(self.displayName, to: peerName, progress: detail)) }
                     }
                 }
                 if sequence > 0 { try self.waitForAcknowledgement(sequence: sequence - 1) }
@@ -3528,7 +3616,7 @@ private final class OutgoingFileTransfer {
                     ciphertext: sealed.ciphertext
                 )
                 guard !self.isCancelled else { throw PairingError.cancelled }
-                DispatchQueue.main.async { status("Verifying \(self.displayName) on Android…") }
+                DispatchQueue.main.async { status(FileTransferText.verifying(self.displayName, on: peerName)) }
                 DispatchQueue.main.async { completion(.success(message)) }
             } catch {
                 DispatchQueue.main.async { completion(.failure(error)) }

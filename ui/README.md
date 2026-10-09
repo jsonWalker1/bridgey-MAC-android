@@ -36,17 +36,21 @@ panel and the dashboard show *the peers*, then *the selected peer's card*:
 - **that peer's own telemetry** (battery, storage, memory, CPU, temperature and the details view),
   whichever peer it is (MD-4c, see [telemetry](../features/telemetry/README.md));
 - **Clipboard to that peer** (MD-5);
-- legacy sections (calls, media, files, links, screen share, quick actions) only when
+- **Send Files… to that peer** (MD-6); transfer rows and notifications name the peer
+  (`photo.jpg → Mac`, `document.pdf ← S23`), Android's Share dialog asks for the recipient (the
+  selected peer preselected when it is eligible), and on macOS Finder's Services → "Send to
+  Bridgey…" sends a selection, see [files](../features/files/README.md);
+- legacy sections (calls, media, links, screen share, quick actions) only when
   the selected peer **is** the routed peer (`SelectedDeviceContext`
   `legacyFeaturesApply`), so one peer's state is never shown under another peer's name.
 
 Three concepts stay separate: connected peers (the directory), `selectedDeviceId` (UI context)
 and `preferredDeviceID` (where legacy single-peer features are routed). When they differ, a row
 says which features currently use <peer> and offers "Use <selected> for these features", which only changes
-`preferredDeviceID` (it stops a file transfer in progress, as before). With no selection and
+`preferredDeviceID` (file transfers in progress keep their peer, MD-6). With no selection and
 several peers nothing is shown as selected; with one peer it is selected automatically.
 
 Known limitation: legacy sections still exist only for the routed peer until each feature is
-migrated (MD-5+).
+migrated (MD-5, MD-6, …).
 
 Related: [app](../app/README.md) · [features](../features/README.md)
