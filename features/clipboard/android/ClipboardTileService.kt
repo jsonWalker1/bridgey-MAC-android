@@ -24,11 +24,12 @@ class ClipboardTileService : TileService() {
         listening = scope.launch {
             combine(app.pairing.state, app.pairing.remoteFeatures, app.settings.state) { _, _, _ -> Unit }.collect {
                 qsTile?.apply {
-                    val ready = app.isBridgeyEnabled && app.pairing.state.value is PairingState.Connected &&
-                        app.pairing.isFeatureAvailable(BridgeyFeature.CLIPBOARD)
+                    // MD-5: the tile sends without a picker, so it is ready only with exactly one eligible peer.
+                    val target = app.pairing.targets(FeatureApplicability.Feature.CLIPBOARD).singleOrNull()
+                    val ready = app.isBridgeyEnabled && app.pairing.state.value is PairingState.Connected && target != null
                     state = if (ready) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
                     label = "Bridgey clipboard"
-                    if (Build.VERSION.SDK_INT >= 29) subtitle = if (ready) "Send to Mac" else "Open Bridgey"
+                    if (Build.VERSION.SDK_INT >= 29) subtitle = if (ready) "Send to ${target?.name}" else "Open Bridgey"
                     updateTile()
                 }
             }
@@ -45,7 +46,7 @@ class ClipboardTileService : TileService() {
             val app = application as BridgeyApplication
             if (!app.isPrimaryUser) return@unlockAndRun
             val ready = app.isBridgeyEnabled && app.pairing.state.value is PairingState.Connected &&
-                app.pairing.isFeatureAvailable(BridgeyFeature.CLIPBOARD)
+                app.pairing.targets(FeatureApplicability.Feature.CLIPBOARD).size == 1
             val activity = if (ready) ClipboardCaptureActivity::class.java else MainActivity::class.java
             val intent = Intent(this, activity).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             if (Build.VERSION.SDK_INT >= 34) {

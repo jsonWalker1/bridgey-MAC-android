@@ -86,6 +86,8 @@ enum class ClipboardSendResult {
     CONNECTION_LOST,
     NO_ACKNOWLEDGEMENT,
     TOO_LARGE,
+    /** MD-5: several peers can receive the clipboard and none was chosen (never a fallback peer). */
+    NO_TARGET,
 }
 
 data class FileTransferState(
@@ -195,7 +197,9 @@ class PairingCoordinator(
     @Volatile private var localDeviceName = localDeviceName
     private val mutableClipboardStatus = MutableStateFlow<String?>(null)
     val clipboardStatus: StateFlow<String?> = mutableClipboardStatus.asStateFlow()
-    private val pendingClipboardSends = ConcurrentHashMap<String, (ClipboardSendResult) -> Unit>()
+    /** MD-5: clipboard sends per (deviceId, messageId), and one completion per send. */
+    private val clipboardSends = ClipboardSends()
+    private val clipboardCompletions = ConcurrentHashMap<String, (ClipboardSendResult) -> Unit>()
     private val pendingFileAccepts = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
     private val pendingFileCompletions = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
     private val mutableFileTransferStatus = MutableStateFlow<String?>(null)
@@ -339,7 +343,7 @@ class PairingCoordinator(
         mediaRemote.start()
         scope.launch {
             settings.state.collect {
-                if (!featureEnabled(BridgeyFeature.CLIPBOARD)) mutableClipboardStatus.value = null
+                if (!settings.isEnabled(BridgeyFeature.CLIPBOARD, null)) mutableClipboardStatus.value = null
                 // MD-4c: each peer's telemetry follows that peer's own grant; a re-enabled battery
                 // grant gets our current battery right away (as on macOS).
                 mutableTelemetry.update { map -> DeviceTelemetryStore.prune(map) { id, metric -> settings.isEnabled(metric.feature, id) } }
@@ -505,28 +509,49 @@ class PairingCoordinator(
     fun isFeatureAvailable(feature: BridgeyFeature): Boolean =
         effectiveFeatureAvailable(featureEnabled(feature), mutableRemoteFeatures.value[feature] != false)
 
-    fun sendClipboard() {
+    /** MD-5: sends this phone's clipboard to exactly [deviceId] (explicit send, never synchronized). */
+    fun sendClipboard(deviceId: String) {
         val clipboard = appContext.getSystemService(ClipboardManager::class.java)
         val item = clipboard.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)
         val text = item?.coerceToText(appContext)?.toString()
         if (text.isNullOrEmpty()) {
             mutableClipboardStatus.value = "Clipboard unavailable. Copy text, return to Bridgey, and try again."
         } else {
-            sendClipboardContent(text, item.htmlText)
+            sendClipboardContent(deviceId, text, item.htmlText)
         }
     }
 
-    fun sendText(text: String, onResult: (ClipboardSendResult) -> Unit = {}) =
-        sendClipboardContent(text, html = null, onResult = onResult)
+    /**
+     * Target-less entry points (Quick Settings tile, notification action, share): sends only when
+     * exactly one connected peer can receive the clipboard - never to a routed or fallback peer.
+     */
+    fun sendText(text: String, onResult: (ClipboardSendResult) -> Unit = {}) {
+        val deviceId = ClipboardTarget.forTargetlessSend(targets(FeatureApplicability.Feature.CLIPBOARD).map { it.deviceId })
+        if (deviceId == null) {
+            val anyConnected = peers.connectedInOrder().isNotEmpty()
+            mutableClipboardStatus.value = if (anyConnected) "Choose a device in Bridgey to send the clipboard" else "Not connected — clipboard was not sent"
+            onResult(if (anyConnected) ClipboardSendResult.NO_TARGET else ClipboardSendResult.NOT_CONNECTED)
+            return
+        }
+        sendClipboardContent(deviceId, text, html = null, onResult = onResult)
+    }
 
+    /**
+     * MD-5: the send is tracked as (deviceId, messageId); its ack, rejection, timeout or the device's
+     * disconnect never touch another device's send. One retry after 3 s with the same message id
+     * (the receiver acknowledges a retransmission again instead of applying it twice).
+     */
     private fun sendClipboardContent(
+        deviceId: String,
         text: String,
         html: String?,
         onResult: (ClipboardSendResult) -> Unit = {},
     ) {
-        if (!isFeatureAvailable(BridgeyFeature.CLIPBOARD)) {
-            mutableClipboardStatus.value = "Clipboard is turned off on one of your devices"
-            onResult(ClipboardSendResult.DISABLED)
+        val name = displayName(deviceId)
+        if (applicability(FeatureApplicability.Feature.CLIPBOARD, deviceId, localIsSource = true) != FeatureApplicabilityResult.OFFERED) {
+            val connected = peers.connectedSession(deviceId) != null
+            mutableClipboardStatus.value = if (connected) "Clipboard is turned off on one of your devices" else "$name is not connected — clipboard was not sent"
+            onResult(if (connected) ClipboardSendResult.DISABLED else ClipboardSendResult.NOT_CONNECTED)
             return
         }
         if (text.isEmpty()) {
@@ -539,61 +564,44 @@ class PairingCoordinator(
             onResult(ClipboardSendResult.TOO_LARGE)
             return
         }
-        val connectedSession = activeSession
-        if (connectedSession == null || mutableState.value !is PairingState.Connected) {
-            mutableClipboardStatus.value = "Not connected — clipboard was not sent"
-            onResult(ClipboardSendResult.NOT_CONNECTED)
+        val richContent = RichClipboardContent.create(text, html)
+        val plaintext = richContent?.encode() ?: text.toByteArray(Charsets.UTF_8)
+        val kind = if (richContent == null) "clipboard.update" else "clipboard.rich"
+        val messageId = UUID.randomUUID().toString()
+        clipboardSends.begin(deviceId, messageId)
+        clipboardCompletions[messageId] = onResult
+        if (!send(deviceId, kind, plaintext, messageId)) {
+            finishClipboardSend(messageId, ClipboardSendResult.NOT_CONNECTED, "$name is not connected — clipboard was not sent") {
+                clipboardSends.failed(deviceId, messageId)
+            }
             return
         }
+        mutableClipboardStatus.value = "Sending to $name…"
+        android.util.Log.i("Bridgey", "PLUGIN clipboard sent")
         scope.launch {
-            val current = connectedSession
-            if (activeSession !== current || mutableState.value !is PairingState.Connected) {
-                mutableClipboardStatus.value = "Not connected — clipboard was not sent"
-                onResult(ClipboardSendResult.NOT_CONNECTED)
-                return@launch
-            }
-            val messageId = UUID.randomUUID().toString()
-            pendingClipboardSends[messageId] = onResult
-            // BRIDGEY CONNECTIVITY CRASH FIX (2026-09-25): see sendBattery's identical guard for why -
-            // same TOCTOU race, same latent whole-process-crashing force-unwrap.
-            val pairingKey = current.pairingKey ?: run {
-                mutableClipboardStatus.value = "Not connected — clipboard was not sent"
-                onResult(ClipboardSendResult.NOT_CONNECTED)
-                return@launch
-            }
-            val richContent = RichClipboardContent.create(text, html)
-            val plaintext = richContent?.encode() ?: text.toByteArray(Charsets.UTF_8)
-            val encrypted = Crypto.encrypt(pairingKey, plaintext)
-            val message = Message(
-                kind = if (richContent == null) "clipboard.update" else "clipboard.rich",
-                sessionId = current.id,
-                messageId = messageId,
-                nonce = encrypted.nonce,
-                ciphertext = encrypted.ciphertext,
-            )
-            if (!current.send(message)) {
-                pendingClipboardSends.remove(messageId)?.invoke(ClipboardSendResult.CONNECTION_LOST)
-                mutableClipboardStatus.value = "Connection lost"
-                current.close()
-                return@launch
-            }
-            mutableClipboardStatus.value = "Sending…"
-            android.util.Log.i("Bridgey", "PLUGIN clipboard sent")
             delay(3_000)
-            if (pendingClipboardSends.containsKey(messageId) && activeSession === current) {
-                if (!current.send(message)) {
-                    pendingClipboardSends.remove(messageId)?.invoke(ClipboardSendResult.CONNECTION_LOST)
-                    mutableClipboardStatus.value = "Connection lost"
-                    current.close()
-                    return@launch
-                }
-                delay(3_000)
-                pendingClipboardSends.remove(messageId)?.let { callback ->
-                    mutableClipboardStatus.value = "No delivery acknowledgement"
-                    callback(ClipboardSendResult.NO_ACKNOWLEDGEMENT)
-                }
+            if (!clipboardSends.isPending(deviceId, messageId)) return@launch
+            if (!send(deviceId, kind, plaintext, messageId)) return@launch // session gone: deviceEnded fails it
+            delay(3_000)
+            finishClipboardSend(messageId, ClipboardSendResult.NO_ACKNOWLEDGEMENT, "$name did not confirm the clipboard") {
+                clipboardSends.timeOut(deviceId, messageId)
             }
         }
+    }
+
+    /** Completes one send if [transition] still finds it pending; runs its completion once. */
+    private fun finishClipboardSend(messageId: String, result: ClipboardSendResult, status: String, transition: () -> Boolean) {
+        if (!transition()) return
+        mutableClipboardStatus.value = status
+        clipboardCompletions.remove(messageId)?.invoke(result)
+    }
+
+    /** The device's session ended: its sends fail; no other device's send is touched. */
+    private fun clipboardDeviceEnded(deviceId: String) {
+        val ended = clipboardSends.deviceEnded(deviceId)
+        if (ended.isEmpty()) return
+        mutableClipboardStatus.value = "${displayName(deviceId)} disconnected — clipboard was not delivered"
+        ended.forEach { clipboardCompletions.remove(it)?.invoke(ClipboardSendResult.CONNECTION_LOST) }
     }
 
     // region Telemetry (MD-4c: per peer, in both directions)
@@ -1211,6 +1219,7 @@ class PairingCoordinator(
         lastSentBattery.remove(deviceId)
         removeTelemetrySubscriber(deviceId)
         telemetrySubscription.sessionEnded(deviceId)
+        clipboardDeviceEnded(deviceId) // MD-5
         if (pings.deviceEnded(deviceId)) mutablePingStatus.value = "${displayName(deviceId)} disconnected"
         synchronized(findLock) {
             if (find.deviceEnded(deviceId)) stopPhoneRinging()
@@ -1552,8 +1561,6 @@ class PairingCoordinator(
 
     /** Ends every in-flight clipboard/file exchange of the single-peer feature layer. */
     private fun interruptFeatureTransfers() {
-        pendingClipboardSends.values.forEach { it(ClipboardSendResult.NOT_CONNECTED) }
-        pendingClipboardSends.clear()
         pendingFileAccepts.values.forEach { it.complete(false) }
         pendingFileAccepts.clear()
         pendingFileCompletions.values.forEach { it.complete(false) }
@@ -1815,6 +1822,8 @@ class PairingCoordinator(
         "ping.request", "ping.ack", "find.start", "find.stop", "find.started", "find.stopped",
         // MD-4c: telemetry is per peer in both directions.
         "battery.update", "telemetry.update", "telemetry.subscribe", "telemetry.unsubscribe",
+        // MD-5: clipboard is sent to and accepted from an explicit peer.
+        "clipboard.update", "clipboard.rich", "clipboard.ack", "clipboard.rejected",
     )
 
     private fun receive(current: Session, message: Message) {
@@ -1901,18 +1910,18 @@ class PairingCoordinator(
             "clipboard.update" -> receiveClipboard(current, message, rich = false)
             "clipboard.rich" -> receiveClipboard(current, message, rich = true)
             "clipboard.ack" -> {
+                val sender = peers.connectedDeviceId(current) ?: return
                 val messageId = message.messageId ?: return
-                pendingClipboardSends.remove(messageId)?.let { callback ->
-                    mutableClipboardStatus.value = "Delivered"
-                    callback(ClipboardSendResult.DELIVERED)
-                    android.util.Log.i("Bridgey", "PLUGIN clipboard acknowledged")
+                finishClipboardSend(messageId, ClipboardSendResult.DELIVERED, "Delivered to ${displayName(sender)}") {
+                    clipboardSends.acknowledge(messageId, from = sender)
                 }
+                android.util.Log.i("Bridgey", "PLUGIN clipboard acknowledged")
             }
             "clipboard.rejected" -> {
+                val sender = peers.connectedDeviceId(current) ?: return
                 val messageId = message.messageId ?: return
-                pendingClipboardSends.remove(messageId)?.let { callback ->
-                    mutableClipboardStatus.value = "Clipboard is turned off on Mac"
-                    callback(ClipboardSendResult.DISABLED)
+                finishClipboardSend(messageId, ClipboardSendResult.DISABLED, "Clipboard is turned off on ${displayName(sender)}") {
+                    clipboardSends.reject(messageId, from = sender)
                 }
             }
             "notifications.dismiss" -> receiveNotificationDismiss(current, message)
@@ -2191,14 +2200,24 @@ class PairingCoordinator(
     }
 
     private fun receiveClipboard(current: Session, message: Message, rich: Boolean) {
-        if (!settings.isEnabled(BridgeyFeature.CLIPBOARD, current.remoteDeviceId)) {
+        // MD-5: accepted from any connected peer the clipboard is offered with (direction and its own
+        // grant, checked below); the sender is the session it arrived on, never the routed peer.
+        // Unauthenticated sessions get no reply at all.
+        val senderId = peers.connectedDeviceId(current) ?: return
+        if (message.sessionId != current.id) return
+        val senderAccepted = device(senderId)?.let { ClipboardReceiveAction.acceptsSender(it.profile, localProfile) } ?: false
+        if (!senderAccepted || !settings.isEnabled(BridgeyFeature.CLIPBOARD, senderId)) {
             current.send(Message(kind = "clipboard.rejected", sessionId = current.id, messageId = message.messageId))
             sendFeatureState()
             return
         }
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
         val messageId = message.messageId ?: return
-        if (!current.acceptMessageId(messageId)) return
+        // A retransmission (the sender retried before our ack arrived) is acknowledged again, not
+        // applied twice.
+        if (ClipboardReceiveAction.forMessage(current.acceptMessageId(messageId)) == ClipboardReceiveAction.ACKNOWLEDGE_AGAIN) {
+            current.send(Message(kind = "clipboard.ack", sessionId = current.id, messageId = messageId))
+            return
+        }
         val plaintext = Crypto.decrypt(
             current.pairingKey!!,
             message.nonce ?: return,
@@ -2636,7 +2655,6 @@ class PairingCoordinator(
         quickActions.policyChanged()
         mediaRemote.policyChanged()
         refreshNotificationForwardingAvailability()
-        if (received[BridgeyFeature.CLIPBOARD] == false) mutableClipboardStatus.value = null
     }
 
     private fun receiveBattery(current: Session, message: Message) {

@@ -322,14 +322,14 @@ final class PairingCoordinator: ObservableObject {
     private var pendingCallNumber: String?
     private var pendingCallExpiryWorkItem: DispatchWorkItem?
     private var remoteFeatureStateReceived = false
-    private var clipboardSendID: String?
+    /// MD-5: clipboard sends per (deviceId, messageId).
+    @Published private(set) var clipboardSends = ClipboardSends()
     /// BRIDGEY KVM COPY/PASTE INTEGRATION: lets a caller of `sendClipboard(completion:)` (namely
     /// Command+V during KVM - see `onPasteRequested`) know once the sync has definitely either
     /// succeeded or failed, so it can safely follow up with a KEY(Ctrl+V) forward to Android without
-    /// racing the clipboard update across the separate control/input TCP channels. `nil` for the
-    /// existing manual-trigger call sites (menu button, global hotkey), which don't need to know.
-    private var clipboardCompletion: ((Bool) -> Void)?
-    private var clipboardTimeoutWorkItem: DispatchWorkItem?
+    /// racing the clipboard update across the separate control/input TCP channels. MD-5: one
+    /// completion per send, keyed like the send itself.
+    private var clipboardCompletions: [ClipboardSends.Key: (Bool) -> Void] = [:]
     private let notificationPresenter = NotificationPresenter()
     private var remoteNotificationCategories: [String: UNNotificationCategory] = [:]
     // BRIDGEY NOTIFICATION++ SOUND POLISH: highest Android postTime already delivered per logical
@@ -446,7 +446,7 @@ final class PairingCoordinator: ObservableObject {
         }
         shortcuts.perform = { [weak self] action in
             switch action {
-            case .clipboard: self?.sendClipboard()
+            case .clipboard: self?.sendClipboardFromShortcut()
             case .call: self?.sendCallFromClipboard()
             case .link: self?.quickActions.sendClipboardLink()
             case .ping: self?.sendPing()
@@ -482,7 +482,7 @@ final class PairingCoordinator: ObservableObject {
                     self.mediaRemote.reset()
                     self.videoChannel.reset()
                     self.screenStreamDecoder.reset()
-                    if !self.featureEnabled(.clipboard) { self.clearClipboardSendStatus() }
+                    if !self.settings.isEnabled(.clipboard, for: nil) { self.clearClipboardSendStatus() }
                     if !self.featureEnabled(.notifications) { self.clearRemoteCall() }
                     // BRIDGEY NOTIFICATION++ RECONCILIATION: forwarding off (globally or for one
                     // device) = nothing mirrored from that device may stay in Notification Center.
@@ -862,17 +862,36 @@ final class PairingCoordinator: ObservableObject {
         )
     }
 
-    /// BRIDGEY KVM COPY/PASTE INTEGRATION: `completion` is `nil` for every pre-existing call site
-    /// (the menu button, the global keyboard shortcut) - only `onPasteRequested` (Command+V during
-    /// KVM) passes one, to know once the sync has definitely finished (delivered, rejected, or timed
-    /// out) before forwarding the follow-up KEY(Ctrl+V). Behavior for existing callers is unchanged.
+    /// BRIDGEY KVM COPY/PASTE INTEGRATION: Command+V during KVM syncs the clipboard to the peer the
+    /// KVM channel belongs to, which is the routed peer (KVM is frozen and single-peer). Every other
+    /// clipboard send names its target explicitly (MD-5).
     func sendClipboard(completion: ((Bool) -> Void)? = nil) {
-        guard let current = activeSession, case .connected = state else {
+        guard let deviceID = activePeerID else {
             completion?(false)
             return
         }
-        guard isFeatureAvailable(.clipboard) else {
-            clipboardStatus = "Clipboard is turned off on one of your devices"
+        sendClipboard(to: deviceID, completion: completion)
+    }
+
+    /// MD-5: the global shortcut has no UI selection; it sends only when exactly one connected peer
+    /// can receive the clipboard, and never falls back to the routed peer.
+    func sendClipboardFromShortcut() {
+        guard let deviceID = ClipboardTarget.forTargetlessSend(eligible: targets(for: .clipboard).map(\.deviceID)) else {
+            clipboardStatus = "Choose a device in the Bridgey panel to send the clipboard"
+            return
+        }
+        sendClipboard(to: deviceID)
+    }
+
+    /// MD-5: sends this Mac's clipboard to exactly `deviceID` (explicit send, never synchronized).
+    /// The send is tracked as (deviceId, messageId); its ack, rejection, timeout or the device's
+    /// disconnect never touch another device's send.
+    func sendClipboard(to deviceID: String, completion: ((Bool) -> Void)? = nil) {
+        let name = displayName(deviceID)
+        guard applicability(of: .clipboard, with: deviceID, localIsSource: true) == .offered else {
+            clipboardStatus = peers.connectedSession(for: deviceID) == nil
+                ? "\(name) is not connected — clipboard was not sent"
+                : "Clipboard is turned off on one of your devices"
             completion?(false)
             return
         }
@@ -890,47 +909,50 @@ final class PairingCoordinator: ObservableObject {
             .flatMap { String(data: $0, encoding: .utf8) }
         let richContent = RichClipboardContent(text: text, html: html)
         let plaintext = richContent.flatMap { try? JSONEncoder().encode($0) } ?? Data(text.utf8)
-        guard let encrypted = try? encrypt(plaintext, key: current.pairingKey!) else {
-            clipboardStatus = "Encryption failed"
-            completion?(false)
+        let messageID = UUID().uuidString.lowercased()
+        let key = ClipboardSends.Key(deviceID: deviceID, messageID: messageID)
+        clipboardSends.begin(deviceID: deviceID, messageID: messageID)
+        if let completion { clipboardCompletions[key] = completion }
+        guard send(to: deviceID, kind: richContent == nil ? "clipboard.update" : "clipboard.rich",
+                   payload: plaintext, messageID: messageID) else {
+            finishClipboardSend(key, success: false, status: "\(name) is not connected — clipboard was not sent") {
+                $0.failed(deviceID: deviceID, messageID: messageID)
+            }
             return
         }
-        let messageID = UUID().uuidString.lowercased()
-        current.send(PairingMessage(
-            kind: richContent == nil ? "clipboard.update" : "clipboard.rich",
-            sessionId: current.id,
-            messageId: messageID,
-            nonce: encrypted.nonce,
-            ciphertext: encrypted.ciphertext
-        ))
-        clipboardTimeoutWorkItem?.cancel()
-        clipboardSendID = messageID
-        clipboardCompletion = completion
-        clipboardStatus = "Sending…"
-        let timeout = DispatchWorkItem { [weak self, weak current] in
-            guard let self, let current, self.activeSession === current,
-                  self.clipboardSendID == messageID else { return }
-            self.clipboardSendID = nil
-            self.clipboardTimeoutWorkItem = nil
-            self.clipboardStatus = "No delivery acknowledgement"
-            self.sendFeatureState()
-            let completion = self.clipboardCompletion
-            self.clipboardCompletion = nil
-            completion?(false)
-        }
-        clipboardTimeoutWorkItem = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: timeout)
+        clipboardStatus = "Sending to \(name)…"
         NSLog("PLUGIN clipboard sent")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            self?.finishClipboardSend(key, success: false, status: "\(name) did not confirm the clipboard") {
+                $0.timeOut(deviceID: deviceID, messageID: messageID)
+            }
+        }
+    }
+
+    /// Completes one send if `transition` still finds it pending; runs its completion once.
+    private func finishClipboardSend(
+        _ key: ClipboardSends.Key,
+        success: Bool,
+        status: String,
+        _ transition: (inout ClipboardSends) -> Bool
+    ) {
+        guard transition(&clipboardSends) else { return }
+        clipboardStatus = status
+        clipboardCompletions.removeValue(forKey: key)?(success)
+    }
+
+    /// The device's session ended: its sends fail; no other device's send is touched.
+    private func clipboardDeviceEnded(_ deviceID: String) {
+        let ended = clipboardSends.deviceEnded(deviceID)
+        guard !ended.isEmpty else { return }
+        clipboardStatus = "\(displayName(deviceID)) disconnected — clipboard was not delivered"
+        for messageID in ended {
+            clipboardCompletions.removeValue(forKey: ClipboardSends.Key(deviceID: deviceID, messageID: messageID))?(false)
+        }
     }
 
     private func clearClipboardSendStatus() {
-        clipboardTimeoutWorkItem?.cancel()
-        clipboardTimeoutWorkItem = nil
-        clipboardSendID = nil
         clipboardStatus = nil
-        let completion = clipboardCompletion
-        clipboardCompletion = nil
-        completion?(false)
     }
 
     /// Compatibility path without an explicit target (keyboard shortcut): the routed device.
@@ -1298,6 +1320,7 @@ final class PairingCoordinator: ObservableObject {
         lastSentBattery[deviceID] = nil
         telemetryUnsubscribed(by: deviceID)
         telemetrySubscription.sessionEnded(deviceID)
+        clipboardDeviceEnded(deviceID) // MD-5
         if pings.deviceEnded(deviceID) { setTransientPingStatus("\(displayName(deviceID)) disconnected") }
         if find.deviceEnded(deviceID) { stopMacSound() }
         deviceDirectoryRevision += 1
@@ -1776,7 +1799,6 @@ final class PairingCoordinator: ObservableObject {
     /// Ends in-flight clipboard/file/call exchanges of the single-peer feature layer.
     private func interruptFeatureTransfers() {
         cancelIncomingFiles()
-        clearClipboardSendStatus()
         clearCallStatus()
         if !outgoingFiles.isEmpty {
             outgoingFiles.values.forEach { $0.cancel() }
@@ -1851,6 +1873,8 @@ final class PairingCoordinator: ObservableObject {
         "ping.request", "ping.ack", "find.start", "find.stop", "find.started", "find.stopped",
         // MD-4c: telemetry is per peer in both directions.
         "battery.update", "telemetry.update", "telemetry.subscribe", "telemetry.unsubscribe",
+        // MD-5: clipboard is sent to and accepted from an explicit peer.
+        "clipboard.update", "clipboard.rich", "clipboard.ack", "clipboard.rejected",
     ]
 
     private func receive(_ message: PairingMessage, in current: Session) {
@@ -1985,20 +2009,33 @@ final class PairingCoordinator: ObservableObject {
             case "ping.ack":
                 receivePingAcknowledgement(message, in: current)
             case "clipboard.update", "clipboard.rich":
-                guard featureEnabled(.clipboard, current: current) else {
+                // MD-5: accepted from any connected peer the clipboard is offered with (direction and
+                // its own grant, checked below); the sender is the session it arrived on, never the
+                // routed peer. Unauthenticated sessions get no clipboard.rejected reply.
+                guard let senderID = peers.connectedDeviceID(of: current),
+                      message.sessionId == current.id,
+                      let messageID = message.messageId else {
+                    throw PairingError.invalidMessage
+                }
+                let senderAccepted = device(senderID).map {
+                    ClipboardReceiveAction.acceptsSender($0.profile, receiver: localProfile)
+                } ?? false
+                guard senderAccepted, featureEnabled(.clipboard, current: current) else {
                     current.send(PairingMessage(
                         kind: "clipboard.rejected",
                         sessionId: current.id,
-                        messageId: message.messageId
+                        messageId: messageID
                     ))
                     sendFeatureState()
                     return
                 }
-                guard case .connected = state,
-                      message.sessionId == current.id,
-                      let messageID = message.messageId,
-                      current.acceptMessageID(messageID),
-                      let nonce = message.nonce,
+                // A retransmission (the sender retried before our ack arrived) is acknowledged again,
+                // not applied twice and not treated as a protocol error.
+                guard ClipboardReceiveAction.forMessage(isNewMessageID: current.acceptMessageID(messageID)) == .apply else {
+                    current.send(PairingMessage(kind: "clipboard.ack", sessionId: current.id, messageId: messageID))
+                    return
+                }
+                guard let nonce = message.nonce,
                       let ciphertext = message.ciphertext,
                       let plaintext = try? decrypt(nonce: nonce, ciphertext: ciphertext, key: current.pairingKey!) else {
                     throw PairingError.invalidMessage
@@ -2023,24 +2060,18 @@ final class PairingCoordinator: ObservableObject {
                 NSLog("PLUGIN clipboard received")
                 current.send(PairingMessage(kind: "clipboard.ack", sessionId: current.id, messageId: messageID))
             case "clipboard.ack":
-                guard message.messageId == clipboardSendID else { return }
-                clipboardTimeoutWorkItem?.cancel()
-                clipboardTimeoutWorkItem = nil
-                clipboardSendID = nil
-                clipboardStatus = "Delivered"
+                guard let sender = peers.connectedDeviceID(of: current), let messageID = message.messageId else { return }
+                finishClipboardSend(ClipboardSends.Key(deviceID: sender, messageID: messageID), success: true,
+                                    status: "Delivered to \(displayName(sender))") {
+                    $0.acknowledge(messageID: messageID, from: sender)
+                }
                 NSLog("PLUGIN clipboard acknowledged")
-                let ackCompletion = clipboardCompletion
-                clipboardCompletion = nil
-                ackCompletion?(true)
             case "clipboard.rejected":
-                guard message.messageId == clipboardSendID else { return }
-                clipboardTimeoutWorkItem?.cancel()
-                clipboardTimeoutWorkItem = nil
-                clipboardSendID = nil
-                clipboardStatus = "Clipboard is turned off on Android"
-                let rejectedCompletion = clipboardCompletion
-                clipboardCompletion = nil
-                rejectedCompletion?(false)
+                guard let sender = peers.connectedDeviceID(of: current), let messageID = message.messageId else { return }
+                finishClipboardSend(ClipboardSends.Key(deviceID: sender, messageID: messageID), success: false,
+                                    status: "Clipboard is turned off on \(displayName(sender))") {
+                    $0.reject(messageID: messageID, from: sender)
+                }
             case "find.start":
                 try receiveFindCommand(message, in: current, start: true)
             case "find.stop":
@@ -2457,7 +2488,6 @@ final class PairingCoordinator: ObservableObject {
         videoChannel.reset()
         screenStreamDecoder.reset()
         mediaController.refresh()
-        if remoteFeatures[.clipboard] == false { clearClipboardSendStatus() }
         if remoteFeatures[.notifications] == false {
             clearRemoteCall()
             let peerID = activePeerID ?? ""

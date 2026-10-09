@@ -1113,7 +1113,7 @@ private fun DeviceScreen(
                     ConnectedDeviceCard(
                         device = selected,
                         legacy = legacy,
-                        clipboardStatus = if (legacy) clipboardStatus else null,
+                        clipboardStatus = clipboardStatus,
                         phoneRinging = phoneRinging,
                         remoteRinging = remoteRinging,
                         pingEligible = pingTargets.any { it.first == selected.deviceId },
@@ -1129,9 +1129,11 @@ private fun DeviceScreen(
                         cpuEnabled = pairing.isTelemetryAvailable(TelemetryMetric.CPU, selected.deviceId),
                         temperatureEnabled = pairing.isTelemetryAvailable(TelemetryMetric.TEMPERATURE, selected.deviceId),
                         pingStatus = pingStatus,
-                        clipboardEnabled = legacy && enabledFeatures[BridgeyFeature.CLIPBOARD] != false,
+                        // MD-5: the clipboard goes to this peer, whichever peer legacy features use.
+                        clipboardEnabled = pairing.applicability(FeatureApplicability.Feature.CLIPBOARD, selected.deviceId, localIsSource = true) ==
+                            FeatureApplicabilityResult.OFFERED,
                         filesEnabled = legacy && enabledFeatures[BridgeyFeature.FILES] != false,
-                        onClipboard = pairing::sendClipboard,
+                        onClipboard = { pairing.sendClipboard(selected.deviceId) },
                         onFile = { filePicker.launch(arrayOf("*/*")) },
                         onRing = { pairing.startFinding(it) },
                         onStopRing = { pairing.stopFinding(it) },
@@ -1367,7 +1369,7 @@ private fun ConnectedDeviceCard(
                 Text("›", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .72f))
             }
             if (clipboardEnabled || filesEnabled) Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                if (clipboardEnabled) QuickAction("Clipboard", "Copy", Modifier.weight(1f), onClipboard)
+                if (clipboardEnabled) QuickAction("Clipboard", "To ${device.name}", Modifier.weight(1f), onClipboard)
                 if (filesEnabled) QuickAction("File", "Send", Modifier.weight(1f), onFile)
                 if (clipboardEnabled.xor(filesEnabled)) Spacer(Modifier.weight(1f))
             }
@@ -1497,7 +1499,7 @@ private fun formattedByteCount(context: Context, bytes: Long): String = Formatte
 private fun LegacyRoutingRow(routedName: String, selected: DeviceListItem?, transferActive: Boolean, onUseForFeatures: (String) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Text(
-            "Files, clipboard, links, media and screen sharing currently use $routedName.",
+            "Files, links, media and screen sharing currently use $routedName.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

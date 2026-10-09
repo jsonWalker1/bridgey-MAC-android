@@ -212,7 +212,7 @@ private struct BridgeyPanel: View {
     /// explicit switch (`setPreferredDevice`). Selection and routing stay separate.
     private func legacyRoutingRow(routed: DeviceListItem, selected: DeviceListItem?) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Files, clipboard, media, calls, links and screen share currently use \(routed.name).")
+            Text("Files, media, calls, links and screen share currently use \(routed.name).")
                 .font(.caption).foregroundStyle(.secondary)
             if let selected {
                 Button("Use \(selected.name) for these features") { settings.setPreferredDevice(selected.deviceID) }
@@ -335,8 +335,10 @@ private struct BridgeyPanel: View {
             }
 
             LazyVGrid(columns: quickActionColumns, spacing: 8) {
-                if legacy && pairing.isFeatureAvailable(.clipboard) {
-                    actionButton("Clipboard", icon: "doc.on.clipboard") { pairing.sendClipboard() }
+                // MD-5: the clipboard goes to this peer, whichever peer legacy features use.
+                if isEligible(device, for: .clipboard) {
+                    actionButton("Clipboard", icon: "doc.on.clipboard") { pairing.sendClipboard(to: device.deviceID) }
+                        .help("Send the clipboard to \(device.name)")
                 }
                 if legacy && pairing.isFeatureAvailable(.files) {
                     actionButton("File", icon: "paperplane") { pairing.chooseAndSendFile() }
@@ -390,7 +392,7 @@ private struct BridgeyPanel: View {
                     .accessibilityHint("Opens a window that stays visible while you drag a file from Finder")
             }
             if legacy &&
-                !pairing.isFeatureAvailable(.clipboard) &&
+                !isEligible(device, for: .clipboard) &&
                 !pairing.isFeatureAvailable(.files) &&
                 !isEligible(device, for: .findDevice) &&
                 !isEligible(device, for: .ping) &&
@@ -400,8 +402,8 @@ private struct BridgeyPanel: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            if legacy, let status = pairing.clipboardStatus {
-                Label(status, systemImage: status == "Delivered" ? "checkmark.circle.fill" : "clock")
+            if let status = pairing.clipboardStatus {
+                Label(status, systemImage: status.hasPrefix("Delivered") ? "checkmark.circle.fill" : "clock")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -33,6 +33,7 @@ class ClipboardCaptureActivity : Activity() {
                             ClipboardSendResult.CONNECTION_LOST -> "Send failed — connection lost"
                             ClipboardSendResult.NO_ACKNOWLEDGEMENT -> "Mac did not confirm delivery"
                             ClipboardSendResult.TOO_LARGE -> "Clipboard exceeds 32 KiB. Send it as a file."
+                            ClipboardSendResult.NO_TARGET -> "Open Bridgey and choose a device to send the clipboard"
                         }
                         Toast.makeText(appContext, message, Toast.LENGTH_SHORT).show()
                     }

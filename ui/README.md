@@ -35,7 +35,8 @@ panel and the dashboard show *the peers*, then *the selected peer's card*:
   and **Disconnect that peer** (`disconnect(deviceId)`, never the routed session);
 - **that peer's own telemetry** (battery, storage, memory, CPU, temperature and the details view),
   whichever peer it is (MD-4c, see [telemetry](../features/telemetry/README.md));
-- legacy sections (calls, media, clipboard, files, links, screen share, quick actions) only when
+- **Clipboard to that peer** (MD-5);
+- legacy sections (calls, media, files, links, screen share, quick actions) only when
   the selected peer **is** the routed peer (`SelectedDeviceContext`
   `legacyFeaturesApply`), so one peer's state is never shown under another peer's name.
 
