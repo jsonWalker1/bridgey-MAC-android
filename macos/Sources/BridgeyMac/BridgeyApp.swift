@@ -152,6 +152,9 @@ private struct BridgeyPanel: View {
                     case .idle: nearbyDevices
                     }
                 }
+                // MD-7: handoff cards from every peer, each naming its sender - also after the
+                // sender disconnected (opening a link or a book needs no connection).
+                QuickActionsPanel(actions: pairing.quickActions)
             }
 
             if !pairing.fileTransfers.isEmpty {
@@ -196,6 +199,7 @@ private struct BridgeyPanel: View {
         if deviceItems.count > 1 && !showingDeviceDetails {
             DeviceListSection(items: deviceItems, selection: deviceSelection)
         }
+
         if let selected = context.selected {
             if showingDeviceDetails {
                 deviceDetailsView(device: selected)
@@ -367,8 +371,10 @@ private struct BridgeyPanel: View {
                     actionButton("Call", icon: "phone.arrow.up.right") { pairing.sendCallFromClipboard() }
                         .help("Call the phone number currently in the clipboard")
                 }
-                if legacy && pairing.isFeatureAvailable(.links) {
-                    actionButton("Link", icon: "link") { pairing.quickActions.sendClipboardLink() }
+                // MD-7: the copied link goes to this peer, whichever peer legacy features use.
+                if isEligible(device, for: .linkToPhone) {
+                    actionButton("Link", icon: "link") { pairing.quickActions.sendClipboardLink(to: device.deviceID) }
+                        .help("Send the copied link to \(device.name)")
                 }
                 // M2: no BridgeyFeature gate yet (that lands in M3, matching the video channel
                 // itself) - the window shows "waiting for stream" until Android actually starts one.
@@ -376,13 +382,12 @@ private struct BridgeyPanel: View {
                     actionButton("Screen", icon: "rectangle.on.rectangle") { pairing.showScreenShareWindow() }
                 }
             }
-            if legacy { QuickActionsPanel(actions: pairing.quickActions) }
             if legacy &&
                 !isEligible(device, for: .clipboard) &&
-                !pairing.isFeatureAvailable(.files) &&
+                !isEligible(device, for: .files) &&
                 !isEligible(device, for: .findDevice) &&
                 !isEligible(device, for: .ping) &&
-                !pairing.isFeatureAvailable(.links) &&
+                !isEligible(device, for: .linkToPhone) &&
                 !pairing.isFeatureAvailable(.calls) {
                 Text("Quick actions are turned off in Settings on one of your devices.")
                     .font(.caption).foregroundStyle(.secondary)

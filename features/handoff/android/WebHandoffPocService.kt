@@ -104,7 +104,9 @@ class WebHandoffPocService : AccessibilityService() {
         // The Mac's feature list (Web links on/off) arrives shortly after the connection itself.
         connectionWatch = stateScope.launch {
             val pairing = (application as BridgeyApplication).pairing
-            kotlinx.coroutines.flow.merge(pairing.state, pairing.remoteFeatures).collect { chip?.requestUpdate(0) }
+            // MD-7: the chip follows whether any Mac can take a handoff (per-peer directory changes too).
+            kotlinx.coroutines.flow.merge(pairing.state, pairing.remoteFeatures, pairing.deviceDirectoryRevision)
+                .collect { chip?.requestUpdate(0) }
         }
         log("service connected")
     }
@@ -369,7 +371,8 @@ class WebHandoffPocService : AccessibilityService() {
         log("RESULT $message")
         android.os.Handler(mainLooper).post { Toast.makeText(this, "Web Handoff POC: $message", Toast.LENGTH_SHORT).show() }
         if (sendUrl != null) {
-            (application as BridgeyApplication).pairing.quickActions.sendLink(sendUrl)
+            // MD-7: same target resolution as every other handoff (one Mac, else the user picks).
+            WebHandoff.perform(this, WebHandoffSource(sendUrl), origin = "poc")
             log("SENT continuation url via links quick action length=${sendUrl.length}")
         }
     }

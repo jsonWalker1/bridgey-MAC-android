@@ -40,7 +40,8 @@ panel and the dashboard show *the peers*, then *the selected peer's card*:
   (`photo.jpg → Mac`, `document.pdf ← S23`), Android's Share dialog asks for the recipient (the
   selected peer preselected when it is eligible), and on macOS Finder's Services → "Send to
   Bridgey…" sends a selection, see [files](../features/files/README.md);
-- legacy sections (calls, media, links, screen share, quick actions) only when
+- **Link to that peer** and one list of received link/book cards naming each sender (MD-7);
+- legacy sections (calls, media, screen share) only when
   the selected peer **is** the routed peer (`SelectedDeviceContext`
   `legacyFeaturesApply`), so one peer's state is never shown under another peer's name.
 

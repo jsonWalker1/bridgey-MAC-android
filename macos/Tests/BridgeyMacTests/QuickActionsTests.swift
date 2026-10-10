@@ -51,13 +51,12 @@ final class QuickActionsTests: XCTestCase {
     @MainActor func testDisabledLinksRejectWithoutOpeningOrRetaining() {
         let actions = QuickActions()
         var replies: [[String: Any]] = []
-        actions.send = { _, payload in replies.append(payload); return true }
+        actions.send = { _, payload, _ in replies.append(payload); return true }
         actions.receive("quick.request", payload: ["version": 1, "requestId": UUID().uuidString,
             "feature": "links", "action": "offer", "value": "https://example.com"])
         XCTAssertNil(actions.receivedLink)
         XCTAssertEqual(replies.first?["accepted"] as? Bool, false)
-        actions.reset()
-        XCTAssertNil(actions.status)
+        XCTAssertNil(actions.status, "a declined link announces nothing")
     }
 
     func testNewCapabilitiesFailClosedForOldPeers() {
@@ -86,9 +85,9 @@ final class QuickActionsTests: XCTestCase {
 
     @MainActor func testBookIsQueuedOnceAndDeclinedWhilePending() {
         let actions = QuickActions()
-        actions.available = { $0 == .links }
+        actions.receivable = { _ in true }; actions.granted = { _ in true }
         var replies: [[String: Any]] = []
-        actions.send = { _, payload in replies.append(payload); return true }
+        actions.send = { _, payload, _ in replies.append(payload); return true }
         actions.receive("quick.request", payload: bookRequest(#"{"version":1,"title":"Alice","page":64,"pages":91}"#))
         XCTAssertEqual(actions.receivedBook?.title, "Alice")
         XCTAssertEqual(replies.last?["accepted"] as? Bool, true)
@@ -99,18 +98,18 @@ final class QuickActionsTests: XCTestCase {
         actions.receive("quick.request", payload: ["version": 1, "requestId": UUID().uuidString,
             "feature": "links", "action": "offer", "value": "https://example.com"])
         XCTAssertEqual(actions.receivedLink, "https://example.com")
-        actions.reset()
+        actions.dismiss("phone|book"); actions.dismiss("phone|link")
         XCTAssertNil(actions.receivedBook); XCTAssertNil(actions.receivedLink)
     }
 
     @MainActor func testBookRejectedWhenLinksAreOffOrPayloadInvalid() {
         let actions = QuickActions()
         var replies: [[String: Any]] = []
-        actions.send = { _, payload in replies.append(payload); return true }
+        actions.send = { _, payload, _ in replies.append(payload); return true }
         actions.receive("quick.request", payload: bookRequest(#"{"version":1,"title":"Alice"}"#))
         XCTAssertNil(actions.receivedBook)
         XCTAssertEqual(replies.last?["accepted"] as? Bool, false)
-        actions.available = { $0 == .links }
+        actions.receivable = { _ in true }; actions.granted = { _ in true }
         actions.receive("quick.request", payload: bookRequest("not json"))
         XCTAssertNil(actions.receivedBook)
         XCTAssertEqual(replies.last?["accepted"] as? Bool, false)
@@ -118,8 +117,8 @@ final class QuickActionsTests: XCTestCase {
 
     @MainActor func testContinueInBooksCopiesQuoteAndClearsOnlyWhenBooksOpened() {
         let actions = QuickActions()
-        actions.available = { $0 == .links }
-        actions.send = { _, _ in true }
+        actions.receivable = { _ in true }; actions.granted = { _ in true }
+        actions.send = { _, _, _ in true }
         var copied: [String] = []
         actions.copyText = { copied.append($0) }
         actions.openBooks = { false }
@@ -160,8 +159,8 @@ final class QuickActionsTests: XCTestCase {
 
     @MainActor private func actionsWithBook(_ json: String = #"{"version":1,"title":"Alice","quote":"Will you","app":"com.google.android.apps.books"}"#) -> QuickActions {
         let actions = QuickActions()
-        actions.available = { $0 == .links }
-        actions.send = { _, _ in true }
+        actions.receivable = { _ in true }; actions.granted = { _ in true }
+        actions.send = { _, _, _ in true }
         actions.copyText = { _ in }
         actions.receive("quick.request", payload: ["version": 1, "requestId": UUID().uuidString,
             "feature": "links", "action": "book", "value": json])
@@ -218,4 +217,19 @@ final class QuickActionsTests: XCTestCase {
         XCTAssertEqual(opened, [URL(string: "https://play.google.com/books")!])
         XCTAssertNotNil(actions.receivedBook)
     }
+}
+
+/// The single-peer view of the per-peer API (MD-7) these tests were written against: one phone.
+@MainActor private extension QuickActions {
+    var receivedLink: String? {
+        if case let .link(link)? = handoff.card("phone|link")?.content { return link }
+        return nil
+    }
+    var receivedBook: BookHandoff? {
+        if case let .book(book)? = handoff.card("phone|book")?.content { return book }
+        return nil
+    }
+    func receive(_ kind: String, payload: [String: Any]) { receive(kind, payload: payload, from: "phone") }
+    func continueInBooks() { continueInBooks("phone|book") }
+    func findInBooks() { findInBooks("phone|book") }
 }

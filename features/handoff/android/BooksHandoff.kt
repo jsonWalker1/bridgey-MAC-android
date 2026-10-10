@@ -1,9 +1,11 @@
 package dev.bridgey.android
 
 import android.content.Context
+import android.content.Intent
 import android.widget.Toast
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
@@ -87,20 +89,37 @@ internal fun parseReaderPosition(texts: List<String>): Triple<String?, Int, Int>
 internal object BooksHandoff {
     private val scope = MainScope()
 
-    fun perform(context: Context, source: BookSource?, origin: String) {
+    /** MD-7: one eligible Mac gets the book directly; with several the user picks one. */
+    fun perform(context: Context, source: BookSource?, origin: String, launch: ((Intent) -> Unit)? = null) {
         val app = context.applicationContext
         val plan = source?.let(::planBooksHandoff)
         if (plan == null) return toast(app, "Nothing to continue — open a book in your reader first")
-        if (!WebHandoff.macConnected(app)) return toast(app, "Mac not connected — nothing sent")
-        val quick = (app as BridgeyApplication).pairing.quickActions
-        android.util.Log.i("BridgeyBooksHandoff", "HANDOFF origin=$origin position=${plan.hasPosition} quote=${plan.hasQuote} bytes=${plan.payload.length}")
-        val sent = quick.sendBook(plan.payload)
+        val eligible = (app as BridgeyApplication).pairing.targets(FeatureApplicability.Feature.BOOKS_HANDOFF).map { it.deviceId }
+        when (val target = HandoffTarget.resolve(eligible)) {
+            HandoffTarget.None -> toast(app, "No Mac available — nothing sent")
+            is HandoffTarget.Send -> send(app, target.deviceId, plan, origin)
+            is HandoffTarget.Choose -> HandoffTargetActivity.chooseForBook(app, plan, origin, launch ?: app::startActivity)
+        }
+    }
+
+    /** Sends [plan] to exactly [deviceId]; never another Mac. */
+    fun send(context: Context, deviceId: String, plan: BookPlan, origin: String) {
+        val app = context.applicationContext
+        val pairing = (app as BridgeyApplication).pairing
+        val name = pairing.device(deviceId)?.name ?: "Mac"
+        if (pairing.targets(FeatureApplicability.Feature.BOOKS_HANDOFF).none { it.deviceId == deviceId }) {
+            return toast(app, "$name is not available — nothing sent")
+        }
+        val quick = pairing.quickActions
+        android.util.Log.i("BridgeyBooksHandoff", "HANDOFF origin=$origin position=${plan.hasPosition} quote=${plan.hasQuote} bytes=${plan.payload.length} to=${deviceId.take(8)}")
+        val sent = quick.sendBook(deviceId, plan.payload)
         // A busy feature (an earlier handoff not yet confirmed) leaves the old status in place;
         // it must never be reported as this handoff's outcome.
-        if (!sent) return toast(app, notSentMessage(quick.status.value))
-        toast(app, "Sending to Mac…")
+        // Outcomes are read for this Mac only: a handoff to another Mac must never be reported here.
+        if (!sent) return toast(app, notSentMessage(quick.linkStatus.value[deviceId]))
+        toast(app, "Sending to $name…")
         scope.launch {
-            val status = withTimeoutOrNull(9_000) { quick.status.first { it != null && it != "Sending…" } }
+            val status = withTimeoutOrNull(9_000) { quick.linkStatus.map { it[deviceId] }.first { it != null && it != "Sending…" } }
             toast(app, bookOutcomeMessage(status, plan))
         }
     }

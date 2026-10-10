@@ -4,6 +4,7 @@ import android.content.Context
 import android.widget.Toast
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -62,26 +63,43 @@ internal fun samePage(a: String, b: String): Boolean {
 internal object WebHandoff {
     private val scope = MainScope()
 
-    fun macConnected(context: Context): Boolean {
-        val pairing = (context.applicationContext as BridgeyApplication).pairing
-        return pairing.state.value is PairingState.Connected && pairing.isFeatureAvailable(BridgeyFeature.LINKS)
-    }
+    /** MD-7: the Macs a web handoff can go to now (connected, `links` granted both ways). */
+    fun eligibleMacs(context: Context): List<DeviceDirectoryEntry> =
+        (context.applicationContext as BridgeyApplication).pairing.targets(FeatureApplicability.Feature.WEB_HANDOFF)
 
-    /** Sends the best continuation for [source] (or reports why not) and shows the outcome. */
+    fun macConnected(context: Context): Boolean = eligibleMacs(context).isNotEmpty()
+
+    /**
+     * Sends the best continuation for [source] (or reports why not) and shows the outcome. MD-7:
+     * one eligible Mac gets it directly; with several the user picks one ([HandoffTargetActivity]).
+     */
     fun perform(context: Context, source: WebHandoffSource?, origin: String) {
         val app = context.applicationContext
         val plan = source?.let(::planWebHandoff)
         if (plan == null) return toast(app, "Nothing to continue on Mac — no web page address")
-        if (!macConnected(app)) return toast(app, "Mac not connected — nothing sent")
-        val quick = (app as BridgeyApplication).pairing.quickActions
-        android.util.Log.i("BridgeyWebHandoff", "HANDOFF origin=$origin kind=${plan.kind} length=${plan.url.length}")
-        val sent = quick.sendLink(plan.url)
+        when (val target = HandoffTarget.resolve(eligibleMacs(app).map { it.deviceId })) {
+            HandoffTarget.None -> toast(app, "No Mac available — nothing sent")
+            is HandoffTarget.Send -> send(app, target.deviceId, plan, origin)
+            is HandoffTarget.Choose -> HandoffTargetActivity.chooseForWeb(app, plan, origin)
+        }
+    }
+
+    /** Sends [plan] to exactly [deviceId]; never another Mac. */
+    fun send(context: Context, deviceId: String, plan: WebHandoffPlan, origin: String) {
+        val app = context.applicationContext
+        val pairing = (app as BridgeyApplication).pairing
+        val name = pairing.device(deviceId)?.name ?: "Mac"
+        if (eligibleMacs(app).none { it.deviceId == deviceId }) return toast(app, "$name is not available — nothing sent")
+        val quick = pairing.quickActions
+        android.util.Log.i("BridgeyWebHandoff", "HANDOFF origin=$origin kind=${plan.kind} length=${plan.url.length} to=${deviceId.take(8)}")
+        val sent = quick.sendLink(deviceId, plan.url)
         // A busy feature (an earlier handoff not yet confirmed) leaves the old status in place;
         // it must never be reported as this handoff's outcome.
-        if (!sent) return toast(app, notSentMessage(quick.status.value))
-        toast(app, "Sending to Mac…")
+        // Outcomes are read for this Mac only: a handoff to another Mac must never be reported here.
+        if (!sent) return toast(app, notSentMessage(quick.linkStatus.value[deviceId]))
+        toast(app, "Sending to $name…")
         scope.launch {
-            val status = withTimeoutOrNull(9_000) { quick.status.first { it != null && it != "Sending…" } }
+            val status = withTimeoutOrNull(9_000) { quick.linkStatus.map { it[deviceId] }.first { it != null && it != "Sending…" } }
             toast(app, outcomeMessage(status, plan.kind))
         }
     }

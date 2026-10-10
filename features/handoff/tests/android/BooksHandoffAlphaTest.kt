@@ -103,7 +103,11 @@ class BooksHandoffAlphaTest {
         // QuickActions only needs a Context to open received links, which these tests never do.
         val unsafe = sun.misc.Unsafe::class.java.getDeclaredField("theUnsafe").apply { isAccessible = true }.get(null) as sun.misc.Unsafe
         val context = unsafe.allocateInstance(android.content.ContextWrapper::class.java) as Context
-        return QuickActions(context, scope, { available }, { _, payload -> sent += payload; sendOk }) to scope
+        return QuickActions(
+            context, scope, { available }, { _, payload -> sent += payload; sendOk },
+            sendTo = { _, payload, _ -> sent += payload; sendOk },
+            sendable = { available }, receivable = { available }, granted = { available }, peerName = { "Mac" },
+        ) to scope
     }
 
     private fun result(id: String, accepted: Boolean) =
@@ -125,7 +129,7 @@ class BooksHandoffAlphaTest {
         assertEquals("Not connected — request not sent", notSentMessage(offline.status.value))
         val (disabled, s2) = quick(available = false)
         assertFalse(disabled.sendBook("{\"version\":1,\"title\":\"x\"}"))
-        assertEquals("Feature is unavailable on one of your devices", disabled.status.value)
+        assertEquals("Web links are unavailable on Mac", disabled.status.value)
         s1.cancel(); s2.cancel()
     }
 
@@ -165,3 +169,9 @@ class BooksHandoffAlphaTest {
         scope.cancel()
     }
 }
+
+// These tests describe one Mac; MD-7 made the API per peer.
+private const val MAC = "mac"
+private fun QuickActions.sendBook(payload: String) = sendBook(MAC, payload)
+private fun QuickActions.sendLink(url: String) = sendLink(MAC, url)
+private fun QuickActions.receive(kind: String, payload: JSONObject) = receive(kind, payload, MAC)

@@ -82,8 +82,12 @@ and are accepted from any connected peer with its own grant.
 (deviceId, transferId); `files.*` is accepted from any connected peer. Photo sync reuses the same
 engine but still targets the routed peer, resolved when an asset starts.
 
+**Migrated (MD-7):** [handoff](../../features/handoff/README.md) — Web links and book handoff
+(`quick.*` feature `links`) go to and come from an explicit peer; feature `media` on the same
+kinds stays routed.
+
 **Still on `activeSession`:** photo sync (target only), notifications (forwarding, actions,
-dismiss, Clear All), calls, media (both directions), quick actions / links / Web and Books Handoff,
+dismiss, Clear All), calls, media (both directions, including `quick.*` feature `media`),
 screen share / Remote Start (video channel providers) and KVM (input channel, frozen). The inactive-peer gate in `receive` still drops their messages from non-routed
 devices.
 

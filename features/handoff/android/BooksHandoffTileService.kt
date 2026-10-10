@@ -1,5 +1,6 @@
 package dev.bridgey.android
 
+import android.app.PendingIntent
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
@@ -26,7 +27,7 @@ class BooksHandoffTileService : TileService() {
         if (!app.isPrimaryUser) { qsTile?.apply { state = Tile.STATE_UNAVAILABLE; updateTile() }; return }
         listening?.cancel()
         listening = scope.launch {
-            combine(app.pairing.state, app.pairing.remoteFeatures) { _, _ -> Unit }.collect {
+            combine(app.pairing.state, app.pairing.remoteFeatures, app.pairing.deviceDirectoryRevision) { _, _, _ -> Unit }.collect {
                 qsTile?.apply {
                     val ready = WebHandoff.macConnected(app)
                     state = if (ready) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
@@ -49,6 +50,15 @@ class BooksHandoffTileService : TileService() {
             BooksHandoff.toast(applicationContext, "Turn on Bridgey Web Handoff in Accessibility settings to continue reading")
             return
         }
-        BooksHandoff.perform(this, source, origin = "tile")
+        // With several Macs the chooser opens; collapse the shade so it is not hidden behind it.
+        BooksHandoff.perform(this, source, origin = "tile") { intent ->
+            if (Build.VERSION.SDK_INT >= 34) {
+                startActivityAndCollapse(PendingIntent.getActivity(this, 772, intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
+            } else {
+                @Suppress("DEPRECATION")
+                startActivityAndCollapse(intent)
+            }
+        }
     }
 }

@@ -1,16 +1,28 @@
 # BRIDGEY — WEB HANDOFF STATE
 
-Status as of 2026-10-02. Read this file + `CLAUDE.md` first. Covers the whole
-Web Handoff track (Web Anchor POC → browser toolbar chip POC → dogfood Alpha)
-and the two Apple Books handoff experiments run alongside it.
+Status as of 2026-10-10 (history below kept from 2026-10-02/03). Read this file + `CLAUDE.md`
+first. Covers the whole Web Handoff track (Web Anchor POC → browser toolbar chip POC → dogfood
+Alpha), the Books Handoff Alpha and the Apple Books experiments run alongside it.
+
+**Current state:** Web Handoff and Books Handoff are **alpha** functionality ("works as an alpha,
+needs a lot of tuning" — user, 2026-10-03). All of it is committed and on `main` and
+`feature/multi-device`. Source now lives in [`features/handoff/`](features/handoff/README.md)
+(moved in `fb26744`); the quick-action transport and the cards (`QuickActions.*`) are still in the
+platform folders. **MD-7 (handoff per peer) is done** on `feature/multi-device` — see §8.
 
 | Stage | State | Commit |
 | --- | --- | --- |
-| Web Anchor POC (context capture + continuation URL) | done, pushed | `ad17aa8` |
-| Browser toolbar chip UX POC | done, committed (not pushed) | `1a928ce` |
-| **Web Handoff Alpha** (chip + Share → "Continue on Mac") | done, device-verified, **uncommitted** | — |
-| Apple Books handoff (feasibility + 50-run reliability) | experiment only, scratchpad | — |
-| **Books Handoff Alpha** (tile + Share quote → Mac card) | done, Android device-checked, Mac unit-tested, **uncommitted** | — |
+| Web Anchor POC (context capture + continuation URL) | done | `ad17aa8` |
+| Browser toolbar chip UX POC | done | `1a928ce` |
+| **Web Handoff Alpha** (chip + Share → "Continue on Mac") | alpha, device-verified | `740b2c6` |
+| Apple Books handoff (feasibility + 50-run reliability) | experiment only (scratchpad) | — |
+| **Books Handoff Alpha** (tile + Share quote → Mac card) | alpha | `740b2c6` |
+| Find in Books / Go to chapter / Open in Google Play Books (Mac) | alpha | `b301176` |
+| Apple Books automation POC (`experiments/books-automation-poc`) | only on branch `feature/handoff-books`, not on `main` | `2ae70c2` |
+| Foreground service after updates, battery exemption, Play Books position memory | done | `2fc806c` (+ `d4b52fc`) |
+| "No Wi-Fi" in the persistent notification | done | `eb1317d` |
+| Moved into `features/handoff/` | done | `fb26744` |
+| Multi-device (MD-7) | done, hardware-tested (S23 + two Macs) | "handoff: route by peer" |
 
 Detailed reports (Claude Docs): Web Handoff POC report, Handoff chip UX POC,
 Books Handoff POC, Books Handoff reliability test (50 runs), modularity audit.
@@ -79,7 +91,7 @@ Quick Settings tile, accessibility button — none can live in the toolbar.
 Samsung Internet: the chip fits, but its address field shows only the domain and
 page content is not exposed → not useful there.
 
-## 4. WEB HANDOFF ALPHA (uncommitted, device-verified)
+## 4. WEB HANDOFF ALPHA (`740b2c6`, device-verified)
 
 Goal: dogfoodable everyday use. Decision by the user: **the Mac keeps the
 explicit Open** — a handoff is queued in the Bridgey menu-bar panel and opened
@@ -153,12 +165,15 @@ fragment overwritten by our reading position, chip used the selection popup
 window instead of the page window, chip not restored after reconnect (features
 arrive after `Connected`).
 
-### 4.4 Files (Alpha, uncommitted)
+### 4.4 Files
 
-- new: `WebHandoff.kt`, `WebHandoffShareActivity.kt`, test `WebHandoffAlphaTest.kt` (10 tests)
-- changed: `WebHandoffPocService.kt`, `WebHandoffToolbarChip.kt`,
-  `AndroidManifest.xml` (share activity), `res/values/strings.xml` (`web_handoff_share_label`)
-- Android unit tests: 272/272 green; `assembleDebug` OK. macOS unchanged.
+- `features/handoff/android/`: `WebHandoff.kt`, `WebHandoffShareActivity.kt`,
+  `WebHandoffPocService.kt` (production despite the name), `WebHandoffToolbarChip.kt`;
+  test `features/handoff/tests/android/WebHandoffAlphaTest.kt` (+ `WebHandoffPocTest.kt`)
+- app shell: `AndroidManifest.xml` (share activity), `res/values/strings.xml`
+  (`web_handoff_share_label`), `res/xml/web_handoff_poc_service_config.xml`
+- transport/cards (platform folders): `QuickActions.kt` / `QuickActions.swift` + views
+- At the time of the Alpha commit: Android 272/272 unit tests green, `assembleDebug` OK.
 
 ### 4.5 How to use (dogfood)
 
@@ -170,8 +185,8 @@ arrive after `Connected`).
 
 ### 4.6 Known limitations
 
-- A queued link is **discarded when the connection drops** before it is opened
-  (`QuickActions.reset()` on disconnect) — existing behavior.
+- A queued link is **discarded when the routed peer changes or disconnects** before it is
+  opened (`QuickActions.reset()` in `activePeerChanged`) — existing behavior.
 - The Mac holds **one** pending link; the next handoff is declined until it is
   opened or dismissed.
 - Samsung's share sheet hides "Continue on Mac" under More → Bridgey.
@@ -181,6 +196,7 @@ arrive after `Connected`).
   page text into the Mac's browser history.
 - After an APK reinstall Android sometimes keeps Bridgey's accessibility
   services enabled but unbound → toggle them off/on.
+- Single-peer: sends go to and cards come only from the routed peer (§8).
 
 ## 5. APPLE BOOKS HANDOFF (experiments, scratchpad only)
 
@@ -219,7 +235,7 @@ typing is asynchronous; search is literal (curly quotes/dashes).
 ready for integration. Fix first: run only on an explicit user click, Mac
 position reader (header, verse, chapter), Play Books result navigation.
 
-## 5a. BOOKS HANDOFF ALPHA (uncommitted)
+## 5a. BOOKS HANDOFF ALPHA (`740b2c6`)
 
 "Continue reading on Mac" with the best available context, app-agnostic where
 Android allows it. Decisions by the user: the Mac gets a small **book card** in
@@ -255,7 +271,7 @@ quote as text — that path is app-agnostic.
 - Fixed in both Web and Books Handoff: `sendLink`/`sendBook` now return whether
   they really sent — a second handoff while the first is unconfirmed used to keep
   the old "Sending…" status and report the first handoff's ACK as its own.
-- Tests: Android `BooksHandoffAlphaTest` (14: resolver, fallbacks, truncation,
+- Tests (at the time of the commit): Android `BooksHandoffAlphaTest` (14: resolver, fallbacks, truncation,
   position parsing, share routing, outcome messages, and on the real
   `QuickActions`: book action wire format, offline/disabled, pending second
   handoff, stale + duplicate ACK, disconnect reset) — Android 286/286; macOS
@@ -269,12 +285,14 @@ quote as text — that path is app-agnostic.
   be stale while the toolbar is hidden; only Play Books for the tile; the tile has
   to be added to Quick Settings by the user.
 
-## 5b. BOOKS HANDOFF — 2026-10-03 ADDITIONS (uncommitted, alpha quality)
+## 5b. BOOKS HANDOFF — 2026-10-03 ADDITIONS (`b301176`, `2fc806c`; alpha quality)
 
 User verdict: "as an alpha it works, but it needs a lot of tuning". Left as is.
 
-- **Find in Books (Mac)** — `BooksAutomation.swift`, the state machine from
-  `experiments/books-automation-poc` (README there: scenarios, failure modes). Button on the
+- **Find in Books (Mac)** — `features/handoff/macos/BooksAutomation.swift`
+  ([BooksAutomation.md](features/handoff/macos/BooksAutomation.md)), the state machine from
+  the POC `experiments/books-automation-poc` (README there: scenarios, failure modes; the POC
+  is only on branch `feature/handoff-books`, `2ae70c2`). Button on the
   book card; needs the Accessibility permission for Bridgey (asked via
   `AXIsProcessTrustedWithOptions`) and Automation → System Events. Outcomes: completed (card
   cleared), not found, ambiguous (never picks the first of many; quote copied), aborted on
@@ -289,34 +307,81 @@ User verdict: "as an alpha it works, but it needs a lot of tuning". Left as is.
   the service now remembers the last Play Books position (title/chapter/page only, throttled to
   1.5 s, valid 5 min).
 - **Why the tile cannot send text:** Play Books exposes the text of whole chapters without
-  positions, so the paragraph on screen is unknown. Best next step (not done): on tap,
+  positions, so the paragraph on screen is unknown. Idea (not started, not planned for MD-7): on tap,
   `AccessibilityService.takeScreenshot` + on-device OCR (ML Kit) of the reader window → send the
   first full line as the quote → Find in Books lands exactly.
-- Mac: `QuickActions.reset()` on every new connection also clears the book card.
+- Mac: `QuickActions.reset()` on every routed-peer change also clears the book card (unless
+  Find in Books is running).
 
 ## 6. SIDE FINDINGS
 
-- **Foreground service after reinstall — FIXED 2026-10-03 (uncommitted):** when
+- **Foreground service after reinstall — FIXED (`2fc806c`; later limited to "only while
+  Bridgey is on", `d4b52fc`):** when
   Android started the process only to bind an accessibility service (after an update),
   `BridgeyConnectionService` did not run, Samsung Freecess froze the app, and the
   connection dropped every 10–20 s without recovering (Freecess unfroze it briefly on each
   accessibility event). `WebHandoffPocService.onServiceConnected` now starts the foreground
   service (allowed for a bound accessibility service). Verified: FGS up after install
   without opening the app, 0 drops / 0 freezes in 75 s.
-- **Battery-optimization exemption (uncommitted):** `BackgroundRunning.kt` asks once after
+- **Battery-optimization exemption (`2fc806c`):** `BackgroundRunning.kt` (now
+  `context/android/`) asks once after
   pairing (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) and shows a "Background running" card
   while the exemption is missing.
 - **"No Wi-Fi" status** in the persistent notification with a Wi-Fi action
-  (`BridgeyConnectionService.kt`, `ConnectionStatusTextTest.kt`) — implemented
-  and device-verified, **uncommitted**.
+  (`BridgeyConnectionService.kt`, `ConnectionStatusTextTest.kt`) — device-verified,
+  committed (`eb1317d`).
 - Samsung: `svc wifi enable` often does not stick on the first try.
 - macOS Do Not Disturb delivers Bridgey notifications silently (`delay
   delivery`) — not a Bridgey bug.
 
 ## 7. NEXT STEPS
 
-1. Commit the Alpha (and separately the "No Wi-Fi" status).
-2. Dogfood; decide whether the Mac should auto-open handoff links (would change
-   the documented security model) or keep a queue of more than one link.
-3. Keep pending links across reconnects.
-4. Optional sensitive-domain blocklist before wider use.
+Done: committing the Alphas and the "No Wi-Fi" status (see the table at the top).
+
+1. Done: **MD-7 Handoff multi-device** (§8).
+2. Dogfood; decide whether the Mac should auto-open handoff links (would change the documented
+   security model) or keep more than one pending link.
+3. Keep pending links across reconnects (partly covered by MD-7 if cards are no longer cleared on
+   routing changes — see §8).
+4. Ideas, not planned: sensitive-domain blocklist; Chrome/Samsung Internet context; Play Books
+   tile OCR; deep link to the exact book in Google Play Books.
+
+## 8. MULTI-DEVICE STATE (MD-7)
+
+**Implemented (2026-10-10), decisions:** D1 one eligible Mac → sent directly, several → the user
+picks (`HandoffTargetActivity`); D2 received cards stay after the sender disconnects; D3 one card
+list naming each sender. Details: [handoff README](features/handoff/README.md) "Per peer (MD-7)".
+Feature `media` on the same `quick.*` kinds stays with the routed peer.
+
+**Hardware (2026-10-10, S23 + MacBook Air M4 + MacBook Air "pracovní"):** handoff to the non-routed
+Mac accepted and shown only there; chooser with two Macs (web and book), Cancel sends nothing;
+one Mac → sent directly; links from both Macs → two received links on the S23, each naming its
+Mac; a received card survives the sender's disconnect and "Open in browser" still works; a quote
+share reaches the chosen Mac. **Known limitation (unchanged by MD-7):** the Play Books tile often
+sends only the title (no chapter unless Bridgey saw the reader's position bar within 5 min, never
+the visible text), so the card offers only "Continue in Books" (opens Books, copies nothing to
+search); "Find in Books" / "Go to chapter" need a quote or a chapter.
+
+**Before MD-7 (audit 2026-10-10)** handoff and the Web links / book cards rode the
+**`quick.request` / `quick.result`** quick-action messages (feature `links`, actions `offer` and
+`book`; the same kinds also carry feature `media`) single-peer:
+
+- Android sends via `PairingCoordinator.sendQuickPayload` → `activeSession` (the routed Mac); the
+  send coroutine re-checks `activeSession === current`, so a routing change in between silently
+  drops it (the user sees "did not confirm" after 8–9 s). Entry points (`WebHandoff.perform`,
+  `BooksHandoff.perform`, chip, tile, Share, "Send as link") have no target; availability is
+  `isFeatureAvailable(LINKS)` = the routed peer.
+- Both receivers accept `quick.*` only from the routed session (`receiveQuickPayload` requires
+  `activeSession === current`; `quick.*` is not in `deviceAddressedMessageKinds`).
+- `QuickActions` state is one global slot per side (Mac `receivedLink`, `receivedBook`, `pending`,
+  `status`; Android `receivedLink`, `pending` per feature) with no deviceId; `reset()` runs on
+  every routed-peer change.
+- macOS → Android "Link" (panel button + shortcut) also goes to the routed peer.
+- The cards are shown only on the routed peer's card (`legacy` in the panel / dashboard).
+
+MD-2 already defines the directional features `webHandoff` / `booksHandoff` (Android → Mac) and
+`linkToPhone` (Mac → Android) on the `links` capability. The wire format does not need to change:
+the destination is the session a message is sent on, the sender is the authenticated session.
+The detailed findings, proposed MD-7 scope and acceptance tests are in the MD-7 audit report
+(2026-10-10); MD-5 ([clipboard](features/clipboard/README.md)) and MD-6
+([files](features/files/README.md)) are the reference implementations.

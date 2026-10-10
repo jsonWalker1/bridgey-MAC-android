@@ -430,8 +430,12 @@ final class PairingCoordinator: ObservableObject {
         UNUserNotificationCenter.current().delegate = notificationPresenter
         refreshNotificationAuthorization()
         startListener()
-        quickActions.available = { [weak self] in self?.isFeatureAvailable($0) == true }
-        quickActions.send = { [weak self] in self?.sendQuickPayload(kind: $0, payload: $1) == true }
+        // MD-7: handoff cards and links are per peer (applicability per deviceId, addressed sends).
+        quickActions.receivable = { [weak self] in self?.applicability(of: .webHandoff, with: $0, localIsSource: false) == .offered }
+        quickActions.sendable = { [weak self] in self?.applicability(of: .linkToPhone, with: $0, localIsSource: true) == .offered }
+        quickActions.granted = { [weak self] in self?.settings.isEnabled(.links, for: $0) == true }
+        quickActions.peerName = { [weak self] in self?.displayName($0) ?? "Android" }
+        quickActions.send = { [weak self] in self?.sendQuickPayload(kind: $0, payload: $1, to: $2) == true }
         mediaController.allowed = { [weak self] in
             guard let self, case .connected = self.state else { return false }
             return self.isFeatureAvailable(.media)
@@ -459,7 +463,7 @@ final class PairingCoordinator: ObservableObject {
             switch action {
             case .clipboard: self?.sendClipboardFromShortcut()
             case .call: self?.sendCallFromClipboard()
-            case .link: self?.quickActions.sendClipboardLink()
+            case .link: self?.sendLinkFromShortcut()
             case .ping: self?.sendPing()
             }
         }
@@ -488,7 +492,7 @@ final class PairingCoordinator: ObservableObject {
                     // MD-4c: each peer's telemetry follows that peer's own grant.
                     self.telemetry.prune { deviceID, metric in self.settings.isEnabled(metric.feature, for: deviceID) }
                     if !self.settings.isEnabled(.ping, for: nil) { self.clearPingStatus() }
-                    if !self.isFeatureAvailable(.links) { self.quickActions.reset() }
+                    self.quickActions.policyChanged()
                     self.mediaController.reset()
                     self.mediaRemote.reset()
                     self.videoChannel.reset()
@@ -1046,6 +1050,28 @@ final class PairingCoordinator: ObservableObject {
         pingStatus = nil
     }
 
+    /// MD-7: one quick-action message on exactly `deviceID`'s session (handoff links), never the
+    /// routed peer's.
+    private func sendQuickPayload(kind: String, payload: [String: Any], to deviceID: String) -> Bool {
+        guard let current = peers.connectedSession(for: deviceID), let key = current.pairingKey,
+              let data = try? JSONSerialization.data(withJSONObject: payload), data.count <= 32768,
+              let encrypted = try? encrypt(data, key: key) else { return false }
+        current.send(PairingMessage(kind: kind, sessionId: current.id,
+            messageId: UUID().uuidString.lowercased(), nonce: encrypted.nonce, ciphertext: encrypted.ciphertext))
+        return true
+    }
+
+    /// Mac -> Android link from the keyboard shortcut: the only eligible peer; with several, the
+    /// user picks one on its card. Never the routed peer by default.
+    private func sendLinkFromShortcut() {
+        switch HandoffTarget.resolve(eligible: targets(for: .linkToPhone).map(\.deviceID)) {
+        case let .send(deviceID): quickActions.sendClipboardLink(to: deviceID)
+        case .choose: quickActions.report("Choose a device in the Bridgey panel to send the link")
+        case .none: quickActions.report("No connected device can receive links")
+        }
+    }
+
+    /// Media and other routed-peer payloads (not migrated).
     private func sendQuickPayload(kind: String, payload: [String: Any]) -> Bool {
         guard let current = activeSession, case .connected = state, let key = current.pairingKey,
               let data = try? JSONSerialization.data(withJSONObject: payload), data.count <= 32768,
@@ -1068,12 +1094,14 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func receiveQuickPayload(_ message: PairingMessage, current: Session) {
-        guard activeSession === current, case .connected = state, message.sessionId == current.id,
+        guard let senderID = peers.connectedDeviceID(of: current), message.sessionId == current.id,
               let key = current.pairingKey, let id = message.messageId, current.acceptMessageID(id),
               let nonce = message.nonce, let ciphertext = message.ciphertext,
               let data = try? decrypt(nonce: nonce, ciphertext: ciphertext, key: key), data.count <= 8192,
               let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              payload["version"] as? Int == 1 else { return }
+              payload["version"] as? Int == 1,
+              // MD-7: "links" from any connected peer, "media" only from the routed one.
+              QuickPayloadGate.accepts(feature: payload["feature"] as? String, fromRoutedPeer: current === activeSession) else { return }
         if message.kind == "quick.request" {
             guard let feature = payload["feature"] as? String, let sequence = payload["sequence"] as? Int,
                   current.quickSequence.accept(feature: feature, sequence: sequence) else { return }
@@ -1090,7 +1118,7 @@ final class PairingCoordinator: ObservableObject {
                   let value = payload["value"] as? String else { reply(false); return }
             mediaController.command(action: action, value: value, completion: reply)
         } else {
-            quickActions.receive(message.kind, payload: payload)
+            quickActions.receive(message.kind, payload: payload, from: senderID)
         }
     }
 
@@ -1333,6 +1361,7 @@ final class PairingCoordinator: ObservableObject {
         telemetrySubscription.sessionEnded(deviceID)
         clipboardDeviceEnded(deviceID) // MD-5
         endFileTransfers(of: deviceID) // MD-6
+        quickActions.deviceEnded(deviceID) // MD-7
         if pings.deviceEnded(deviceID) { setTransientPingStatus("\(displayName(deviceID)) disconnected") }
         if find.deviceEnded(deviceID) { stopMacSound() }
         deviceDirectoryRevision += 1
@@ -1871,7 +1900,7 @@ final class PairingCoordinator: ObservableObject {
     private func activePeerChanged(previous: Session?) {
         // Transfers bound to the previous peer cannot complete through the feature layer any more.
         if previous != nil { interruptFeatureTransfers() }
-        quickActions.reset()
+        // MD-7: handoff cards and links belong to their own peer, not to the routed one.
         mediaController.reset()
         mediaRemote.reset()
         videoChannel.reset()
@@ -1919,6 +1948,9 @@ final class PairingCoordinator: ObservableObject {
         // MD-6: file transfers belong to the peer that sends or receives them.
         "files.offer", "files.accept", "files.chunk", "files.chunk.ack", "files.complete",
         "files.complete.ack", "files.rejected", "files.cancel", "files.cancel.ack",
+        // MD-7: quick actions reach any connected peer; receiveQuickPayload keeps feature "media"
+        // with the routed peer (QuickPayloadGate).
+        "quick.request", "quick.result",
     ]
 
     private func receive(_ message: PairingMessage, in current: Session) {
@@ -2558,7 +2590,6 @@ final class PairingCoordinator: ObservableObject {
             ($0, capabilities[$0.rawValue] ?? false)
         })
         remoteFeatureStateReceived = true
-        if !isFeatureAvailable(.links) { quickActions.reset() }
         mediaController.reset()
         mediaRemote.reset()
         videoChannel.reset()

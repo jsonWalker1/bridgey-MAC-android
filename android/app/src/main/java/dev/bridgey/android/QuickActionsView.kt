@@ -15,27 +15,19 @@ import androidx.compose.ui.unit.dp
 
 @Composable
 @OptIn(ExperimentalLayoutApi::class)
-internal fun QuickActionsCard(actions: QuickActions, linksEnabled: Boolean, mediaEnabled: Boolean) {
-    val link by actions.receivedLink.collectAsState()
+internal fun QuickActionsCard(actions: QuickActions, linkTarget: DeviceListItem?, mediaEnabled: Boolean) {
     val status by actions.status.collectAsState()
     val media by actions.media.collectAsState()
     val context = LocalContext.current
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            if (linksEnabled) {
+            if (linkTarget != null) {
                 Text("Web links", style = MaterialTheme.typography.titleMedium)
                 Button(onClick = {
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     val text = clipboard.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
-                    actions.sendLink(text)
-                }) { Text("Send copied link to Mac") }
-                link?.let { url ->
-                    Text(url, maxLines = 4)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = actions::openLink) { Text("Open link") }
-                        TextButton(onClick = actions::dismissLink) { Text("Dismiss") }
-                    }
-                }
+                    actions.sendLink(linkTarget.deviceId, text)
+                }) { Text("Send copied link to ${linkTarget.name}") }
             }
             if (mediaEnabled) {
                 Text("Mac media · ${media.player}", style = MaterialTheme.typography.titleMedium)
@@ -72,6 +64,25 @@ internal fun QuickActionsCard(actions: QuickActions, linksEnabled: Boolean, medi
                     onValueChangeFinished = { actions.request(BridgeyFeature.MEDIA, "volume", volume.toInt().toString()) })
             }
             status?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+        }
+    }
+}
+
+/** MD-7: links received from every Mac, each naming its sender - also after it disconnected. */
+@Composable
+internal fun ReceivedLinksCard(actions: QuickActions) {
+    val links by actions.receivedLinks.collectAsState()
+    if (links.isEmpty()) return
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            links.values.forEach { link ->
+                Text("Link from ${link.peerName}", style = MaterialTheme.typography.titleMedium)
+                Text(link.url, maxLines = 4)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { actions.openLink(link.deviceId) }) { Text("Open link") }
+                    TextButton(onClick = { actions.dismissLink(link.deviceId) }) { Text("Dismiss") }
+                }
+            }
         }
     }
 }

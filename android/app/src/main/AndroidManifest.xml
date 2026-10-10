@@ -107,6 +107,14 @@
         </activity>
         <!-- WEB HANDOFF ALPHA: Share → "Continue on Mac" (text/URLs only, no UI). Exported because the
              system share sheet launches it; it only ever sends an http(s) link to the paired Mac. -->
+        <!-- MD-7: "Continue on which Mac?" when several Macs can take a handoff. -->
+        <activity
+            android:name=".HandoffTargetActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:noHistory="true"
+            android:taskAffinity="dev.bridgey.android.web_handoff"
+            android:theme="@style/Theme.Bridgey.Transparent" />
         <activity
             android:name=".WebHandoffShareActivity"
             android:excludeFromRecents="true"

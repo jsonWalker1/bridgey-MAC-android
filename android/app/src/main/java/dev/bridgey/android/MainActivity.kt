@@ -753,10 +753,12 @@ private fun BridgeyApp(
             },
             dismissButton = {
                 Row {
-                    if (content.files.isEmpty() && content.text?.let(::validatedWebLink) != null &&
-                        pairing.isFeatureAvailable(BridgeyFeature.LINKS)) {
+                    // MD-7: the link goes to the recipient chosen above, never another Mac.
+                    if (content.files.isEmpty() && content.text?.let(::validatedWebLink) != null && chosen != null &&
+                        pairing.applicability(FeatureApplicability.Feature.WEB_HANDOFF, chosen, localIsSource = true) ==
+                        FeatureApplicabilityResult.OFFERED) {
                         TextButton(onClick = {
-                            pairing.quickActions.sendLink(content.text.orEmpty())
+                            pairing.quickActions.sendLink(chosen, content.text.orEmpty())
                             onSharedContentHandled()
                         }) { Text("Send as link") }
                     }
@@ -1114,6 +1116,7 @@ private fun DeviceScreen(
         if (uri != null && target != null) pairing.sendFile(target, uri)
     }
     val screenSharing by pairing.screenCapture.isActive.collectAsStateWithLifecycle()
+    val receivedLinks by pairing.quickActions.receivedLinks.collectAsStateWithLifecycle()
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
@@ -1127,6 +1130,8 @@ private fun DeviceScreen(
             pairing.deviceDirectory().firstOrNull { it.isRouted }?.deviceId,
         )
         val legacy = context.legacyFeaturesApply
+        // MD-7: links from every Mac, each naming its sender (also after it disconnected).
+        if (receivedLinks.isNotEmpty()) item { ReceivedLinksCard(pairing.quickActions) }
         if (deviceItems.isNotEmpty()) {
             if (deviceItems.size > 1) item { DeviceListSection(deviceItems, selectedDeviceId, onSelectDevice) }
             val selected = context.selected
@@ -1182,11 +1187,14 @@ private fun DeviceScreen(
                     )
                 }
             }
-            if (legacy && (enabledFeatures[BridgeyFeature.LINKS] == true || enabledFeatures[BridgeyFeature.MEDIA] == true)) {
-                item {
-                    QuickActionsCard(pairing.quickActions, enabledFeatures[BridgeyFeature.LINKS] == true,
-                        enabledFeatures[BridgeyFeature.MEDIA] == true)
-                }
+            // MD-7: "Send copied link" goes to the selected Mac; Mac media stays with the routed peer.
+            val linkTarget = context.selected?.takeIf {
+                pairing.applicability(FeatureApplicability.Feature.WEB_HANDOFF, it.deviceId, localIsSource = true) ==
+                    FeatureApplicabilityResult.OFFERED
+            }
+            val mediaEnabled = legacy && enabledFeatures[BridgeyFeature.MEDIA] == true
+            if (linkTarget != null || mediaEnabled) {
+                item { QuickActionsCard(pairing.quickActions, linkTarget, mediaEnabled) }
             }
             if (legacy) item {
                 ServiceCard(

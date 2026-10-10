@@ -144,7 +144,15 @@ class PairingCoordinator(
     // it was evaluated - a false -> true transition (connect, reconnect, re-enable on either peer)
     // triggers one fresh reconciliation. See refreshNotificationForwardingAvailability().
     private var notificationForwardingAvailable = false
-    val quickActions = QuickActions(appContext, scope, ::isFeatureAvailable, ::sendQuickPayload)
+    // MD-7: Web links / book handoff per peer; Mac media stays with the routed peer.
+    val quickActions = QuickActions(
+        appContext, scope, ::isFeatureAvailable, ::sendQuickPayload,
+        sendTo = { kind, payload, deviceId -> send(deviceId, kind, payload.toString().toByteArray(Charsets.UTF_8)) },
+        sendable = { applicability(FeatureApplicability.Feature.WEB_HANDOFF, it, localIsSource = true) == FeatureApplicabilityResult.OFFERED },
+        receivable = { applicability(FeatureApplicability.Feature.LINK_TO_PHONE, it, localIsSource = false) == FeatureApplicabilityResult.OFFERED },
+        granted = { settings.isEnabled(BridgeyFeature.LINKS, it) },
+        peerName = { displayName(it) },
+    )
     val mediaRemote = MediaContinuityManager(
         appContext,
         available = { mutableState.value is PairingState.Connected && isFeatureAvailable(BridgeyFeature.MEDIA) },
@@ -972,20 +980,24 @@ class PairingCoordinator(
     }
 
     private fun receiveQuickPayload(current: Session, message: Message) {
-        if (activeSession !== current || mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        val sender = peers.connectedDeviceId(current) ?: return
+        if (message.sessionId != current.id) return
         val key = current.pairingKey ?: return
         val id = message.messageId ?: return
         if (!current.acceptMessageId(id)) return
         val data = Crypto.decrypt(key, message.nonce ?: return, message.ciphertext ?: return) ?: return
         if (data.size > if (message.kind == "media.state") 32768 else 8192) return
         val payload = runCatching { JSONObject(data.toString(Charsets.UTF_8)) }.getOrNull() ?: return
+        // MD-7: "links" from any connected peer; media (feature "media", media.state) only from the routed one.
+        val routed = current === activeSession
+        if (if (message.kind == "media.state") !routed else !QuickPayloadGate.accepts(payload.optString("feature"), routed)) return
         if (message.kind == "quick.request") {
             val raw = payload.opt("sequence")
             if (raw !is Int && raw !is Long) return
             val sequence = (raw as Number).toLong()
             if (!current.quickSequence.accept(payload.optString("feature"), sequence)) return
         }
-        quickActions.receive(message.kind, payload)
+        quickActions.receive(message.kind, payload, sender)
     }
 
     fun sendNotification(
@@ -1233,6 +1245,7 @@ class PairingCoordinator(
         telemetrySubscription.sessionEnded(deviceId)
         clipboardDeviceEnded(deviceId) // MD-5
         endFileTransfers(deviceId) // MD-6
+        quickActions.deviceEnded(deviceId) // MD-7
         if (pings.deviceEnded(deviceId)) mutablePingStatus.value = "${displayName(deviceId)} disconnected"
         synchronized(findLock) {
             if (find.deviceEnded(deviceId)) stopPhoneRinging()
@@ -1244,6 +1257,7 @@ class PairingCoordinator(
     /** MD-3: the local Find grant for this device was revoked - it may no longer make this phone ring. */
     private fun deviceAuthorizationChanged(deviceId: String) {
         mutableDeviceDirectoryRevision.update { it + 1 }
+        quickActions.policyChanged() // MD-7: a peer's links grant/capability changed (routed or not)
         if (settings.isEnabled(BridgeyFeature.FIND_DEVICE, deviceId)) return
         synchronized(findLock) {
             if (deviceId !in find.localRequesters()) return
@@ -1786,7 +1800,8 @@ class PairingCoordinator(
         // (4) Transfers and acknowledgements bound to the previous peer cannot complete through the
         // feature layer any more; finish them now instead of letting them time out.
         // MD-6: file transfers are not part of it - they belong to their own peer.
-        quickActions.reset()
+        // MD-7: neither are handoff links; only the routed peer's media state goes.
+        quickActions.routedPeerChanged()
         mediaRemote.reset()
         videoChannel.reset()
         mutableRemoteFeatures.value = defaultFeatureState()
@@ -1861,6 +1876,9 @@ class PairingCoordinator(
         // MD-6: file transfers belong to the peer that sends or receives them.
         "files.offer", "files.accept", "files.chunk", "files.chunk.ack", "files.complete",
         "files.complete.ack", "files.rejected", "files.cancel", "files.cancel.ack",
+        // MD-7: quick actions reach any connected peer; receiveQuickPayload keeps feature "media"
+        // with the routed peer (QuickPayloadGate). media.state stays routed-only.
+        "quick.request", "quick.result",
     )
 
     private fun receive(current: Session, message: Message) {

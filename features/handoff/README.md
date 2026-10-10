@@ -26,6 +26,23 @@ and without the connection's foreground service the app is frozen in the backgro
 Web and books are not split into sub-folders yet; that happens only for files that are clearly
 specific to one of them.
 
+## Per peer (MD-7)
+Web links and book handoff go to and come from an explicit peer (`HandoffRouting.*` in `macos/`
+and `android/`); the wire format is unchanged (destination = the session, sender = the
+authenticated session).
+- **Android → Mac:** browser chip, Share → "Continue on Mac", the Play Books tile and the POC path
+  resolve the target once: the only eligible Mac gets it directly; with several the user picks one
+  in `HandoffTargetActivity`; none → nothing is sent. Share → "Send as link" uses the share
+  dialog's recipient. The chip/tile show when any Mac can take a handoff.
+- **Mac → Android:** "Link" on a peer's card; the keyboard shortcut sends only when exactly one
+  peer is eligible.
+- **Receiving:** `quick.request` / `quick.result` with feature `links` are accepted from any
+  connected peer; feature `media` (and `media.state`) stay with the routed peer
+  (`QuickPayloadGate`). Cards are kept per sender (one link + one book per peer) in one list that
+  names the sender, whichever peer is selected or routed; they stay after the sender disconnects
+  until opened or dismissed, and go when the local `links` grant for that peer is turned off.
+  A routing change no longer clears them. Results complete only the sender's own request.
+
 ## Rules
 Only the continuation URL or the book reference leaves the phone — never passwords, tokens, cookies
 or session data. The Mac never opens a link or drives Books on its own: the user clicks

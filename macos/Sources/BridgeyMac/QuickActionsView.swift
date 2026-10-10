@@ -1,38 +1,42 @@
 import SwiftUI
 
+/// MD-7: the received link and book cards of every peer, each naming its sender - shown whichever
+/// peer is selected or routed, and kept after the sender disconnects until opened or dismissed.
 struct QuickActionsPanel: View {
     @ObservedObject var actions: QuickActions
     var body: some View {
-        if let link = actions.receivedLink {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Link from Android").font(.headline)
-                Text(link).font(.caption).lineLimit(3).textSelection(.enabled)
-                HStack {
-                    Button("Open in browser", action: actions.openLink)
-                    Button("Dismiss", action: actions.dismissLink)
-                }
-            }
-        }
-        if let book = actions.receivedBook {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Continue reading from Android").font(.headline)
-                if let title = book.title { Text(title).font(.body.weight(.semibold)).lineLimit(2) }
-                if let chapter = book.chapter { Text(chapter).font(.caption).lineLimit(2) }
-                if let page = book.page {
-                    Text(book.pages.map { "Page \(page) of \($0) on the phone (\(page * 100 / $0) %)" } ?? "Page \(page) on the phone")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                if let quote = book.quote { Text("“\(quote)”").font(.caption).italic().lineLimit(4).textSelection(.enabled) }
-                HStack {
-                    if book.title != nil && (book.quote != nil || book.chapter != nil) {
-                        Button(book.quote != nil ? "Find in Books" : "Go to chapter in Books", action: actions.findInBooks)
-                            .disabled(actions.findingInBooks)
+        ForEach(actions.cards) { card in
+            switch card.content {
+            case let .link(link):
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Link from \(card.peerName)").font(.headline)
+                    Text(link).font(.caption).lineLimit(3).textSelection(.enabled)
+                    HStack {
+                        Button("Open in browser") { actions.openLink(card.id) }
+                        Button("Dismiss") { actions.dismiss(card.id) }
                     }
-                    Button("Continue in Books", action: actions.continueInBooks).disabled(actions.findingInBooks)
-                    Button("Dismiss", action: actions.dismissBook).disabled(actions.findingInBooks)
                 }
-                if book.fromGooglePlayBooks {
-                    Button("Open in Google Play Books", action: actions.openInGooglePlayBooks)
+            case let .book(book):
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Continue reading from \(card.peerName)").font(.headline)
+                    if let title = book.title { Text(title).font(.body.weight(.semibold)).lineLimit(2) }
+                    if let chapter = book.chapter { Text(chapter).font(.caption).lineLimit(2) }
+                    if let page = book.page {
+                        Text(book.pages.map { "Page \(page) of \($0) on the phone (\(page * 100 / $0) %)" } ?? "Page \(page) on the phone")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if let quote = book.quote { Text("“\(quote)”").font(.caption).italic().lineLimit(4).textSelection(.enabled) }
+                    HStack {
+                        if book.title != nil && (book.quote != nil || book.chapter != nil) {
+                            Button(book.quote != nil ? "Find in Books" : "Go to chapter in Books") { actions.findInBooks(card.id) }
+                                .disabled(actions.findingInBooks)
+                        }
+                        Button("Continue in Books") { actions.continueInBooks(card.id) }.disabled(actions.findingInBooks)
+                        Button("Dismiss") { actions.dismiss(card.id) }.disabled(actions.findingInBooks)
+                    }
+                    if book.fromGooglePlayBooks {
+                        Button("Open in Google Play Books", action: actions.openInGooglePlayBooks)
+                    }
                 }
             }
         }

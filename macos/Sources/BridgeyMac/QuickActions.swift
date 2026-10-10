@@ -57,8 +57,8 @@ func validatedBookHandoff(_ value: String) -> BookHandoff? {
 
 @MainActor
 final class QuickActions: ObservableObject {
-    @Published private(set) var receivedLink: String?
-    @Published private(set) var receivedBook: BookHandoff?
+    /// MD-7: received link and book cards, per sending peer (see `HandoffCards`).
+    @Published private(set) var handoff = HandoffCards()
     /// Opening Apple Books and copying the quote; replaceable in tests.
     var openBooks: () -> Bool = {
         NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Books.app"))
@@ -77,88 +77,118 @@ final class QuickActions: ObservableObject {
         NSPasteboard.general.setString(text, forType: .string)
     }
     @Published private(set) var status: String?
-    var available: (BridgeyFeature) -> Bool = { _ in false }
-    var send: (String, [String: Any]) -> Bool = { _, _ in false }
-    private var pending: String?
-    private var timeout: Task<Void, Never>?
+    /// Whether handoff from (receiving) or a link to (sending) this peer is offered now.
+    var receivable: (_ deviceID: String) -> Bool = { _ in false }
+    var sendable: (_ deviceID: String) -> Bool = { _ in false }
+    /// Whether the local grant still allows this peer's cards to be used (also when it is offline).
+    var granted: (_ deviceID: String) -> Bool = { _ in false }
+    var peerName: (_ deviceID: String) -> String = { _ in "Android" }
+    /// Sends one quick-action message on exactly this peer's session.
+    var send: (_ kind: String, _ payload: [String: Any], _ deviceID: String) -> Bool = { _, _, _ in false }
+    /// The link sent to each peer and not confirmed yet: deviceID -> requestId.
+    private var pending: [String: String] = [:]
+    private var timeouts: [String: Task<Void, Never>] = [:]
     private var sequence = 0
 
-    func sendClipboardLink() {
+    var cards: [HandoffCard] { handoff.cards }
+
+    /// Mac -> Android "Link": the copied link to `deviceID` (the peer's card, or the only eligible
+    /// peer for the keyboard shortcut). Never another peer.
+    func sendClipboardLink(to deviceID: String) {
+        let name = peerName(deviceID)
         guard let link = NSPasteboard.general.string(forType: .string).flatMap(validatedWebLink) else {
             status = "Copy a valid http or https link first"; return
         }
-        guard available(.links) else { status = "Web links are unavailable on one of your devices"; return }
-        guard pending == nil else { return }
+        guard sendable(deviceID) else { status = "Web links are unavailable on \(name)"; return }
+        guard pending[deviceID] == nil else { status = "The previous link to \(name) is still waiting for confirmation"; return }
         let id = UUID().uuidString.lowercased()
-        pending = id
+        pending[deviceID] = id
         sequence += 1
-        status = "Sending link…"
-        if !send("quick.request", ["version": 1, "requestId": id, "feature": "links", "action": "offer", "value": link, "sequence": sequence]) {
-            pending = nil; status = "Not connected — link not sent"; return
+        status = "Sending link to \(name)…"
+        if !send("quick.request", ["version": 1, "requestId": id, "feature": "links", "action": "offer", "value": link, "sequence": sequence], deviceID) {
+            pending[deviceID] = nil; status = "\(name) is not connected — link not sent"; return
         }
-        timeout?.cancel()
-        timeout = Task { [weak self] in
+        timeouts[deviceID]?.cancel()
+        timeouts[deviceID] = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 8_000_000_000)
-            guard !Task.isCancelled, self?.pending == id else { return }
-            self?.pending = nil
-            self?.status = "Android did not confirm delivery"
+            guard !Task.isCancelled, self?.pending[deviceID] == id else { return }
+            self?.pending[deviceID] = nil
+            self?.status = "\(name) did not confirm delivery"
         }
     }
 
-    func receive(_ kind: String, payload: [String: Any]) {
+    /// A quick-action message from `deviceID` (the authenticated sender).
+    func receive(_ kind: String, payload: [String: Any], from deviceID: String) {
         guard payload["version"] as? Int == 1,
               let id = payload["requestId"] as? String, UUID(uuidString: id) != nil else { return }
+        let name = peerName(deviceID)
         if kind == "quick.result" {
-            guard id == pending, payload["feature"] as? String == "links" else { return }
-            pending = nil; timeout?.cancel()
+            // Only this peer's own pending link completes; another peer's result never does.
+            guard pending[deviceID] == id, payload["feature"] as? String == "links" else { return }
+            pending[deviceID] = nil; timeouts.removeValue(forKey: deviceID)?.cancel()
             status = payload["accepted"] as? Bool == true
-                ? "Link delivered — waiting for the user to open it"
-                : "Link declined — check settings or dismiss the previous link"
+                ? "Link delivered to \(name) — waiting for the user to open it"
+                : "Link declined by \(name) — check settings or dismiss the previous link"
         } else if kind == "quick.request", payload["action"] as? String == "book" {
             let book = (payload["value"] as? String).flatMap(validatedBookHandoff)
-            let accepted = available(.links) && payload["feature"] as? String == "links" && book != nil && receivedBook == nil
+            var accepted = false
+            if receivable(deviceID), payload["feature"] as? String == "links", let book {
+                accepted = handoff.add(HandoffCard(deviceID: deviceID, peerName: name, content: .book(book), receivedAt: Date()))
+            }
             if accepted {
-                receivedBook = book
-                status = "Continue reading received — see below"
+                status = "Continue reading received from \(name) — see below"
                 NSSound(named: NSSound.Name("Glass"))?.play()
             }
-            _ = send("quick.result", ["version": 1, "requestId": id, "feature": "links", "accepted": accepted])
+            _ = send("quick.result", ["version": 1, "requestId": id, "feature": "links", "accepted": accepted], deviceID)
         } else if kind == "quick.request" {
             let link = (payload["value"] as? String).flatMap(validatedWebLink)
-            let accepted = available(.links) && payload["feature"] as? String == "links" &&
-                payload["action"] as? String == "offer" && link != nil && receivedLink == nil
+            var accepted = false
+            if receivable(deviceID), payload["feature"] as? String == "links", payload["action"] as? String == "offer", let link {
+                accepted = handoff.add(HandoffCard(deviceID: deviceID, peerName: name, content: .link(link), receivedAt: Date()))
+            }
             if accepted {
-                receivedLink = link
-                status = "Link received — open it below"
+                status = "Link received from \(name) — open it below"
                 NSSound(named: NSSound.Name("Glass"))?.play()
             }
-            _ = send("quick.result", ["version": 1, "requestId": id, "feature": "links", "accepted": accepted])
+            _ = send("quick.result", ["version": 1, "requestId": id, "feature": "links", "accepted": accepted], deviceID)
         }
     }
 
-    func openLink() {
-        guard available(.links), let link = receivedLink.flatMap(validatedWebLink), let url = URL(string: link) else { return }
-        if NSWorkspace.shared.open(url) { receivedLink = nil } else { status = "Could not open your browser" }
+    /// The card's book, while the local grant still allows its sender.
+    private func book(_ cardID: String) -> BookHandoff? {
+        guard let card = handoff.card(cardID), granted(card.deviceID), case let .book(book) = card.content else { return nil }
+        return book
     }
-    func dismissLink() { receivedLink = nil }
+    /// A grant change while Find in Books was running, applied when it finishes.
+    private var policyChangedDuringFind = false
+
+    func openLink(_ cardID: String) {
+        guard let card = handoff.card(cardID), granted(card.deviceID), case let .link(value) = card.content,
+              let link = validatedWebLink(value), let url = URL(string: link) else { return }
+        if NSWorkspace.shared.open(url) { handoff.remove(cardID) } else { status = "Could not open your browser" }
+    }
+
+    func dismiss(_ cardID: String) {
+        guard !(findingInBooks && handoff.card(cardID)?.isLink == false) else { return }
+        handoff.remove(cardID)
+    }
 
     /// Copies the quote (to find the place with ⌘F in Books) and opens Apple Books.
-    func continueInBooks() {
-        guard let book = receivedBook else { return }
+    func continueInBooks(_ cardID: String) {
+        guard let book = book(cardID) else { return }
         if let quote = book.quote { copyText(quote) }
         if openBooks() {
-            receivedBook = nil
+            handoff.remove(cardID)
             status = book.quote != nil ? "Quote copied — in Books open the book, press ⌘F and ⌘V" : "Books opened — open the book and go to the page shown"
         } else {
             status = "Could not open Books"
         }
     }
-    func dismissBook() { receivedBook = nil }
 
     /// Opens Apple Books, searches the quote and lands on it (explicit click only). Anything the
     /// automation cannot verify ends in a message, with the quote copied for the manual way.
-    func findInBooks() {
-        guard let book = receivedBook, book.title != nil, book.quote != nil || book.chapter != nil, !findingInBooks else { return }
+    func findInBooks(_ cardID: String) {
+        guard let book = book(cardID), book.title != nil, book.quote != nil || book.chapter != nil, !findingInBooks else { return }
         guard accessibilityTrusted(true) else {
             status = "Allow Bridgey in System Settings → Privacy & Security → Accessibility, then try again"
             return
@@ -168,15 +198,19 @@ final class QuickActions: ObservableObject {
         let run = runBooksAutomation
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result = run(book) { text in DispatchQueue.main.async { if self?.findingInBooks == true { self?.status = text } } }
-            DispatchQueue.main.async { self?.finishFind(result, book: book) }
+            DispatchQueue.main.async { self?.finishFind(result, book: book, cardID: cardID) }
         }
     }
 
-    private func finishFind(_ result: BooksAutomationResult, book: BookHandoff) {
+    private func finishFind(_ result: BooksAutomationResult, book: BookHandoff, cardID: String) {
         findingInBooks = false
+        if policyChangedDuringFind {
+            policyChangedDuringFind = false
+            handoff.keep(where: granted)
+        }
         switch result {
         case .completed:
-            if receivedBook == book { receivedBook = nil }
+            if case .book(book)? = handoff.card(cardID)?.content { handoff.remove(cardID) }
             status = book.quote != nil ? "Found in Books — you are at the quote"
                 : "Books is at the start of \(book.chapter ?? "the chapter")" + (book.page.map { " (phone: page \($0))" } ?? "")
         case .notFound:
@@ -200,5 +234,21 @@ final class QuickActions: ObservableObject {
             status = "Could not open your browser"
         }
     }
-    func reset() { timeout?.cancel(); pending = nil; receivedLink = nil; if !findingInBooks { receivedBook = nil }; status = nil }
+
+    func report(_ message: String) { status = message }
+
+    /// The peer's session ended: its unconfirmed link is over; its cards stay (MD-7, D2).
+    func deviceEnded(_ deviceID: String) {
+        timeouts.removeValue(forKey: deviceID)?.cancel()
+        if pending.removeValue(forKey: deviceID) != nil {
+            status = "\(peerName(deviceID)) disconnected — link not confirmed"
+        }
+    }
+
+    /// The local grant changed: cards of peers no longer allowed are dropped (never while Find in
+    /// Books is running on one of them).
+    func policyChanged() {
+        guard !findingInBooks else { policyChangedDuringFind = true; return }
+        handoff.keep(where: granted)
+    }
 }
