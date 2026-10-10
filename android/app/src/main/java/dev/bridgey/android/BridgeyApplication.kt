@@ -93,6 +93,8 @@ class BridgeyApplication : Application() {
                 photoSync.requestScan()
             }
         }
+        // MD-8: a peer's capabilities or grants changed (e.g. the routed Mac turned Photo Sync on).
+        applicationScope.launch { pairing.deviceDirectoryRevision.collect { photoSync.requestScan() } }
         applicationScope.launch {
             pairing.remoteFeatures.collect { features ->
                 if (features[BridgeyFeature.BATTERY] != false) lastBatteryIntent?.let(::publishBattery)

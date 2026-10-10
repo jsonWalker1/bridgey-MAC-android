@@ -213,6 +213,7 @@ domain's code has moved, its README lists where the code lives today.
 | MD-5 clipboard sent to the selected peer, per-device send/ack state | done — see [clipboard](features/clipboard/README.md) |
 | MD-6 file transfers per peer: (deviceId, transferId) state, explicit target, Mac <-> Mac opt-in | done — see [files](features/files/README.md) |
 | MD-7 handoff per peer: explicit Mac (one → direct, several → choose), per-sender cards kept after disconnect | implemented — see [handoff](features/handoff/README.md) |
+| MD-8 Photo Sync: preferred Mac (else routed) resolved once per batch, stops when it goes away, no fallback | implemented — see [photos](features/photos/README.md) |
 | Documentation (this file, domain READMEs, component docs) | in progress |
 | Domain source tree: build skeleton (root `Package.swift`, Gradle source dirs for `features/*`) | done |
 | Feature moves into `features/` | in progress |

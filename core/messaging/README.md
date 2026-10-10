@@ -86,7 +86,10 @@ engine but still targets the routed peer, resolved when an asset starts.
 (`quick.*` feature `links`) go to and come from an explicit peer; feature `media` on the same
 kinds stays routed.
 
-**Still on `activeSession`:** photo sync (target only), notifications (forwarding, actions,
+**Migrated (MD-8):** [photos](../../features/photos/README.md) — Photo Sync targets the preferred
+Mac (else the routed one), resolved once per batch and only while eligible; no fallback to another peer.
+
+**Still on `activeSession`:** notifications (forwarding, actions,
 dismiss, Clear All), calls, media (both directions, including `quick.*` feature `media`),
 screen share / Remote Start (video channel providers) and KVM (input channel, frozen). The inactive-peer gate in `receive` still drops their messages from non-routed
 devices.

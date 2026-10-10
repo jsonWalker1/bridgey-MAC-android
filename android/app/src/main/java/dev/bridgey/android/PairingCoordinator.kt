@@ -1342,19 +1342,20 @@ class PairingCoordinator(
         startFileTransfer(deviceId, uri, assetKey = null, onResult = onResult)
     }
 
-    /**
-     * Photo Sync is not migrated (MD-6): it keeps using the routed peer, but resolved once when the
-     * asset starts, so a routing change neither interrupts nor redirects an asset in flight.
-     */
-    fun sendSyncAsset(uri: Uri, assetKey: String, onResult: (Boolean) -> Unit) {
-        if (!isFeatureAvailable(BridgeyFeature.PHOTO_SYNC)) {
-            mutableFileTransferStatus.value = "File transfer is turned off on one of your devices"
-            onResult(false)
-            return
-        }
-        val deviceId = activePeerId
-        if (deviceId == null || peers.connectedSession(deviceId) == null) {
-            mutableFileTransferStatus.value = "Not connected — file was not sent"
+    /** MD-8: the routed peer - Photo Sync's target only when no preferred Mac is configured. */
+    internal fun routedDeviceId(): String? = activePeerId
+
+    /** MD-8: the connected peers that can take Photo Sync from this phone now (applicability per device). */
+    internal fun photoSyncTargets(): List<String> = targets(FeatureApplicability.Feature.PHOTO_SYNC).map { it.deviceId }
+
+    /** MD-8: one Photo Sync asset to exactly [deviceId] (the batch's target); never another peer. */
+    fun sendSyncAsset(uri: Uri, assetKey: String, deviceId: String, onResult: (Boolean) -> Unit) {
+        if (deviceId !in photoSyncTargets()) {
+            mutableFileTransferStatus.value = if (peers.connectedSession(deviceId) == null) {
+                "${displayName(deviceId)} is not connected — photo was not sent"
+            } else {
+                "Photo Sync is turned off on ${displayName(deviceId)}"
+            }
             onResult(false)
             return
         }

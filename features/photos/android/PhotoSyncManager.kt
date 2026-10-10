@@ -14,6 +14,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -34,6 +36,7 @@ internal class PhotoSyncManager(
     private var observer: ContentObserver? = null
     private var registered = false
     private var scanJob: Job? = null
+    private val batch = PhotoSyncBatchGate()
 
     fun start() {
         if (registered) return
@@ -54,14 +57,22 @@ internal class PhotoSyncManager(
         observer?.let { runCatching { appContext.contentResolver.unregisterContentObserver(it) } }
         observer = null
         scanJob?.cancel()
+        batch.reset()
     }
 
     fun requestScan() {
         if (!registered || !hasMediaPermission() || !settings.isEnabled(BridgeyFeature.PHOTO_SYNC, null)) return
+        // MD-8: a running batch keeps its target; this request is served after it.
+        if (!batch.request()) return
         scanJob?.cancel()
         scanJob = scope.launch {
             delay(1_500)
-            withContext(Dispatchers.IO) { runScan() }
+            val token = batch.started()
+            try {
+                withContext(Dispatchers.IO) { runScan() }
+            } finally {
+                if (batch.finished(token)) requestScan()
+            }
         }
     }
 
@@ -88,13 +99,19 @@ internal class PhotoSyncManager(
                 return
             }
         }
-        if (pairing.state.value !is PairingState.Connected) return
+        // MD-8: one target for the whole batch - the preferred Mac (no fallback), else the routed one.
+        val target = photoSyncTarget(settings.state.value.preferredDeviceId, pairing.routedDeviceId(), pairing.photoSyncTargets())
+            ?: return
         val ledgerKeys = preferences.getStringSet(KEY_SYNCED, emptySet()).orEmpty()
         val pending = unsyncedAssets(queryCandidates(), ledgerKeys)
+        var failures = 0
         for (asset in pending) {
-            if (pairing.state.value !is PairingState.Connected) break
+            currentCoroutineContext().ensureActive()
+            // Stops when the target goes away; never continues on another connected peer.
+            if (!photoSyncContinues(target, pairing.photoSyncTargets())) break
             if (!settings.isEnabled(BridgeyFeature.PHOTO_SYNC, null)) break
-            sendOne(asset)
+            failures = if (sendOne(asset, target)) 0 else failures + 1
+            if (failures >= PHOTO_SYNC_MAX_CONSECUTIVE_FAILURES) break
         }
     }
 
@@ -112,7 +129,7 @@ internal class PhotoSyncManager(
             .apply()
     }
 
-    private suspend fun sendOne(asset: MediaAssetRef) {
+    private suspend fun sendOne(asset: MediaAssetRef, target: String): Boolean {
         val collection = if (asset.mediaType == MEDIA_TYPE_IMAGE) {
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         } else {
@@ -120,8 +137,10 @@ internal class PhotoSyncManager(
         }
         val uri = ContentUris.withAppendedId(collection, asset.mediaStoreId)
         val done = CompletableDeferred<Boolean>()
-        pairing.sendSyncAsset(uri, asset.ledgerKey()) { success -> done.complete(success) }
-        if (done.await()) markSynced(asset)
+        pairing.sendSyncAsset(uri, asset.ledgerKey(), target) { success -> done.complete(success) }
+        val sent = done.await()
+        if (sent) markSynced(asset)
+        return sent
     }
 
     private fun markSynced(asset: MediaAssetRef) {

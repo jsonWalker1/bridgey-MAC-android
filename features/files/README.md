@@ -38,7 +38,8 @@ correlates a message from one peer with another peer's transfer. The sender of a
 - **Flow control:** a macOS receiver sends cumulative `files.chunk.ack` like Android does, so a Mac
   sender (window 64) works towards another Mac. Acks only move forward and never past a chunk
   actually sent.
-- **Photo Sync** is not migrated: it targets the routed peer, resolved when each asset starts.
+- **Photo Sync** targets the preferred Mac (else the routed peer), resolved once per batch (MD-8, see
+  [photos](../photos/README.md)).
 
 ## Sending files on macOS
 - **Finder (primary):** select one or more files → right-click → **Services → "Send to Bridgey…"**.
