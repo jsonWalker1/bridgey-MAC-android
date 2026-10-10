@@ -21,7 +21,7 @@ Media (Android) uses this feature's listener component as its MediaSession permi
 ## Code
 | | |
 |---|---|
-| `android/` | `BridgeyNotificationListenerService` (listener, `ForwardedNotificationRegistry`, eligibility, sync parts, action tokens) |
+| `android/` | `BridgeyNotificationListenerService` (listener, `ForwardedNotificationRegistry`, eligibility, sync parts, action tokens); `NotificationRouting` (MD-9 target Mac) |
 | `macos/` | [NotificationIdentity](macos/NotificationIdentity.md) (ids, sync assembly, reconciliation), [NotificationClearAllDetector](macos/NotificationClearAllDetector.md), [NotificationActionRouting](macos/NotificationActionRouting.md), `NotificationHistory` |
 | still elsewhere | `NotificationPresenter` and the `notifications.*` handlers in `Pairing.swift`; `sendNotification*` in `PairingCoordinator.kt` |
 
@@ -29,11 +29,16 @@ Payloads: `notifications.*` in [docs/protocol.md](../../docs/protocol.md).
 History and measurements: [BRIDGEY_NOTIFICATIONS_STATE.md](../../BRIDGEY_NOTIFICATIONS_STATE.md).
 
 ## Rules
+- MD-9: a phone mirrors to exactly one Mac - the preferred Mac (no fallback while it is offline),
+  else the routed one (`NotificationRouting.kt`). Other Macs get an empty `notifications.sync` once
+  per session, so a former target keeps no copies. Only the target may dismiss or act. The Mac shows
+  notifications from any eligible phone and answers each notification's own phone. See
+  docs/protocol.md, "One target Mac per phone".
 - Identifiers include the Android `deviceID`; one device's snapshot never touches another device's
   notifications. Notification content is never logged off the device.
 - Known gap: `forget` does not yet remove a forgotten device's delivered notifications or history
   (history items carry no `deviceId` yet).
 
 ## Tests
-`tests/android/ForwardedNotificationRegistryTest.kt`, `NotificationReconciliationTest.kt`;
+`tests/android/ForwardedNotificationRegistryTest.kt`, `NotificationReconciliationTest.kt`, `NotificationRoutingTest.kt`;
 `tests/macos/Notification*Tests.swift`, `NotificationSyncTests.swift`.

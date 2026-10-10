@@ -92,6 +92,23 @@ final class NotificationSyncTests: XCTestCase {
         XCTAssertEqual(stale, ["req-\(phone)-1", "req-\(phone)-2"])
     }
 
+    /// MD-9: the empty sync a phone sends to a Mac that is no longer its target removes exactly that
+    /// phone's copies - never another phone's, never non-Bridgey notifications.
+    func testEmptyCleanupSyncOfOnePhoneLeavesOtherDevicesUntouched() {
+        let assembler = NotificationSyncAssembler()
+        // Another phone's sync in progress is not disturbed by this phone's cleanup.
+        XCTAssertNil(assembler.add(payload([hexID(7)], syncId: "other", part: 1, parts: 2), deviceID: otherPhone))
+        let snapshot = assembler.add(payload([], syncId: "cleanup"), deviceID: phone)
+        XCTAssertEqual(snapshot, [])
+        let items = delivered([1, 2], device: phone) + delivered([1, 2], device: otherPhone) + [
+            DeliveredRemoteNotification(requestIdentifier: "some-local-notification", androidDeviceID: nil, androidNotificationID: nil),
+            DeliveredRemoteNotification(requestIdentifier: "id-less", androidDeviceID: phone, androidNotificationID: nil),
+        ]
+        XCTAssertEqual(staleRemoteNotificationIdentifiers(delivered: items, deviceID: phone, snapshot: snapshot!),
+                       ["req-\(phone)-1", "req-\(phone)-2"])
+        XCTAssertEqual(assembler.add(payload([hexID(8)], syncId: "other", part: 2, parts: 2), deviceID: otherPhone), [hexID(7), hexID(8)])
+    }
+
     func testApplyingTheSameSyncTwiceIsHarmless() {
         var items = delivered([1, 2, 3], device: phone)
         let first = staleRemoteNotificationIdentifiers(delivered: items, deviceID: phone, snapshot: [hexID(1)])

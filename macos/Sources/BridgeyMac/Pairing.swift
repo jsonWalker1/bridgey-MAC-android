@@ -472,6 +472,9 @@ final class PairingCoordinator: ObservableObject {
             started: { [weak self] deviceID in
                 guard let self else { return }
                 self.deviceDirectoryRevision += 1
+                // MD-9: a new phone session re-seeds Clear All from what is delivered after settling.
+                self.clearAllDetector.reset()
+                self.clearAllSettlingStartedAt = Date()
                 // MD-4c: resubscribe if the panel shows this peer.
                 self.applyTelemetrySubscription(self.telemetrySubscription.sessionStarted(deviceID))
             },
@@ -498,7 +501,7 @@ final class PairingCoordinator: ObservableObject {
                     self.videoChannel.reset()
                     self.screenStreamDecoder.reset()
                     if !self.settings.isEnabled(.clipboard, for: nil) { self.clearClipboardSendStatus() }
-                    if !self.featureEnabled(.notifications) { self.clearRemoteCall() }
+                    if !self.settings.isEnabled(.notifications, for: nil) { self.clearRemoteCall() }
                     // BRIDGEY NOTIFICATION++ RECONCILIATION: forwarding off (globally or for one
                     // device) = nothing mirrored from that device may stay in Notification Center.
                     // Re-enabling needs nothing here: Android reconciles on the features.update.
@@ -1362,6 +1365,8 @@ final class PairingCoordinator: ObservableObject {
         clipboardDeviceEnded(deviceID) // MD-5
         endFileTransfers(of: deviceID) // MD-6
         quickActions.deviceEnded(deviceID) // MD-7
+        // MD-9: this phone's notification call card cannot be answered without its session.
+        if let call = remoteCall, call.source == .notification, call.deviceID == deviceID { clearRemoteCall() }
         if pings.deviceEnded(deviceID) { setTransientPingStatus("\(displayName(deviceID)) disconnected") }
         if find.deviceEnded(deviceID) { stopMacSound() }
         deviceDirectoryRevision += 1
@@ -1905,7 +1910,9 @@ final class PairingCoordinator: ObservableObject {
         mediaRemote.reset()
         videoChannel.reset()
         screenStreamDecoder.reset()
-        clearRemoteCall()
+        // MD-9: a notification call card belongs to its own phone (it goes with that phone's session
+        // or notification); only the routed-only telecom card follows routing.
+        if remoteCall?.source == .telecom { clearRemoteCall() }
         remoteFeatures = defaultRemoteFeatureState()
         remoteFeatureStateReceived = false
         guard let current = activeSession, peers.phase(of: current) == .connected else { return }
@@ -1951,6 +1958,9 @@ final class PairingCoordinator: ObservableObject {
         // MD-7: quick actions reach any connected peer; receiveQuickPayload keeps feature "media"
         // with the routed peer (QuickPayloadGate).
         "quick.request", "quick.result",
+        // MD-9: each phone mirrors its notifications to one Mac it chooses; this Mac shows them
+        // from any connected phone that may mirror here, whatever this Mac routes to.
+        "notifications.post", "notifications.remove", "notifications.sync",
     ]
 
     private func receive(_ message: PairingMessage, in current: Session) {
@@ -2057,6 +2067,12 @@ final class PairingCoordinator: ObservableObject {
                 peers.setCapabilities(capabilities, for: current)
                 // Features: only the routed session's capabilities drive today's single-peer features.
                 if current === activeSession { applyRemoteFeatures(capabilities) }
+                // MD-9: this peer's mirrored notifications (and its call card) go when it turns them off.
+                if previousCapabilities?[BridgeyFeature.notifications.rawValue] != false,
+                   capabilities[BridgeyFeature.notifications.rawValue] == false {
+                    let peerID = current.remoteDeviceID
+                    removeAllRemoteNotifications(reason: "peer_feature_off") { $0 == peerID }
+                }
                 // MD-6: this peer's transfers stop when it turns file transfer off; others continue.
                 if previousCapabilities?[BridgeyFeature.files.rawValue] == true,
                    capabilities[BridgeyFeature.files.rawValue] == false {
@@ -2227,9 +2243,8 @@ final class PairingCoordinator: ObservableObject {
                 guard let sender = peers.connectedDeviceID(of: current), message.sessionId == current.id else { return }
                 telemetryUnsubscribed(by: sender)
             case "notifications.post":
-                guard featureEnabled(.notifications, current: current) else { return }
-                guard case .connected = state,
-                      message.sessionId == current.id,
+                guard let sender = notificationSender(current) else { return }
+                guard message.sessionId == current.id,
                       let messageID = message.messageId,
                       current.acceptMessageID(messageID),
                       let nonce = message.nonce,
@@ -2242,19 +2257,18 @@ final class PairingCoordinator: ObservableObject {
                       (!payload.title.isEmpty || !payload.text.isEmpty) else {
                     throw PairingError.invalidMessage
                 }
-                recordNotificationHistory(payload, deviceID: current.remoteDeviceID)
-                updateRemoteCall(payload, deviceID: current.remoteDeviceID)
+                recordNotificationHistory(payload, deviceID: sender)
+                updateRemoteCall(payload, deviceID: sender)
                 if shouldUseSystemNotification(callType: payload.callType) {
-                    postNotification(payload, deviceID: current.remoteDeviceID)
+                    postNotification(payload, deviceID: sender)
                 }
             case "notifications.remove":
-                guard featureEnabled(.notifications, current: current),
+                guard let sender = notificationSender(current),
                       let reference = try receiveNotificationReference(message, in: current) else { return }
-                removeRemoteNotification(reference.notificationId, deviceID: current.remoteDeviceID)
+                removeRemoteNotification(reference.notificationId, deviceID: sender)
             case "notifications.sync":
-                guard featureEnabled(.notifications, current: current) else { return }
-                guard case .connected = state,
-                      message.sessionId == current.id,
+                guard let sender = notificationSender(current) else { return }
+                guard message.sessionId == current.id,
                       let messageID = message.messageId,
                       current.acceptMessageID(messageID),
                       let nonce = message.nonce,
@@ -2264,9 +2278,10 @@ final class PairingCoordinator: ObservableObject {
                       isValidNotificationSyncPayload(payload) else {
                     throw PairingError.invalidMessage
                 }
-                let deviceID = current.remoteDeviceID
-                if let snapshot = notificationSyncAssembler.add(payload, deviceID: deviceID) {
-                    reconcileRemoteNotifications(deviceID: deviceID, snapshot: snapshot)
+                // Identity and cleanup stay scoped to the authenticated sender: an empty sync (the
+                // phone moved its notifications to another Mac) removes only this phone's copies.
+                if let snapshot = notificationSyncAssembler.add(payload, deviceID: sender) {
+                    reconcileRemoteNotifications(deviceID: sender, snapshot: snapshot)
                 }
             case "calls.started", "calls.confirmation_required", "calls.rejected":
                 guard message.messageId == callRequestID else { return }
@@ -2595,11 +2610,6 @@ final class PairingCoordinator: ObservableObject {
         videoChannel.reset()
         screenStreamDecoder.reset()
         mediaController.refresh()
-        if remoteFeatures[.notifications] == false {
-            clearRemoteCall()
-            let peerID = activePeerID ?? ""
-            removeAllRemoteNotifications(reason: "peer_feature_off") { $0 == peerID }
-        }
         if remoteFeatures[.calls] == false { clearCallStatus() }
         flushPendingCallIfPossible()
     }
@@ -2880,7 +2890,7 @@ final class PairingCoordinator: ObservableObject {
         let context = NotificationClickContext(
             androidPackage: content.userInfo["androidPackage"] as? String,
             conversationID: content.userInfo["androidConversationId"] as? String,
-            canOpenOnPhone: phoneOpenToken != nil && isConnected(to: deviceID)
+            canOpenOnPhone: phoneOpenToken != nil && notificationCommandSession(for: deviceID) != nil
         )
         let decision = notificationActions.route(context)
         NSLog("PLUGIN notification click package=%@ decision=%@", context.androidPackage ?? "-", String(describing: decision))
@@ -2964,7 +2974,7 @@ final class PairingCoordinator: ObservableObject {
         let center = UNUserNotificationCenter.current()
         if clear {
             center.removeDeliveredNotifications(withIdentifiers: [identifier])
-            if isConnected(to: deviceID) {
+            if notificationCommandSession(for: deviceID) != nil {
                 dismissAndroidNotification(notificationID, deviceID: deviceID)
             } else {
                 NSLog("PLUGIN notification click clear: phone not connected, Android keeps it until the next sync")
@@ -2989,9 +2999,28 @@ final class PairingCoordinator: ObservableObject {
         }
     }
 
-    private func isConnected(to deviceID: String) -> Bool {
-        if case let .connected(connectedDeviceID, _) = state, connectedDeviceID == deviceID, activeSession != nil { return true }
-        return false
+    // MARK: - NOTIFICATIONS PER PHONE (MD-9)
+
+    /// The phone a notification message on `current` comes from, when it may mirror notifications
+    /// to this Mac (connected, Android -> Mac, its capability and this Mac's grant for it).
+    private func notificationSender(_ current: Session) -> String? {
+        guard let sender = peers.connectedDeviceID(of: current),
+              applicability(of: .notificationMirror, with: sender, localIsSource: false) == .offered else { return nil }
+        return sender
+    }
+
+    /// Connected phones whose notifications this Mac shows, in connection order.
+    private var notificationPhoneIDs: [String] {
+        peers.connectedInOrder.map(\.deviceID).filter {
+            applicability(of: .notificationMirror, with: $0, localIsSource: false) == .offered
+        }
+    }
+
+    /// Dismiss / action / reply / Clear All go to the phone the notification came from - its own
+    /// session, never the routed peer and never another device. Nil when it cannot take them now.
+    private func notificationCommandSession(for deviceID: String) -> Session? {
+        guard applicability(of: .notificationActions, with: deviceID, localIsSource: true) == .offered else { return nil }
+        return peers.connectedSession(for: deviceID)
     }
 
     // MARK: - BRIDGEY NOTIFICATION++ macOS CLEAR ALL (see NotificationClearAllDetector.swift)
@@ -3003,8 +3032,7 @@ final class PairingCoordinator: ObservableObject {
     private var clearAllNotificationsAuthorized: Bool?
 
     private func checkNotificationClearAll() {
-        guard case let .connected(deviceID, _) = state, let current = activeSession else { return }
-        let forwardingAvailable = isFeatureAvailable(.notifications) && featureEnabled(.notifications, current: current)
+        let forwardingAvailable = !notificationPhoneIDs.isEmpty
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { settings in
             // Turning Bridgey notifications off in System Settings also empties Notification Center;
@@ -3019,13 +3047,13 @@ final class PairingCoordinator: ObservableObject {
                     entries[notification.request.identifier] = ClearAllSnapshotEntry(deviceID: itemDeviceID, notificationID: notificationID)
                 }
                 DispatchQueue.main.async { [weak self] in
-                    self?.applyNotificationClearAll(entries, deviceID: deviceID, active: forwardingAvailable, authorized: authorized)
+                    self?.applyNotificationClearAll(entries, active: forwardingAvailable, authorized: authorized)
                 }
             }
         }
     }
 
-    private func applyNotificationClearAll(_ current: [String: ClearAllSnapshotEntry], deviceID: String, active: Bool, authorized: Bool) {
+    private func applyNotificationClearAll(_ current: [String: ClearAllSnapshotEntry], active: Bool, authorized: Bool) {
         let now = Date()
         if clearAllNotificationsAuthorized != authorized {
             clearAllNotificationsAuthorized = authorized
@@ -3044,20 +3072,21 @@ final class PairingCoordinator: ObservableObject {
         case .explained:
             NSLog("PLUGIN notification clear_all explained_by_bridgey previous=%d", previous)
         case .dismissMany(let entries):
-            let notificationIDs = entries.filter { $0.deviceID == deviceID }.map(\.notificationID)
-            NSLog("PLUGIN notification clear_all detected previous=%d dismissing=%d", previous, notificationIDs.count)
-            sendNotificationDismissMany(notificationIDs, deviceID: deviceID)
+            // MD-9: each phone gets exactly its own notifications; a disconnected phone's part is
+            // dropped (its notifications return with its reconciliation).
+            let byDevice = notificationDismissManyByDevice(entries)
+            NSLog("PLUGIN notification clear_all detected previous=%d dismissing=%d devices=%d", previous, entries.count, byDevice.count)
+            for (deviceID, notificationIDs) in byDevice {
+                sendNotificationDismissMany(notificationIDs, deviceID: deviceID)
+            }
         }
     }
 
     private func sendNotificationDismissMany(_ notificationIDs: [String], deviceID: String) {
-        guard !notificationIDs.isEmpty,
-              case let .connected(connectedDeviceID, _) = state,
-              connectedDeviceID == deviceID,
-              let current = activeSession,
-              current.remoteDeviceID == deviceID,
-              isFeatureAvailable(.notifications),
-              featureEnabled(.notifications, current: current) else { return }
+        guard !notificationIDs.isEmpty, let current = notificationCommandSession(for: deviceID) else {
+            NSLog("PLUGIN notification clear_all dropped: phone not available")
+            return
+        }
         for part in notificationDismissManyParts(notificationIDs) {
             guard let plaintext = try? JSONSerialization.data(withJSONObject: [
                 "version": 1,
@@ -3095,7 +3124,14 @@ final class PairingCoordinator: ObservableObject {
             self.publishLocalBattery(to: current.remoteDeviceID) // MD-4c: every peer's own heartbeat
             if current === self.activeSession {
                 self.mediaController.refresh()
-                self.checkNotificationClearAll() // piggybacks on the existing heartbeat, no new timer
+            }
+            // Piggybacks on the existing heartbeat, no new timer. MD-9: one notification phone's
+            // heartbeat drives it, whatever this Mac routes to.
+            let notificationPhones = self.notificationPhoneIDs
+            if notificationPhones.isEmpty {
+                self.clearAllDetector.reset() // nothing mirrored here: nothing to infer a Clear All from
+            } else if notificationPhones.first == self.peers.connectedDeviceID(of: current) {
+                self.checkNotificationClearAll()
             }
             self.scheduleHeartbeat(for: current)
         }
@@ -3243,11 +3279,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func dismissAndroidNotification(_ notificationID: String, deviceID: String) {
-        guard case let .connected(connectedDeviceID, _) = state,
-              connectedDeviceID == deviceID,
-              let current = activeSession,
-              current.remoteDeviceID == deviceID,
-              featureEnabled(.notifications, current: current),
+        guard let current = notificationCommandSession(for: deviceID),
               !notificationID.isEmpty,
               notificationID.count <= 512,
               let plaintext = try? JSONEncoder().encode(NotificationReferencePayload(notificationId: notificationID)),
@@ -3270,11 +3302,7 @@ final class PairingCoordinator: ObservableObject {
         replyText: String?,
         route: String? = nil
     ) {
-        guard case let .connected(connectedDeviceID, _) = state,
-              connectedDeviceID == deviceID,
-              let current = activeSession,
-              current.remoteDeviceID == deviceID,
-              featureEnabled(.notifications, current: current),
+        guard let current = notificationCommandSession(for: deviceID),
               !notificationID.isEmpty,
               notificationID.count <= 512,
               actionToken.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
@@ -3298,8 +3326,7 @@ final class PairingCoordinator: ObservableObject {
     }
 
     private func receiveNotificationReference(_ message: PairingMessage, in current: Session) throws -> NotificationReferencePayload? {
-        guard case .connected = state,
-              message.sessionId == current.id,
+        guard message.sessionId == current.id,
               let messageID = message.messageId,
               current.acceptMessageID(messageID),
               let nonce = message.nonce,

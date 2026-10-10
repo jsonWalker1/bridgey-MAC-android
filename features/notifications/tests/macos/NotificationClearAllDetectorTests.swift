@@ -116,4 +116,18 @@ final class NotificationClearAllDetectorTests: XCTestCase {
         XCTAssertEqual(notificationDismissManyParts(ids).flatMap { $0 }, ids)
         XCTAssertEqual(notificationDismissManyParts([]).count, 0)
     }
+
+    // MD-9: per phone
+
+    func testClearAllIsSplitPerPhoneAndNoPhoneGetsAnotherPhonesIDs() {
+        let entries = [
+            ClearAllSnapshotEntry(deviceID: "phone-b", notificationID: "b1"),
+            ClearAllSnapshotEntry(deviceID: "phone-a", notificationID: "a1"),
+            ClearAllSnapshotEntry(deviceID: "phone-b", notificationID: "b2"),
+        ]
+        let split = notificationDismissManyByDevice(entries)
+        XCTAssertEqual(split.map(\.deviceID), ["phone-a", "phone-b"])
+        XCTAssertEqual(split.map(\.notificationIDs), [["a1"], ["b1", "b2"]])
+        XCTAssertTrue(notificationDismissManyByDevice([]).isEmpty)
+    }
 }

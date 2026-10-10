@@ -105,3 +105,11 @@ func notificationDismissManyParts(_ notificationIDs: [String]) -> [[String]] {
         Array(notificationIDs[$0..<min($0 + maximumNotificationDismissManyIDs, notificationIDs.count)])
     }
 }
+
+/// MD-9: an inferred Clear All split per originating phone - each phone is sent only its own IDs.
+/// Sorted by device for a deterministic send order.
+func notificationDismissManyByDevice(_ entries: [ClearAllSnapshotEntry]) -> [(deviceID: String, notificationIDs: [String])] {
+    Dictionary(grouping: entries, by: \.deviceID)
+        .map { (deviceID: $0.key, notificationIDs: $0.value.map(\.notificationID)) }
+        .sorted { $0.deviceID < $1.deviceID }
+}

@@ -139,6 +139,25 @@ Replaces the tap-routing POC (`6d72ffb`). `NotificationActionRouting.swift`:
 - Android unchanged (`conversationId` already on the wire). Not yet tested with a
   real WhatsApp click.
 
+## 7b. MD-9: ONE TARGET MAC PER PHONE (2026-10-10)
+
+Product decision: a phone mirrors notifications to exactly one Mac - the preferred Mac; if it is
+offline or not eligible there is no target (never another Mac); the routed Mac only when no Mac is
+preferred. No fan-out. Wire protocol unchanged (docs/protocol.md, "One target Mac per phone").
+
+- Android `NotificationRouting.kt`: `notificationTarget`, `NotificationTargetTracker` (committed
+  target; reconcile when a target session is new; empty `notifications.sync` once per session to
+  every other eligible Mac). dismiss / dismissMany / action accepted only from the target.
+- macOS: post / remove / sync accepted from any eligible phone (independent of its own routed peer);
+  dismiss, action, reply, Open on phone, call actions and Clear All go to the notification's own
+  phone session; Clear All split per phone; a phone's call card goes with its session.
+- HW (S23 + M4 + work Mac): delivery only to the target (work Mac received while itself routed to
+  M4); preferred switch cleared the old Mac (3 removed) and reconciled the new one; target offline →
+  nothing anywhere, missed notification restored on reconnect; non-target reconnect got only the
+  empty sync; dismiss on M4 removed it on the phone; M4 Clear All → `dismissMany received=6
+  dismissed=6`. Not HW-tested: incoming call on the target only (deferred to real use); switching
+  the preferred Mac while the old one is offline (UI does not offer it; unit-tested).
+
 ## 8. NOT IN SCOPE / DECIDED
 
 - No Bridgey UI button for clearing phone notifications.

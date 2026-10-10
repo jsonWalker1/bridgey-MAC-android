@@ -140,10 +140,9 @@ class PairingCoordinator(
     private val notificationSendDispatcher = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "bridgey-notification-send").apply { isDaemon = true }
     }.asCoroutineDispatcher()
-    // Whether notification forwarding was available on the current connected session the last time
-    // it was evaluated - a false -> true transition (connect, reconnect, re-enable on either peer)
-    // triggers one fresh reconciliation. See refreshNotificationForwardingAvailability().
-    private var notificationForwardingAvailable = false
+    // MD-9: which Mac was last reconciled as the notification target and which other Macs were
+    // cleared. See refreshNotificationTarget().
+    private val notificationTargets = NotificationTargetTracker()
     // MD-7: Web links / book handoff per peer; Mac media stays with the routed peer.
     val quickActions = QuickActions(
         appContext, scope, ::isFeatureAvailable, ::sendQuickPayload,
@@ -352,9 +351,16 @@ class PairingCoordinator(
                 synchronized(telemetrySubscription) {
                     applyTelemetrySubscription(telemetrySubscription.sessionStarted(deviceId))
                 }
+                refreshNotificationTarget() // MD-9
             }
-            override fun sessionEnded(deviceId: String) = deviceSessionEnded(deviceId)
-            override fun authorizationChanged(deviceId: String) = deviceAuthorizationChanged(deviceId)
+            override fun sessionEnded(deviceId: String) {
+                deviceSessionEnded(deviceId)
+                refreshNotificationTarget() // MD-9
+            }
+            override fun authorizationChanged(deviceId: String) {
+                deviceAuthorizationChanged(deviceId)
+                refreshNotificationTarget() // MD-9: a Mac's notification capability or grant changed
+            }
         })
         mediaRemote.start()
         scope.launch {
@@ -368,7 +374,7 @@ class PairingCoordinator(
                 quickActions.policyChanged()
                 mediaRemote.policyChanged()
                 sendFeatureState()
-                refreshNotificationForwardingAvailability()
+                refreshNotificationTarget()
                 publishLocalStorage(force = true)
                 publishLocalMemory(force = true)
                 publishLocalTemperature()
@@ -1015,12 +1021,11 @@ class PairingCoordinator(
         bluetoothRouteName: String? = null,
         resync: Boolean = false,
         conversationId: String? = null,
+        deviceId: String? = null,
     ) {
-        if (!isFeatureAvailable(BridgeyFeature.NOTIFICATIONS)) return
-        val connectedSession = activeSession ?: return
-        if (mutableState.value !is PairingState.Connected) return
+        val connectedSession = notificationSession(deviceId) ?: return
         scope.launch(notificationSendDispatcher) {
-            if (activeSession !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
+            if (notificationSession(deviceId) !== connectedSession) return@launch
             // BRIDGEY CONNECTIVITY CRASH FIX (2026-09-25): see sendBattery's identical guard for why.
             val pairingKey = connectedSession.pairingKey ?: return@launch
             val payload = JSONObject()
@@ -1085,55 +1090,96 @@ class PairingCoordinator(
      * of at most [MAX_NOTIFICATION_SYNC_IDS_PER_PART]. An empty list is sent as one empty part. Goes
      * through the same ordered notification send queue as posts and removes.
      */
-    fun sendNotificationSync(notificationIds: List<String>) {
-        if (!isFeatureAvailable(BridgeyFeature.NOTIFICATIONS)) return
-        val connectedSession = activeSession ?: return
-        if (mutableState.value !is PairingState.Connected) return
-        val syncId = UUID.randomUUID().toString()
-        val parts = notificationSyncParts(notificationIds)
+    fun sendNotificationSync(notificationIds: List<String>, deviceId: String? = null) {
+        val connectedSession = notificationSession(deviceId) ?: return
         scope.launch(notificationSendDispatcher) {
-            if (activeSession !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
-            val pairingKey = connectedSession.pairingKey ?: return@launch
-            parts.forEachIndexed { index, ids ->
-                val payload = JSONObject()
-                    .put("version", 1)
-                    .put("syncId", syncId)
-                    .put("part", index + 1)
-                    .put("parts", parts.size)
-                    .put("notificationIds", JSONArray(ids))
-                    .toString()
-                    .toByteArray()
-                val encrypted = Crypto.encrypt(pairingKey, payload)
-                connectedSession.send(
-                    Message(
-                        kind = "notifications.sync",
-                        sessionId = connectedSession.id,
-                        messageId = UUID.randomUUID().toString(),
-                        nonce = encrypted.nonce,
-                        ciphertext = encrypted.ciphertext,
-                    ),
-                )
-            }
-            android.util.Log.i("Bridgey", "PLUGIN notification sync sent ids=${notificationIds.size} parts=${parts.size}")
+            if (notificationSession(deviceId) !== connectedSession) return@launch
+            sendNotificationSyncParts(connectedSession, notificationIds)
         }
     }
 
     /**
-     * Re-evaluates whether notification forwarding is usable on the current connected session and,
-     * on a false -> true transition, asks the listener for one fresh reconciliation (silent resync
-     * posts + `notifications.sync`). Called on connect, on every local settings change and on every
-     * received `features.update`, so connect, reconnect and re-enabling the feature on either peer
-     * all reconcile exactly once; nothing is replayed while it stays available.
+     * MD-9: an empty `notifications.sync` to a Mac that is no longer the notification target - it
+     * removes every copy of this phone's notifications there (the Mac scopes a sync to its
+     * authenticated sender, so other devices' notifications are untouched).
      */
-    private fun refreshNotificationForwardingAvailability(sessionStarted: Boolean = false) {
-        val available = mutableState.value is PairingState.Connected && isFeatureAvailable(BridgeyFeature.NOTIFICATIONS)
-        val becameAvailable = synchronized(this) {
-            if (sessionStarted) notificationForwardingAvailable = false
-            val transition = available && !notificationForwardingAvailable
-            notificationForwardingAvailable = available
-            transition
+    private fun sendNotificationClear(deviceId: String, session: Session) {
+        scope.launch(notificationSendDispatcher) {
+            // Became the target again meanwhile: its reconciliation replaces this cleanup.
+            if (peers.connectedSession(deviceId) !== session || notificationTargetId() == deviceId) return@launch
+            sendNotificationSyncParts(session, emptyList())
         }
-        if (becameAvailable) BridgeyNotificationListenerService.requestReconciliation()
+    }
+
+    /** Runs on [notificationSendDispatcher]: every part of one sync goes to the same session. */
+    private fun sendNotificationSyncParts(connectedSession: Session, notificationIds: List<String>) {
+        val syncId = UUID.randomUUID().toString()
+        val parts = notificationSyncParts(notificationIds)
+        val pairingKey = connectedSession.pairingKey ?: return
+        parts.forEachIndexed { index, ids ->
+            val payload = JSONObject()
+                .put("version", 1)
+                .put("syncId", syncId)
+                .put("part", index + 1)
+                .put("parts", parts.size)
+                .put("notificationIds", JSONArray(ids))
+                .toString()
+                .toByteArray()
+            val encrypted = Crypto.encrypt(pairingKey, payload)
+            connectedSession.send(
+                Message(
+                    kind = "notifications.sync",
+                    sessionId = connectedSession.id,
+                    messageId = UUID.randomUUID().toString(),
+                    nonce = encrypted.nonce,
+                    ciphertext = encrypted.ciphertext,
+                ),
+            )
+        }
+        android.util.Log.i("Bridgey", "PLUGIN notification sync sent ids=${notificationIds.size} parts=${parts.size}")
+    }
+
+    /**
+     * MD-9: the one Mac notifications go to now - the preferred Mac (never another one while it is
+     * set), else the routed Mac - and only while it can take notifications from this phone. The
+     * target committed by the last [refreshNotificationTarget].
+     */
+    internal fun notificationTargetId(): String? = notificationTargets.target
+
+    /** Connected Macs that may receive notifications from this phone, with their sessions. */
+    private fun notificationEligibleSessions(): Map<String, Session> =
+        targets(FeatureApplicability.Feature.NOTIFICATION_MIRROR)
+            .mapNotNull { entry -> peers.connectedSession(entry.deviceId)?.let { entry.deviceId to it } }
+            .toMap()
+
+    /** The target's session for one notification message; [deviceId] pins an operation to the
+     *  target it started with (nothing is sent once the target has changed). */
+    private fun notificationSession(deviceId: String? = null): Session? {
+        val target = notificationTargetId() ?: return null
+        if (deviceId != null && deviceId != target) return null
+        return peers.connectedSession(target)
+    }
+
+    /**
+     * MD-9: re-evaluates the notification target. A Mac that just became the target (or whose
+     * session is new) is reconciled once - silent re-posts plus the authoritative sync; every other
+     * eligible Mac gets an empty sync once per session, so no stale copy outlives a target change.
+     * Serialized, so concurrent callers apply their evaluations in order.
+     */
+    private fun refreshNotificationTarget() {
+        synchronized(notificationTargets) {
+            val eligible = notificationEligibleSessions()
+            val target = notificationTarget(settings.state.value.preferredDeviceId, activePeerId, eligible.keys.toList())
+            val step = notificationTargets.update(target, eligible)
+            step.clear.forEach { sendNotificationClear(it, eligible.getValue(it)) }
+            step.reconcile?.let(BridgeyNotificationListenerService::requestReconciliation)
+            if (step.reconcile != null || step.clear.isNotEmpty()) {
+                android.util.Log.i(
+                    "Bridgey",
+                    "PLUGIN notification target=${target?.take(8) ?: "none"} reconcile=${step.reconcile != null} cleared=${step.clear.size}",
+                )
+            }
+        }
     }
 
     /**
@@ -1176,11 +1222,10 @@ class PairingCoordinator(
     }
 
     private fun sendNotificationReference(kind: String, notificationId: String) {
-        if (!isFeatureAvailable(BridgeyFeature.NOTIFICATIONS) || notificationId.isBlank()) return
-        val connectedSession = activeSession ?: return
-        if (mutableState.value !is PairingState.Connected) return
+        if (notificationId.isBlank()) return
+        val connectedSession = notificationSession() ?: return
         scope.launch(notificationSendDispatcher) {
-            if (activeSession !== connectedSession || mutableState.value !is PairingState.Connected) return@launch
+            if (notificationSession() !== connectedSession) return@launch
             // BRIDGEY CONNECTIVITY CRASH FIX (2026-09-25): see sendBattery's identical guard for why.
             val pairingKey = connectedSession.pairingKey ?: return@launch
             val payload = JSONObject()
@@ -1808,15 +1853,14 @@ class PairingCoordinator(
         mutableRemoteFeatures.value = defaultFeatureState()
         val current = activeSession
         if (current == null || peers.phase(current) != PeerSessionPhase.CONNECTED) {
-            refreshNotificationForwardingAvailability()
+            refreshNotificationTarget()
             return
         }
         activePeerId?.let(peers::capabilities)?.let { capabilities ->
             applyRemoteFeatures(BridgeyFeature.entries.associateWith { capabilities[it.key] ?: false })
         }
         mediaRemote.sendFreshState()
-        // BRIDGEY NOTIFICATION++ RECONCILIATION: a newly routed session starts "not yet reconciled".
-        refreshNotificationForwardingAvailability(sessionStarted = true)
+        refreshNotificationTarget() // MD-9: without a preferred Mac, the routed Mac is the target
     }
 
     /**
@@ -1880,6 +1924,8 @@ class PairingCoordinator(
         // MD-7: quick actions reach any connected peer; receiveQuickPayload keeps feature "media"
         // with the routed peer (QuickPayloadGate). media.state stays routed-only.
         "quick.request", "quick.result",
+        // MD-9: Mac commands for this phone's notifications, accepted only from the target Mac.
+        "notifications.dismiss", "notifications.dismissMany", "notifications.action",
     )
 
     private fun receive(current: Session, message: Message) {
@@ -2031,12 +2077,19 @@ class PairingCoordinator(
         }
     }
 
+    /** MD-9: only the target Mac may dismiss or act on this phone's notifications. */
+    private fun acceptsNotificationCommandFrom(current: Session): Boolean {
+        val accepted = acceptsNotificationCommand(peers.connectedDeviceId(current), notificationTargetId())
+        if (!accepted) android.util.Log.i("Bridgey", "PLUGIN notification command ignored: sender is not the target Mac")
+        return accepted
+    }
+
     private fun receiveNotificationDismiss(current: Session, message: Message) {
         if (!settings.isEnabled(BridgeyFeature.NOTIFICATIONS, current.remoteDeviceId)) {
             sendFeatureState()
             return
         }
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        if (!acceptsNotificationCommandFrom(current) || message.sessionId != current.id) return
         val messageId = message.messageId ?: return
         if (!current.acceptMessageId(messageId)) return
         val plaintext = Crypto.decrypt(
@@ -2064,7 +2117,7 @@ class PairingCoordinator(
             sendFeatureState()
             return
         }
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        if (!acceptsNotificationCommandFrom(current) || message.sessionId != current.id) return
         val messageId = message.messageId ?: return
         if (!current.acceptMessageId(messageId)) return
         val plaintext = Crypto.decrypt(
@@ -2240,7 +2293,7 @@ class PairingCoordinator(
             sendFeatureState()
             return
         }
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id) return
+        if (!acceptsNotificationCommandFrom(current) || message.sessionId != current.id) return
         val messageId = message.messageId ?: return
         if (!current.acceptMessageId(messageId)) return
         val plaintext = Crypto.decrypt(
@@ -2733,7 +2786,7 @@ class PairingCoordinator(
         mutableRemoteFeatures.value = received
         quickActions.policyChanged()
         mediaRemote.policyChanged()
-        refreshNotificationForwardingAvailability()
+        refreshNotificationTarget()
     }
 
     private fun receiveBattery(current: Session, message: Message) {

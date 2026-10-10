@@ -111,7 +111,7 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
      * forgotten exactly like a removal (covers a previously forwarded notification that became
      * ineligible, e.g. a call once telephony is idle).
      */
-    private fun forward(sbn: StatusBarNotification, rankingMap: RankingMap?, resync: Boolean): String? {
+    private fun forward(sbn: StatusBarNotification, rankingMap: RankingMap?, resync: Boolean, target: String? = null): String? {
         val bridgey = application as BridgeyApplication
         val input = eligibilityInput(sbn, rankingMap)
         val applicationName = runCatching {
@@ -169,6 +169,7 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
                 bluetoothRouteName = bluetoothRouteName,
                 resync = resync,
                 conversationId = notification.shortcutId, // TAP ROUTING POC
+                deviceId = target, // MD-9: a reconciliation stays with its target Mac
             )
             markForwarded(notificationId)
             val now = android.os.SystemClock.elapsedRealtime()
@@ -240,9 +241,13 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
      * whatever Android no longer has. Every send is a safe no-op while disconnected or while
      * notification forwarding is unavailable. Runs on the main thread, like every listener callback.
      */
-    private fun reconcile(repost: Boolean, reason: String) {
+    private fun reconcile(repost: Boolean, reason: String, expectedTarget: String? = null) {
         val bridgey = application as BridgeyApplication
         if (!bridgey.isPrimaryUser || !bridgey.isBridgeyEnabled) return
+        // MD-9: one target Mac for the whole reconciliation. Without one, only the bookkeeping is
+        // rebuilt; a Mac that becomes the target later gets its own reconciliation.
+        val target = bridgey.pairing.notificationTargetId()
+        if (expectedTarget != null && target != expectedTarget) return
         // getActiveNotifications() returns null (or throws) while the listener is not bound. That
         // means "unknown", never "empty": an empty snapshot would make the Mac remove everything.
         // Not bound (yet) is harmless to skip - onListenerConnected reconciles once it binds.
@@ -256,8 +261,8 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
         forwardedNotificationIds.clear()
         val snapshot = linkedSetOf<String>()
         active.filterNot { it.packageName == packageName }.forEach { sbn ->
-            val notificationId = if (repost) {
-                forward(sbn, ranking, resync = true)
+            val notificationId = if (repost && target != null) {
+                forward(sbn, ranking, resync = true, target = target)
             } else {
                 eligibleNotificationId(eligibilityInput(sbn, ranking))?.also { id ->
                     forwardedNotifications.record(id, sbn.key, sbn.packageName)
@@ -270,10 +275,10 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
             pendingCallPosts.remove(staleId)?.let(mainHandler::removeCallbacks)
             removeActions(staleId)
         }
-        bridgey.pairing.sendNotificationSync(snapshot.toList())
+        target?.let { bridgey.pairing.sendNotificationSync(snapshot.toList(), it) }
         android.util.Log.i(
             "Bridgey",
-            "PLUGIN notification reconcile reason=$reason repost=$repost active=${active.size} synced=${snapshot.size}",
+            "PLUGIN notification reconcile reason=$reason repost=$repost target=${target != null} active=${active.size} synced=${snapshot.size}",
         )
     }
 
@@ -503,16 +508,17 @@ class BridgeyNotificationListenerService : NotificationListenerService() {
         }
 
         /**
-         * BRIDGEY NOTIFICATION++ RECONCILIATION: called from PairingCoordinator whenever notification
-         * forwarding becomes available on a connected session (connect, reconnect, feature re-enabled
-         * on either peer). Re-posts every eligible notification as a silent `resync` (the Mac's
-         * request identifier is stable per notificationId, so this replaces rather than duplicates)
-         * followed by the authoritative `notifications.sync`. If the listener is not bound yet,
+         * BRIDGEY NOTIFICATION++ RECONCILIATION: called from PairingCoordinator whenever [deviceId]
+         * becomes the notification target Mac (MD-9: target change, its reconnect, feature re-enabled
+         * on either peer); skipped if another Mac is the target by the time it runs. Re-posts every
+         * eligible notification as a silent `resync` (the Mac's request identifier is stable per
+         * notificationId, so this replaces rather than duplicates) followed by the authoritative
+         * `notifications.sync`. If the listener is not bound yet,
          * nothing is lost: [onListenerConnected] always reconciles once it binds.
          */
-        fun requestReconciliation() {
+        fun requestReconciliation(deviceId: String) {
             activeService?.get()?.let { service ->
-                service.mainHandler.post { service.reconcile(repost = true, reason = "session") }
+                service.mainHandler.post { service.reconcile(repost = true, reason = "target", expectedTarget = deviceId) }
             }
         }
 

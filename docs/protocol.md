@@ -446,6 +446,29 @@ with exactly the same filters and identity as `notifications.post`).
   after Android reports a `REASON_CANCEL_ALL` removal. There is no periodic sync.
 - Clients that do not recognise `notifications.sync` ignore it.
 
+#### One target Mac per phone (MD-9)
+
+Android mirrors its notifications to exactly one Mac at a time, by choosing the
+session it sends on; the payloads are unchanged.
+
+- The target is the phone's preferred Mac while it is connected and notification
+  mirroring is offered to it. If a preferred Mac is set but offline or not
+  eligible, there is no target: nothing is sent to any other Mac. Only when no
+  Mac is preferred does the routed Mac serve as the target.
+- When a Mac becomes the target (including when it reconnects), Android re-posts
+  every eligible notification as `resync` followed by a `notifications.sync`, all
+  on that one session.
+- Every other eligible Mac receives one empty `notifications.sync` per session.
+  This removes that phone's copies there (and nothing else, since a sync is scoped
+  to its authenticated sender), so a former target keeps no stale notifications.
+- Android accepts `notifications.dismiss`, `.dismissMany` and `.action` only from
+  the current target Mac.
+- macOS accepts `notifications.post`, `.remove` and `.sync` from any connected
+  Android device for which notification mirroring is offered, independent of
+  its own routed peer. It sends dismissals, actions, replies and a Clear All to
+  the session of the Android device each notification came from, never to
+  another device; a Clear All is split per device.
+
 `notifications.post` may carry an optional string `conversationId` (at most 256
 characters): the source app's own conversation identifier
 (`Notification.shortcutId`), sent for every app that sets one. It is used only
