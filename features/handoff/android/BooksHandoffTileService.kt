@@ -56,7 +56,8 @@ class BooksHandoffTileService : TileService() {
                 startActivityAndCollapse(PendingIntent.getActivity(this, 772, intent,
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
             } else {
-                @Suppress("DEPRECATION")
+                // API 26-33 only offers the Intent overload; lint id silences the same deprecation.
+                @Suppress("DEPRECATION", "StartActivityAndCollapseDeprecated")
                 startActivityAndCollapse(intent)
             }
         }
