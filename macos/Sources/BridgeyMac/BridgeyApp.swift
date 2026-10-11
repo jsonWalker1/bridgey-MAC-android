@@ -341,7 +341,8 @@ private struct BridgeyPanel: View {
                 .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
 
-            if legacy && pairing.isFeatureAvailable(.media) {
+            // MD-10: the player belongs to the phone it came from, not to the routed peer.
+            if pairing.mediaRemote.deviceID == device.deviceID {
                 MediaRemoteCard(media: pairing.mediaRemote)
             }
 

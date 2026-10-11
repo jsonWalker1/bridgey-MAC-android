@@ -34,7 +34,7 @@ final class GlobalMediaCommandCenterTests: XCTestCase {
             capabilities: ["play", "pause"]
         ))
         var sentAction: String?
-        mediaRemote.sendAction = { action, _, _ in sentAction = action }
+        mediaRemote.sendAction = { action, _, _, _ in sentAction = action }
 
         center.handle(systemDefinedEvent(keyCode: 16, isKeyDown: true))
 
@@ -51,7 +51,7 @@ final class GlobalMediaCommandCenterTests: XCTestCase {
             version: 1, generation: 1, sequence: 1, hasSession: true, title: "Video", capabilities: ["next"]
         ))
         var actions: [String] = []
-        mediaRemote.sendAction = { action, _, _ in actions.append(action) }
+        mediaRemote.sendAction = { action, _, _, _ in actions.append(action) }
 
         center.handle(systemDefinedEvent(keyCode: 17, isKeyDown: true))
         center.handle(systemDefinedEvent(keyCode: 17, isKeyDown: true))
@@ -67,7 +67,7 @@ final class GlobalMediaCommandCenterTests: XCTestCase {
             capabilities: ["next", "previous"]
         ))
         var actions: [String] = []
-        mediaRemote.sendAction = { action, _, _ in actions.append(action) }
+        mediaRemote.sendAction = { action, _, _, _ in actions.append(action) }
 
         center.handle(systemDefinedEvent(keyCode: 17, isKeyDown: true))
         center.handle(systemDefinedEvent(keyCode: 18, isKeyDown: true))
@@ -80,7 +80,7 @@ final class GlobalMediaCommandCenterTests: XCTestCase {
         let (center, mediaRemote, _) = makeCenter()
         mediaRemote.receive(MediaRemoteStatePayload(version: 1, generation: 1, sequence: 1, hasSession: true, title: "Video"))
         var called = false
-        mediaRemote.sendAction = { _, _, _ in called = true }
+        mediaRemote.sendAction = { _, _, _, _ in called = true }
 
         center.handle(systemDefinedEvent(keyCode: 16, isKeyDown: false))
 
@@ -92,7 +92,7 @@ final class GlobalMediaCommandCenterTests: XCTestCase {
         let (center, mediaRemote, _) = makeCenter()
         mediaRemote.receive(MediaRemoteStatePayload(version: 1, generation: 1, sequence: 1, hasSession: true, title: "Video"))
         var called = false
-        mediaRemote.sendAction = { _, _, _ in called = true }
+        mediaRemote.sendAction = { _, _, _, _ in called = true }
         let unrelated = NSEvent.otherEvent(
             with: .systemDefined, location: .zero, modifierFlags: [], timestamp: 0,
             windowNumber: 0, context: nil, subtype: 1, data1: (16 << 16) | (0x0A << 8), data2: -1
@@ -115,7 +115,7 @@ final class GlobalMediaCommandCenterTests: XCTestCase {
             version: 1, generation: 1, sequence: 1, hasSession: true, title: "Video", capabilities: ["play", "pause"]
         ))
         var called = false
-        mediaRemote.sendAction = { _, _, _ in called = true }
+        mediaRemote.sendAction = { _, _, _, _ in called = true }
 
         center.dispatchSeek(forwardBy: 15)
 
@@ -131,7 +131,7 @@ final class GlobalMediaCommandCenterTests: XCTestCase {
             capabilities: ["seek"]
         ))
         var sentValue: Int64?
-        mediaRemote.sendAction = { _, value, _ in sentValue = value }
+        mediaRemote.sendAction = { _, value, _, _ in sentValue = value }
 
         center.dispatchSeek(forwardBy: 15)
 
@@ -142,7 +142,7 @@ final class GlobalMediaCommandCenterTests: XCTestCase {
     func testUnsupportedCommandsDoNothingWhenThereIsNoActiveSessionAnywhere() {
         let (center, mediaRemote, _) = makeCenter()
         var called = false
-        mediaRemote.sendAction = { _, _, _ in called = true }
+        mediaRemote.sendAction = { _, _, _, _ in called = true }
 
         center.handle(systemDefinedEvent(keyCode: 16, isKeyDown: true))
 

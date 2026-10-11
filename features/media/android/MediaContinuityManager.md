@@ -33,8 +33,9 @@ global media keys (`GlobalMediaCommandCenter.swift`) or the connection.
   availability. After a fresh connection everything is resent, artwork included.
 
 ## Multi-device note
-Sends go to the routed (active) Mac only; this is the compatibility seam until media routes by
-`deviceId`.
+MD-10: sends go to exactly one target Mac (`mediaRemoteTarget`, same rules as notifications:
+preferred Mac without fallback, else routed); other eligible Macs get `hasSession=false`
+(`sendCleared`). Actions are accepted only from the target.
 
 ## Tests
 `MediaContinuityManagerTest.kt`; Mac side `MediaRemoteControllerTests.swift`.

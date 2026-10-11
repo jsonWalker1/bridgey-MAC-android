@@ -29,9 +29,13 @@ Payloads: `media.remote.v1` in [docs/protocol.md](../../docs/protocol.md).
 
 ## Rules
 Commands carry the session generation (stale commands are ignored); track changes are throttled
-(900 ms); controls are gated by what the active session supports. Sends go to the routed (active)
-device until media routes by `deviceId`.
+(900 ms); controls are gated by what the active session supports.
+MD-10: Android → Mac goes to exactly one Mac - the preferred Mac (no fallback while it is offline),
+else the routed one; every other eligible Mac gets `hasSession=false` once per session. Android
+accepts `media.remote.action` only from that Mac and acks on the same session. The Mac shows the
+player of the phone that sent it (whatever the Mac routes to), sends commands only to that phone,
+and clears it only when that phone disconnects or turns media off. Mac → Android stays routed-only.
 
 ## Tests
-`tests/android/MediaContinuityManagerTest.kt`, `tests/macos/MediaRemoteControllerTests.swift`,
+`tests/android/MediaContinuityManagerTest.kt`, `MediaRemoteRoutingTest.kt`, `tests/macos/MediaRemoteControllerTests.swift`,
 `MediaRemoteCardLayoutTests.swift`, `GlobalMediaCommandCenterTests.swift`.

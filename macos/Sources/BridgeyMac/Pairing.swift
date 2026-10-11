@@ -443,12 +443,11 @@ final class PairingCoordinator: ObservableObject {
         mediaController.onState = { [weak self] in
             _ = self?.sendQuickPayload(kind: "media.state", payload: $0)
         }
-        mediaRemote.allowed = { [weak self] in
-            guard let self, case .connected = self.state else { return false }
-            return self.isFeatureAvailable(.media)
-        }
-        mediaRemote.sendAction = { [weak self] action, value, generation in
-            self?.sendMediaRemoteAction(action: action, value: value, generation: generation)
+        // MD-10: per phone - the receive path checks the sender, commands check their phone.
+        mediaRemote.allowed = { [weak self] in self?.settings.isEnabled(.media, for: nil) == true }
+        mediaRemote.sendAction = { [weak self] action, value, generation, deviceID in
+            guard let deviceID else { return }
+            self?.sendMediaRemoteAction(action: action, value: value, generation: generation, to: deviceID)
         }
         videoChannel.onVideoFrame = { [weak self] frame in
             DispatchQueue.main.async { self?.screenStreamDecoder.handle(frame) }
@@ -497,7 +496,10 @@ final class PairingCoordinator: ObservableObject {
                     if !self.settings.isEnabled(.ping, for: nil) { self.clearPingStatus() }
                     self.quickActions.policyChanged()
                     self.mediaController.reset()
-                    self.mediaRemote.reset()
+                    // MD-10: the Android player stays unless media was turned off for its phone.
+                    if let phone = self.mediaRemote.deviceID, !self.settings.isEnabled(.media, for: phone) {
+                        self.mediaRemote.reset(deviceID: phone)
+                    }
                     self.videoChannel.reset()
                     self.screenStreamDecoder.reset()
                     if !self.settings.isEnabled(.clipboard, for: nil) { self.clearClipboardSendStatus() }
@@ -807,9 +809,9 @@ final class PairingCoordinator: ObservableObject {
     /// Android currently reports as primary. `generation` pins the command to the session context
     /// mediaRemote last received a state update for, so Android can reject it if its primary
     /// session has since changed underneath the Mac.
-    private func sendMediaRemoteAction(action: String, value: Int64?, generation: Int64) {
-        guard case .connected = state, let current = activeSession,
-              isFeatureAvailable(.media),
+    private func sendMediaRemoteAction(action: String, value: Int64?, generation: Int64, to deviceID: String) {
+        // MD-10: only the phone whose player is shown; never another device if it is unavailable.
+        guard let current = mediaRemoteSession(for: deviceID),
               let plaintext = try? JSONEncoder().encode(MediaRemoteActionPayload(
                 version: 1, requestId: UUID().uuidString.lowercased(), action: action, value: value, generation: generation
               )),
@@ -1365,6 +1367,7 @@ final class PairingCoordinator: ObservableObject {
         clipboardDeviceEnded(deviceID) // MD-5
         endFileTransfers(of: deviceID) // MD-6
         quickActions.deviceEnded(deviceID) // MD-7
+        mediaRemote.reset(deviceID: deviceID) // MD-10: that phone's player cannot be controlled any more
         // MD-9: this phone's notification call card cannot be answered without its session.
         if let call = remoteCall, call.source == .notification, call.deviceID == deviceID { clearRemoteCall() }
         if pings.deviceEnded(deviceID) { setTransientPingStatus("\(displayName(deviceID)) disconnected") }
@@ -1907,7 +1910,6 @@ final class PairingCoordinator: ObservableObject {
         if previous != nil { interruptFeatureTransfers() }
         // MD-7: handoff cards and links belong to their own peer, not to the routed one.
         mediaController.reset()
-        mediaRemote.reset()
         videoChannel.reset()
         screenStreamDecoder.reset()
         // MD-9: a notification call card belongs to its own phone (it goes with that phone's session
@@ -1961,6 +1963,8 @@ final class PairingCoordinator: ObservableObject {
         // MD-9: each phone mirrors its notifications to one Mac it chooses; this Mac shows them
         // from any connected phone that may mirror here, whatever this Mac routes to.
         "notifications.post", "notifications.remove", "notifications.sync",
+        // MD-10: Android's player is shown from its phone whatever this Mac routes to.
+        "media.remote.state", "media.remote.action.ack",
     ]
 
     private func receive(_ message: PairingMessage, in current: Session) {
@@ -2067,6 +2071,11 @@ final class PairingCoordinator: ObservableObject {
                 peers.setCapabilities(capabilities, for: current)
                 // Features: only the routed session's capabilities drive today's single-peer features.
                 if current === activeSession { applyRemoteFeatures(capabilities) }
+                // MD-10: this phone's player goes only when it turns media off (not on every update).
+                if mediaRemoteClearedByFeatureUpdate(capabilities: capabilities, peer: current.remoteDeviceID,
+                                                     shownFrom: mediaRemote.deviceID) {
+                    mediaRemote.reset()
+                }
                 // MD-9: this peer's mirrored notifications (and its call card) go when it turns them off.
                 if previousCapabilities?[BridgeyFeature.notifications.rawValue] != false,
                    capabilities[BridgeyFeature.notifications.rawValue] == false {
@@ -2329,9 +2338,8 @@ final class PairingCoordinator: ObservableObject {
                     setTransientCallStatus("Android could not \(payload.action) the call")
                 }
             case "media.remote.state":
-                guard featureEnabled(.media, current: current) else { return }
-                guard case .connected = state,
-                      message.sessionId == current.id,
+                guard let sender = mediaRemoteSender(current) else { return }
+                guard message.sessionId == current.id,
                       let messageID = message.messageId,
                       current.acceptMessageID(messageID),
                       let nonce = message.nonce,
@@ -2342,10 +2350,10 @@ final class PairingCoordinator: ObservableObject {
                       payload.version == 1 else {
                     throw PairingError.invalidMessage
                 }
-                mediaRemote.receive(payload)
+                mediaRemote.receive(payload, from: sender)
             case "media.remote.action.ack":
-                guard case .connected = state,
-                      message.sessionId == current.id,
+                guard let sender = mediaRemoteSender(current), sender == mediaRemote.deviceID else { return }
+                guard message.sessionId == current.id,
                       let messageID = message.messageId,
                       current.acceptMessageID(messageID),
                       let nonce = message.nonce,
@@ -2606,7 +2614,6 @@ final class PairingCoordinator: ObservableObject {
         })
         remoteFeatureStateReceived = true
         mediaController.reset()
-        mediaRemote.reset()
         videoChannel.reset()
         screenStreamDecoder.reset()
         mediaController.refresh()
@@ -2997,6 +3004,22 @@ final class PairingCoordinator: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - MEDIA CONTINUITY PER PHONE (MD-10)
+
+    /// The phone a `media.remote.*` message on `current` comes from, when it may show its player on
+    /// this Mac (connected, Android -> Mac, its media capability and this Mac's grant for it).
+    private func mediaRemoteSender(_ current: Session) -> String? {
+        guard let sender = peers.connectedDeviceID(of: current),
+              applicability(of: .mediaRemote, with: sender, localIsSource: false) == .offered else { return nil }
+        return sender
+    }
+
+    /// The session of the phone whose player is shown, while media may still flow with it.
+    private func mediaRemoteSession(for deviceID: String) -> Session? {
+        guard applicability(of: .mediaRemote, with: deviceID, localIsSource: false) == .offered else { return nil }
+        return peers.connectedSession(for: deviceID)
     }
 
     // MARK: - NOTIFICATIONS PER PHONE (MD-9)

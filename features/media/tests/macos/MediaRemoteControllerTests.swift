@@ -156,7 +156,7 @@ final class MediaRemoteControllerTests: XCTestCase {
         let controller = makeController()
         controller.receive(MediaRemoteStatePayload(version: 1, generation: 7, sequence: 1, hasSession: true, title: "Track A"))
         var sent: (action: String, value: Int64?, generation: Int64)?
-        controller.sendAction = { action, value, generation in sent = (action, value, generation) }
+        controller.sendAction = { action, value, generation, _ in sent = (action, value, generation) }
         controller.command("pause")
         XCTAssertEqual(sent?.action, "pause")
         XCTAssertEqual(sent?.generation, 7)
@@ -166,7 +166,7 @@ final class MediaRemoteControllerTests: XCTestCase {
     func testCommandDoesNothingWithoutAnActiveSession() {
         let controller = makeController()
         var called = false
-        controller.sendAction = { _, _, _ in called = true }
+        controller.sendAction = { _, _, _, _ in called = true }
         controller.command("pause")
         XCTAssertFalse(called)
     }
@@ -253,5 +253,64 @@ final class MediaRemoteControllerTests: XCTestCase {
             capabilities: ["volume"], volume: 70
         ))
         XCTAssertEqual(controller.state.volume, 70, "the UI must show the new authoritative value, not revert to the previous one")
+    }
+
+    // MARK: - MD-10: one phone's player
+
+    @MainActor
+    func testCommandsGoBackToThePhoneThatSuppliedTheShownState() {
+        let controller = makeController()
+        controller.receive(MediaRemoteStatePayload(version: 1, generation: 3, sequence: 1, hasSession: true, title: "Track A"), from: "phone-1")
+        var target: String?
+        controller.sendAction = { _, _, _, deviceID in target = deviceID }
+        controller.command("toggle")
+        XCTAssertEqual(controller.deviceID, "phone-1")
+        XCTAssertEqual(target, "phone-1")
+    }
+
+    @MainActor
+    func testANewPhoneIsNotComparedAgainstThePreviousPhonesCounters() {
+        let controller = makeController()
+        controller.receive(MediaRemoteStatePayload(version: 1, generation: 9, sequence: 50, hasSession: true, title: "A"), from: "phone-1")
+        controller.receive(MediaRemoteStatePayload(version: 1, generation: 1, sequence: 1, hasSession: true, title: "B"), from: "phone-2")
+        XCTAssertEqual(controller.state.title, "B")
+        XCTAssertEqual(controller.deviceID, "phone-2")
+    }
+
+    @MainActor
+    func testANoSessionStateFromAnotherPhoneDoesNotReplaceTheShownPlayer() {
+        let controller = makeController()
+        controller.receive(MediaRemoteStatePayload(version: 1, generation: 1, sequence: 1, hasSession: true, title: "A"), from: "phone-1")
+        controller.receive(MediaRemoteStatePayload(version: 1, generation: 5, sequence: 9, hasSession: false), from: "phone-2")
+        XCTAssertTrue(controller.state.hasSession)
+        XCTAssertEqual(controller.state.title, "A")
+        XCTAssertEqual(controller.deviceID, "phone-1")
+    }
+
+    @MainActor
+    func testResetForADeviceClearsOnlyItsOwnPlayer() {
+        let controller = makeController()
+        controller.receive(MediaRemoteStatePayload(version: 1, generation: 1, sequence: 1, hasSession: true, title: "A"), from: "phone-1")
+        controller.reset(deviceID: "mac-2")
+        XCTAssertTrue(controller.state.hasSession)
+        controller.reset(deviceID: "phone-1")
+        XCTAssertFalse(controller.state.hasSession)
+        XCTAssertNil(controller.deviceID)
+    }
+
+    @MainActor
+    func testANoSessionStateFromTheTargetHidesThePlayer() {
+        let controller = makeController()
+        controller.receive(MediaRemoteStatePayload(version: 1, generation: 1, sequence: 1, hasSession: true, title: "A"), from: "phone-1")
+        controller.receive(MediaRemoteStatePayload(version: 1, generation: 1, sequence: 2, hasSession: false), from: "phone-1")
+        XCTAssertFalse(controller.state.hasSession)
+        XCTAssertNil(controller.state.title)
+    }
+
+    func testPlayerSurvivesUnrelatedFeatureUpdates() {
+        XCTAssertFalse(mediaRemoteClearedByFeatureUpdate(capabilities: ["media": true, "files": false], peer: "phone-1", shownFrom: "phone-1"))
+        XCTAssertFalse(mediaRemoteClearedByFeatureUpdate(capabilities: ["media": false], peer: "mac-2", shownFrom: "phone-1"))
+        XCTAssertTrue(mediaRemoteClearedByFeatureUpdate(capabilities: ["media": false], peer: "phone-1", shownFrom: "phone-1"))
+        XCTAssertFalse(mediaRemoteClearedByFeatureUpdate(capabilities: ["media": false], peer: "phone-1", shownFrom: nil))
     }
 }

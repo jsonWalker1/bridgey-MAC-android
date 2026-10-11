@@ -143,6 +143,9 @@ class PairingCoordinator(
     // MD-9: which Mac was last reconciled as the notification target and which other Macs were
     // cleared. See refreshNotificationTarget().
     private val notificationTargets = NotificationTargetTracker()
+    // MD-10: the same one-target bookkeeping for Media Continuity (reconcile = fresh state to the
+    // new target, clear = "no session" to every other eligible Mac). See refreshMediaTarget().
+    private val mediaTargets = NotificationTargetTracker()
     // MD-7: Web links / book handoff per peer; Mac media stays with the routed peer.
     val quickActions = QuickActions(
         appContext, scope, ::isFeatureAvailable, ::sendQuickPayload,
@@ -154,8 +157,8 @@ class PairingCoordinator(
     )
     val mediaRemote = MediaContinuityManager(
         appContext,
-        available = { mutableState.value is PairingState.Connected && isFeatureAvailable(BridgeyFeature.MEDIA) },
-        send = ::sendQuickPayload,
+        target = { mediaTargets.target },
+        send = { deviceId, kind, payload -> send(deviceId, kind, payload.toString().toByteArray(Charsets.UTF_8)) },
     )
     // M1: transport/security/lifecycle foundation only - no BridgeyFeature gate yet (that's M3),
     // no encoder/decoder/KVM consumer wired up yet (M2/M4/M5).
@@ -352,14 +355,17 @@ class PairingCoordinator(
                     applyTelemetrySubscription(telemetrySubscription.sessionStarted(deviceId))
                 }
                 refreshNotificationTarget() // MD-9
+                refreshMediaTarget() // MD-10
             }
             override fun sessionEnded(deviceId: String) {
                 deviceSessionEnded(deviceId)
                 refreshNotificationTarget() // MD-9
+                refreshMediaTarget() // MD-10
             }
             override fun authorizationChanged(deviceId: String) {
                 deviceAuthorizationChanged(deviceId)
                 refreshNotificationTarget() // MD-9: a Mac's notification capability or grant changed
+                refreshMediaTarget() // MD-10: a Mac's media capability or grant changed
             }
         })
         mediaRemote.start()
@@ -372,9 +378,9 @@ class PairingCoordinator(
                 peers.connectedInOrder().forEach { publishBattery(it.deviceId, force = true) }
                 if (!settings.isEnabled(BridgeyFeature.PING, null)) clearPingStatus()
                 quickActions.policyChanged()
-                mediaRemote.policyChanged()
                 sendFeatureState()
                 refreshNotificationTarget()
+                refreshMediaTarget()
                 publishLocalStorage(force = true)
                 publishLocalMemory(force = true)
                 publishLocalTemperature()
@@ -1183,6 +1189,29 @@ class PairingCoordinator(
     }
 
     /**
+     * MD-10: re-evaluates the Media Continuity target (same rules as notifications). A Mac that just
+     * became the target, or whose session is new, gets a fresh complete state (artwork included);
+     * every other eligible Mac gets "no session" once per session, so none keeps a stale player.
+     */
+    private fun refreshMediaTarget() {
+        synchronized(mediaTargets) {
+            val eligible = targets(FeatureApplicability.Feature.MEDIA_REMOTE)
+                .mapNotNull { entry -> peers.connectedSession(entry.deviceId)?.let { entry.deviceId to it } }
+                .toMap()
+            val target = mediaRemoteTarget(settings.state.value.preferredDeviceId, activePeerId, eligible.keys.toList())
+            val step = mediaTargets.update(target, eligible)
+            step.clear.forEach(mediaRemote::sendCleared)
+            if (step.reconcile != null) mediaRemote.sendFreshState()
+            if (step.reconcile != null || step.clear.isNotEmpty()) {
+                android.util.Log.i(
+                    "Bridgey",
+                    "MEDIA target=${target?.take(8) ?: "none"} fresh=${step.reconcile != null} cleared=${step.clear.size}",
+                )
+            }
+        }
+    }
+
+    /**
      * Pushes a `calls.state` (v2) update. Nothing on Android currently calls this: the
      * incoming-call signal in production is still the notification-based callType path in
      * sendNotification, driven by BridgeyNotificationListenerService/CallsController. A prior
@@ -1848,19 +1877,19 @@ class PairingCoordinator(
         // MD-6: file transfers are not part of it - they belong to their own peer.
         // MD-7: neither are handoff links; only the routed peer's media state goes.
         quickActions.routedPeerChanged()
-        mediaRemote.reset()
         videoChannel.reset()
         mutableRemoteFeatures.value = defaultFeatureState()
         val current = activeSession
         if (current == null || peers.phase(current) != PeerSessionPhase.CONNECTED) {
             refreshNotificationTarget()
+            refreshMediaTarget()
             return
         }
         activePeerId?.let(peers::capabilities)?.let { capabilities ->
             applyRemoteFeatures(BridgeyFeature.entries.associateWith { capabilities[it.key] ?: false })
         }
-        mediaRemote.sendFreshState()
         refreshNotificationTarget() // MD-9: without a preferred Mac, the routed Mac is the target
+        refreshMediaTarget() // MD-10: likewise
     }
 
     /**
@@ -1926,6 +1955,8 @@ class PairingCoordinator(
         "quick.request", "quick.result",
         // MD-9: Mac commands for this phone's notifications, accepted only from the target Mac.
         "notifications.dismiss", "notifications.dismissMany", "notifications.action",
+        // MD-10: Media Continuity commands, accepted only from the media target Mac.
+        "media.remote.action",
     )
 
     private fun receive(current: Session, message: Message) {
@@ -2225,10 +2256,13 @@ class PairingCoordinator(
      * targeting whatever MediaSession MediaContinuityManager currently considers primary. */
     private fun receiveMediaRemoteAction(current: Session, message: Message) {
         val messageId = message.messageId ?: return
-        if (mutableState.value !is PairingState.Connected || message.sessionId != current.id ||
-            !current.acceptMessageId(messageId)
-        ) return
-        if (!isFeatureAvailable(BridgeyFeature.MEDIA)) {
+        val sender = peers.connectedDeviceId(current)
+        if (!acceptsMediaRemoteAction(sender, mediaTargets.target)) {
+            android.util.Log.i("Bridgey", "MEDIA action ignored: sender is not the media target Mac")
+            return
+        }
+        if (message.sessionId != current.id || !current.acceptMessageId(messageId)) return
+        if (!settings.isEnabled(BridgeyFeature.MEDIA, sender)) {
             sendFeatureState()
             return
         }
@@ -2244,7 +2278,7 @@ class PairingCoordinator(
         if (payload.optInt("version") != 1 || runCatching { UUID.fromString(requestId) }.isFailure) {
             return failSession(current, "Invalid media action")
         }
-        val (accepted, reason) = mediaRemote.handleAction(payload)
+        val (accepted, reason) = mediaRemote.handleAction(payload, sender)
         android.util.Log.i(
             "Bridgey",
             "MEDIA action received action=${payload.optString("action")} accepted=$accepted reason=${reason ?: "-"}",
@@ -2254,7 +2288,10 @@ class PairingCoordinator(
             .put("requestId", requestId)
             .put("accepted", accepted)
             .apply { reason?.let { put("reason", it) } }
-        sendQuickPayload("media.remote.action.ack", ackPayload)
+        // MD-10: the ack goes back to the session the action came from, never to another peer.
+        if (sender != null && peers.connectedSession(sender) === current) {
+            send(sender, "media.remote.action.ack", ackPayload.toString().toByteArray(Charsets.UTF_8))
+        }
         diagnostics.record("media", "action_received", outcome = "${payload.optString("action")}:${if (accepted) "accepted" else reason}")
     }
 
@@ -2785,7 +2822,6 @@ class PairingCoordinator(
     private fun applyRemoteFeatures(received: Map<BridgeyFeature, Boolean>) {
         mutableRemoteFeatures.value = received
         quickActions.policyChanged()
-        mediaRemote.policyChanged()
         refreshNotificationTarget()
     }
 

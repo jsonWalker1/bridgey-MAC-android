@@ -207,6 +207,14 @@ Mac" — can never collide or be confused with each other.
   `accepted`, optional `reason` (`no_session`, `stale_generation`,
   `unsupported`, `invalid`, `execution_failed`, `rate_limited`).
 
+MD-10: Android sends `media.remote.state` to exactly one Mac (its preferred
+Mac while connected and eligible, never another one; the routed Mac only when
+none is preferred) and a `hasSession: false` state once per session to every
+other eligible Mac. It accepts `media.remote.action` only from that Mac and
+sends the ack on the same session. macOS accepts state from any connected
+Android device offered Media Continuity, independent of its own routed peer,
+and sends actions only to the device whose state it shows.
+
 `next`/`previous` are rate-limited to one accepted change per 900 ms
 regardless of source (GUI or a physical media key): some players (YouTube in
 particular) have to fetch and buffer the next item rather than switch

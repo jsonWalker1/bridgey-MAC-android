@@ -126,6 +126,12 @@ func extrapolatedPosition(_ state: MediaRemoteState, nowMs: Int64) -> Int64 {
     return min(max(raw, 0), upperBound)
 }
 
+/// MD-10: a peer's `features.update` clears the shown Android player only when that peer is the
+/// player's phone and turned media off - never for unrelated feature changes.
+func mediaRemoteClearedByFeatureUpdate(capabilities: [String: Bool], peer: String, shownFrom: String?) -> Bool {
+    peer == shownFrom && capabilities[BridgeyFeature.media.rawValue] == false
+}
+
 private func sha256Hex(_ data: Data) -> String {
     SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
 }
@@ -134,14 +140,23 @@ private func sha256Hex(_ data: Data) -> String {
 final class MediaRemoteController: ObservableObject {
     @Published private(set) var state = MediaRemoteState()
     @Published private(set) var lastActionRejectedReason: String?
+    /// MD-10: the Android device the displayed state came from; commands go back to it only.
+    @Published private(set) var deviceID: String?
     var allowed: () -> Bool = { false }
-    var sendAction: (_ action: String, _ value: Int64?, _ generation: Int64) -> Void = { _, _, _ in }
+    var sendAction: (_ action: String, _ value: Int64?, _ generation: Int64, _ deviceID: String?) -> Void = { _, _, _, _ in }
 
     private var ordering = MediaRemoteOrderingGuard()
     private let artworkCache = MediaRemoteArtworkCache()
 
-    func receive(_ payload: MediaRemoteStatePayload) {
+    func receive(_ payload: MediaRemoteStatePayload, from deviceID: String? = nil) {
         guard allowed() else { return }
+        if let deviceID, deviceID != self.deviceID {
+            // Another phone's "nothing here" (e.g. it targets another Mac) never hides the player
+            // of the phone that is shown.
+            if !payload.hasSession && state.hasSession { return }
+            // Another phone's counters are unrelated to the previous phone's.
+            ordering.reset()
+        }
         guard ordering.accept(generation: payload.generation, sequence: payload.sequence) else {
             NSLog("MEDIA remote state rejected as stale generation=%lld sequence=%lld", payload.generation, payload.sequence)
             return
@@ -154,6 +169,7 @@ final class MediaRemoteController: ObservableObject {
                 artwork = artworkCache.image(for: hash)
             }
         }
+        if let deviceID { self.deviceID = deviceID }
         state = MediaRemoteState(
             hasSession: payload.hasSession,
             generation: payload.generation,
@@ -182,7 +198,7 @@ final class MediaRemoteController: ObservableObject {
     func command(_ action: String, value: Int64? = nil) {
         guard allowed(), state.hasSession else { return }
         NSLog("MEDIA command sent action=%@ generation=%lld", action, state.generation)
-        sendAction(action, value, state.generation)
+        sendAction(action, value, state.generation, deviceID)
     }
 
     func receiveAck(_ payload: MediaRemoteActionAckPayload) {
@@ -196,5 +212,13 @@ final class MediaRemoteController: ObservableObject {
         artworkCache.reset()
         state = MediaRemoteState()
         lastActionRejectedReason = nil
+        deviceID = nil
+    }
+
+    /// MD-10: clears only when the displayed state came from `deviceID` (its session ended or it
+    /// turned media off); another device's state stays.
+    func reset(deviceID: String) {
+        guard self.deviceID == deviceID else { return }
+        reset()
     }
 }

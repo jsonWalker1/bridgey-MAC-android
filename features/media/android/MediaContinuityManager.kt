@@ -62,6 +62,16 @@ internal fun selectPrimarySession(
     return sessions.firstOrNull()?.id
 }
 
+/**
+ * MD-10: the one Mac media goes to - the same semantics as notifications (MD-9): the preferred Mac
+ * (never another one while it is set), else the routed Mac; only an eligible one.
+ */
+internal fun mediaRemoteTarget(preferredDeviceId: String?, routedDeviceId: String?, eligible: List<String>): String? =
+    notificationTarget(preferredDeviceId, routedDeviceId, eligible)
+
+/** MD-10: media.remote.action is accepted only from the current target Mac. */
+internal fun acceptsMediaRemoteAction(sender: String?, target: String?): Boolean = acceptsNotificationCommand(sender, target)
+
 /** A Mac-issued action must target the generation Android is currently on, or it's stale. */
 internal fun isActionGenerationValid(current: Long, requested: Long): Boolean = current == requested
 
@@ -137,8 +147,10 @@ internal fun extrapolatedPosition(
 
 class MediaContinuityManager(
     context: Context,
-    private val available: () -> Boolean,
-    private val send: (String, JSONObject) -> Boolean,
+    /** MD-10: the one target Mac (null = media goes nowhere). */
+    private val target: () -> String?,
+    /** Addressed send: (deviceId, kind, payload). */
+    private val send: (String, String, JSONObject) -> Boolean,
 ) {
     private val appContext = context.applicationContext
     private val handler = Handler(Looper.getMainLooper())
@@ -160,7 +172,7 @@ class MediaContinuityManager(
         MediaSessionManager.OnActiveSessionsChangedListener { refreshSessions(it) }
 
     /** Safe to call once; observation runs for the app's lifetime regardless of pairing/connection
-     * state (cheap and event-driven) - only the outbound `send` is gated by [available]. */
+     * state (cheap and event-driven) - only the outbound `send` is gated by [target]. */
     fun start() {
         if (started) return
         started = true
@@ -174,6 +186,7 @@ class MediaContinuityManager(
 
     /** Called after a fresh connection is confirmed: the Mac must never rely on state that
      * predates this connection, so resend everything we currently know, artwork included. */
+    @Synchronized
     fun sendFreshState() {
         android.util.Log.i("Bridgey", "MEDIA reconnect: resending fresh state hasSession=${lastSnapshot.hasSession}")
         lastSentArtworkHash = null
@@ -187,13 +200,20 @@ class MediaContinuityManager(
         lastSentArtworkHash = null
     }
 
-    /** Called whenever local settings or the peer's advertised feature state changes. */
-    fun policyChanged() {
-        if (available()) sendFreshState()
+    /**
+     * MD-10: [deviceId] is not (or no longer) the target - it must not keep showing this phone's
+     * player. Sends the protocol's existing "no session" state; the higher sequence wins on the Mac.
+     */
+    @Synchronized
+    fun sendCleared(deviceId: String) {
+        sequence += 1
+        android.util.Log.i("Bridgey", "MEDIA state cleared on non-target Mac generation=$generation sequence=$sequence")
+        send(deviceId, "media.remote.state", mediaRemoteStatePayload(MediaRemoteState(), generation, sequence, includeArtwork = false))
     }
 
-    fun handleAction(payload: JSONObject): Pair<Boolean, String?> = runCatching {
-        if (!available()) return@runCatching false to "no_session"
+    /** [sender]: the Mac the action came from; it must still be the target when the action runs. */
+    fun handleAction(payload: JSONObject, sender: String?): Pair<Boolean, String?> = runCatching {
+        if (!acceptsMediaRemoteAction(sender, target())) return@runCatching false to "no_session"
         val requestedGeneration = payload.optLong("generation", -1)
         if (!isActionGenerationValid(generation, requestedGeneration)) return@runCatching false to "stale_generation"
         val controller = primaryId?.let(controllers::get) ?: return@runCatching false to "no_session"
@@ -393,9 +413,10 @@ class MediaContinuityManager(
         return bytes.takeIf { it.size <= 16 * 1024 }
     }
 
+    @Synchronized
     private fun publish(snapshot: MediaRemoteState) {
         lastSnapshot = snapshot
-        if (!available()) return
+        val target = target() ?: return
         sequence += 1
         val includeArtwork = snapshot.artworkHash != null && snapshot.artworkHash != lastSentArtworkHash
         if (includeArtwork) lastSentArtworkHash = snapshot.artworkHash
@@ -406,10 +427,13 @@ class MediaContinuityManager(
                 "position=${snapshot.position} duration=${snapshot.duration} generation=$generation sequence=$sequence " +
                 "artworkHash=${snapshot.artworkHash} artworkIncluded=$includeArtwork volume=${snapshot.volume}",
         )
-        send("media.remote.state", snapshot.toPayload(generation, sequence, includeArtwork))
+        send(target, "media.remote.state", mediaRemoteStatePayload(snapshot, generation, sequence, includeArtwork))
     }
+}
 
-    private fun MediaRemoteState.toPayload(generation: Long, sequence: Long, includeArtwork: Boolean): JSONObject {
+/** The `media.remote.state` payload (docs/protocol.md, `media.remote.v1`). */
+internal fun mediaRemoteStatePayload(state: MediaRemoteState, generation: Long, sequence: Long, includeArtwork: Boolean): JSONObject =
+    with(state) {
         val json = JSONObject()
             .put("version", 1)
             .put("generation", generation)
@@ -431,6 +455,5 @@ class MediaContinuityManager(
         if (includeArtwork && artwork != null) {
             json.put("artwork", Base64.encodeToString(artwork, Base64.NO_WRAP))
         }
-        return json
+        json
     }
-}
